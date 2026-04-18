@@ -1,0 +1,10 @@
+node_modules/
+dist/
+logs/
+__pycache__/
+.idea/
+.vscode/
+*.log
+.env
+.env.*
+/config.yaml

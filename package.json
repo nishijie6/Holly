@@ -1,0 +1,23 @@
+{
+  "name": "pybot-ts",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "set NODE_USE_ENV_PROXY=1&& node dist/main.js",
+    "dev": "set NODE_USE_ENV_PROXY=1&& tsx main.ts",
+    "llm:test": "set NODE_USE_ENV_PROXY=1&& tsx test.ts"
+  },
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.17.0",
+    "ws": "^8.20.0",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.6.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}
