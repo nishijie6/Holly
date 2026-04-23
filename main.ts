@@ -1,16 +1,18 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, appendFile } from "node:fs/promises";
+import { mkdir, appendFile, readFile } from "node:fs/promises";
 import { existsSync, watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { WebSocket, type RawData } from "ws";
+import YAML from "yaml";
 import {
   createLlmClient,
   listLlmProfiles,
   setActiveLlmProfile,
   type LlmClient,
+  type LlmMessage,
 } from "./llm-client.js";
 import {
   createIncomingMessageStore,
@@ -35,6 +37,16 @@ type MonitorStatus = {
   state: MonitorConnectionState;
   detail: string;
   updatedAt: string;
+};
+
+type MonitorConversationPreview = {
+  groupId: string | null;
+  updatedAt: string;
+  messages: LlmMessage[];
+  estimatedTokens: number;
+  compressed: boolean;
+  contextLimitTokens: number;
+  compressThresholdTokens: number;
 };
 
 type ParsedIncomingMessage = Omit<IncomingMessageRecord, "sequence">;
@@ -62,6 +74,15 @@ type ThreadScoreBreakdown = {
   sameSender: number;
 };
 
+type ConversationTurn = {
+  groupId: string | null;
+  role: "user" | "assistant";
+  senderName: string | null;
+  userId: string | null;
+  content: string;
+  timestamp: string;
+};
+
 type MessageSegment = {
   type?: unknown;
   data?: unknown;
@@ -78,11 +99,33 @@ type PendingWsAction = {
   timer: NodeJS.Timeout;
 };
 
+type RuntimeLlmConfig = {
+  context_limit_tokens?: unknown;
+  context_compress_threshold_tokens?: unknown;
+};
+
+type AppConfig = {
+  llm?: RuntimeLlmConfig;
+};
+
+type ContextBudgetConfig = {
+  limitTokens: number;
+  compressThresholdTokens: number;
+};
+
+type PreparedModelRequest = {
+  systemPrompt: string;
+  messages: LlmMessage[];
+  estimatedTokens: number;
+  usedCompression: boolean;
+};
+
 type MonitorSnapshot = {
   type: "snapshot";
   target: string;
   status: MonitorStatus;
   history: MonitorEntry[];
+  conversationPreview: MonitorConversationPreview | null;
 };
 
 type MonitorEvent =
@@ -93,6 +136,10 @@ type MonitorEvent =
   | {
       type: "status";
       status: MonitorStatus;
+    }
+  | {
+      type: "conversation";
+      conversationPreview: MonitorConversationPreview | null;
     };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -117,6 +164,13 @@ const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
+const CONVERSATION_HISTORY_LIMIT = 24;
+const CONVERSATION_CONTEXT_WINDOW = 6;
+const DEFAULT_CONTEXT_LIMIT_TOKENS = 128000;
+const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
+const MIN_CONTEXT_LIMIT_TOKENS = 128;
+const CONTEXT_RECENT_MESSAGES_TO_KEEP = 2;
+const CONTEXT_MIN_SECTION_BUDGET = 48;
 const MODEL_DECISION_PROMPT = [
   "You are processing messages from a study group.",
   "Decide whether Holly should reply to the message.",
@@ -124,6 +178,7 @@ const MODEL_DECISION_PROMPT = [
   "Required JSON shape:",
   '{"should_reply": true, "final_answer": "reply text"}',
   "Rules:",
+  "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
@@ -143,9 +198,16 @@ let incomingMessageStoreQueue: Promise<void> = Promise.resolve();
 let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
+let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
+let latestConversationPreview: MonitorConversationPreview | null = null;
+let latestNonReplyContextGroupId: string | null = null;
 let pendingWsActions = new Map<string, PendingWsAction>();
 let configWatcher: FSWatcher | null = null;
 let configReloadTimer: NodeJS.Timeout | null = null;
+let contextBudgetConfig: ContextBudgetConfig = {
+  limitTokens: DEFAULT_CONTEXT_LIMIT_TOKENS,
+  compressThresholdTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
+};
 let monitorStatus: MonitorStatus = {
   state: "closed",
   detail: `Waiting to connect to ${WS_TARGET_URL}`,
@@ -160,6 +222,433 @@ function getActiveLlmClient(): LlmClient {
   }
 
   return activeLlmClient;
+}
+
+function normalizePositiveInteger(value: unknown): number | null {
+  const numeric = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(numeric)) {
+    return null;
+  }
+
+  const normalized = Math.floor(numeric);
+  return normalized > 0 ? normalized : null;
+}
+
+async function loadContextBudgetConfig(configPath: string): Promise<ContextBudgetConfig> {
+  if (!existsSync(configPath)) {
+    return {
+      limitTokens: DEFAULT_CONTEXT_LIMIT_TOKENS,
+      compressThresholdTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
+    };
+  }
+
+  const raw = await readFile(configPath, "utf-8");
+  const config = (YAML.parse(raw) as AppConfig | null) ?? {};
+  const llm = config.llm ?? {};
+  const limitTokens = Math.max(
+    MIN_CONTEXT_LIMIT_TOKENS,
+    normalizePositiveInteger(llm.context_limit_tokens) ?? DEFAULT_CONTEXT_LIMIT_TOKENS,
+  );
+  const compressThresholdTokens = Math.max(
+    1,
+    Math.min(
+      limitTokens,
+      normalizePositiveInteger(llm.context_compress_threshold_tokens) ?? DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
+    ),
+  );
+
+  return {
+    limitTokens,
+    compressThresholdTokens,
+  };
+}
+
+function estimateTextTokens(text: string): number {
+  const normalized = text.trim();
+  if (!normalized) {
+    return 0;
+  }
+
+  let total = 0;
+  let asciiRun = 0;
+
+  const flushAsciiRun = (): void => {
+    if (asciiRun <= 0) {
+      return;
+    }
+
+    total += Math.max(1, Math.ceil(asciiRun / 4));
+    asciiRun = 0;
+  };
+
+  for (const char of normalized) {
+    if (/\s/u.test(char)) {
+      flushAsciiRun();
+      continue;
+    }
+
+    if (/\p{Script=Han}/u.test(char)) {
+      flushAsciiRun();
+      total += 1;
+      continue;
+    }
+
+    if (/[A-Za-z0-9]/.test(char)) {
+      asciiRun += 1;
+      continue;
+    }
+
+    flushAsciiRun();
+    total += 1;
+  }
+
+  flushAsciiRun();
+  return Math.max(1, total);
+}
+
+function estimateSystemPromptTokens(systemPrompt: string): number {
+  const normalized = systemPrompt.trim();
+  return normalized ? estimateTextTokens(normalized) + 12 : 0;
+}
+
+function estimateMessageTokens(message: LlmMessage): number {
+  return estimateTextTokens(message.content) + 6;
+}
+
+function estimateMessagesTokens(messages: readonly LlmMessage[]): number {
+  return messages.reduce((sum, message) => sum + estimateMessageTokens(message), 0);
+}
+
+function estimateRequestTokens(systemPrompt: string, messages: readonly LlmMessage[]): number {
+  return estimateSystemPromptTokens(systemPrompt) + estimateMessagesTokens(messages);
+}
+
+function normalizeMessageContent(text: string): string {
+  return text
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function compactTextToTokenBudget(text: string, maxTokens: number): string {
+  const normalized = normalizeMessageContent(text);
+  if (!normalized || maxTokens <= 0) {
+    return "";
+  }
+
+  if (estimateTextTokens(normalized) <= maxTokens) {
+    return normalized;
+  }
+
+  const chars = Array.from(normalized);
+  let headChars = Math.min(chars.length, Math.max(12, Math.floor(maxTokens * 1.8)));
+  let tailChars = maxTokens >= 40 ? Math.min(chars.length - headChars, Math.floor(maxTokens * 0.6)) : 0;
+  let candidate = `${chars.slice(0, headChars).join("")}${tailChars > 0 ? ` ... ${chars.slice(-tailChars).join("")}` : "..."}`.trim();
+
+  while (estimateTextTokens(candidate) > maxTokens && (headChars > 8 || tailChars > 0)) {
+    if (tailChars > 0 && headChars >= tailChars) {
+      tailChars = Math.max(0, tailChars - 4);
+    } else {
+      headChars = Math.max(8, headChars - 6);
+    }
+
+    candidate = `${chars.slice(0, headChars).join("")}${tailChars > 0 ? ` ... ${chars.slice(-tailChars).join("")}` : "..."}`.trim();
+  }
+
+  while (estimateTextTokens(candidate) > maxTokens && headChars > 4) {
+    headChars = Math.max(4, headChars - 2);
+    candidate = `${chars.slice(0, headChars).join("")}...`.trim();
+  }
+
+  return candidate;
+}
+
+function sanitizeConversationMessages(messages: readonly LlmMessage[]): LlmMessage[] {
+  return messages
+    .map((message): LlmMessage => ({
+      role: message.role,
+      content: normalizeMessageContent(message.content),
+    }))
+    .filter((message) => Boolean(message.content));
+}
+
+function buildCompressedConversationSummary(messages: readonly LlmMessage[], budgetTokens: number): string {
+  if (messages.length === 0 || budgetTokens <= 0) {
+    return "";
+  }
+
+  const header = "Compressed earlier conversation:";
+  let result = header;
+  const perLineBudget = Math.max(
+    10,
+    Math.min(72, Math.floor(Math.max(1, budgetTokens - estimateTextTokens(header)) / messages.length)),
+  );
+
+  for (const message of messages) {
+    const roleLabel = message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
+    const line = `- ${roleLabel}: ${compactTextToTokenBudget(message.content, perLineBudget)}`;
+    const next = `${result}\n${line}`;
+    if (estimateTextTokens(next) > budgetTokens) {
+      break;
+    }
+
+    result = next;
+  }
+
+  return result === header ? compactTextToTokenBudget(header, budgetTokens) : result;
+}
+
+function compressConversationMessages(messages: readonly LlmMessage[], budgetTokens: number): LlmMessage[] {
+  const cleaned = sanitizeConversationMessages(messages);
+  if (cleaned.length === 0 || budgetTokens <= 0) {
+    return [];
+  }
+
+  if (estimateMessagesTokens(cleaned) <= budgetTokens) {
+    return cleaned;
+  }
+
+  for (let keepTail = Math.min(CONTEXT_RECENT_MESSAGES_TO_KEEP, cleaned.length); keepTail >= 0; keepTail -= 1) {
+    const tail = keepTail > 0 ? cleaned.slice(-keepTail) : [];
+    const tailTokens = estimateMessagesTokens(tail);
+    if (tailTokens > budgetTokens) {
+      continue;
+    }
+
+    const older = cleaned.slice(0, cleaned.length - keepTail);
+    const summaryBudget = Math.max(0, budgetTokens - tailTokens);
+    const summary = buildCompressedConversationSummary(older, summaryBudget);
+    const next: LlmMessage[] = summary ? [{ role: "system", content: summary }, ...tail] : tail;
+    if (estimateMessagesTokens(next) <= budgetTokens) {
+      return next;
+    }
+  }
+
+  const lastMessage = cleaned[cleaned.length - 1];
+  const contentBudget = Math.max(8, budgetTokens - 6);
+  return contentBudget > 0
+    ? [{
+        role: lastMessage.role,
+        content: compactTextToTokenBudget(lastMessage.content, contentBudget),
+      }]
+    : [];
+}
+
+function compressMemoryPrompt(memoryPrompt: string, budgetTokens: number): string {
+  const normalized = memoryPrompt.trim();
+  if (!normalized || budgetTokens <= 0) {
+    return "";
+  }
+
+  if (estimateTextTokens(normalized) <= budgetTokens) {
+    return normalized;
+  }
+
+  const lines = normalized
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => line.startsWith("["));
+
+  if (lines.length === 0) {
+    return compactTextToTokenBudget(normalized, budgetTokens);
+  }
+
+  const header = "Compressed thread memory:";
+  let result = header;
+  const perLineBudget = Math.max(
+    10,
+    Math.min(56, Math.floor(Math.max(1, budgetTokens - estimateTextTokens(header)) / lines.length)),
+  );
+
+  for (const line of lines) {
+    const compactLine = `- ${compactTextToTokenBudget(line.replace(/\s+\[thread_score=.*$/, ""), perLineBudget)}`;
+    const next = `${result}\n${compactLine}`;
+    if (estimateTextTokens(next) > budgetTokens) {
+      break;
+    }
+
+    result = next;
+  }
+
+  return result === header ? compactTextToTokenBudget(header, budgetTokens) : result;
+}
+
+function allocateVariableContextBudgets(
+  memoryTokens: number,
+  conversationTokens: number,
+  totalBudget: number,
+): { memoryBudget: number; conversationBudget: number } {
+  if (totalBudget <= 0) {
+    return { memoryBudget: 0, conversationBudget: 0 };
+  }
+
+  if (memoryTokens <= 0) {
+    return { memoryBudget: 0, conversationBudget: totalBudget };
+  }
+
+  if (conversationTokens <= 0) {
+    return { memoryBudget: totalBudget, conversationBudget: 0 };
+  }
+
+  const totalTokens = memoryTokens + conversationTokens;
+  let memoryBudget = Math.round(totalBudget * (memoryTokens / totalTokens));
+  let conversationBudget = totalBudget - memoryBudget;
+  const minimumSectionBudget = Math.min(CONTEXT_MIN_SECTION_BUDGET, Math.floor(totalBudget / 4));
+
+  if (memoryBudget < minimumSectionBudget) {
+    const delta = minimumSectionBudget - memoryBudget;
+    memoryBudget += delta;
+    conversationBudget = Math.max(0, conversationBudget - delta);
+  }
+
+  if (conversationBudget < minimumSectionBudget) {
+    const delta = minimumSectionBudget - conversationBudget;
+    conversationBudget += delta;
+    memoryBudget = Math.max(0, memoryBudget - delta);
+  }
+
+  return { memoryBudget, conversationBudget };
+}
+
+function fitVariableContextToBudget(
+  memoryPrompt: string,
+  conversationMessages: readonly LlmMessage[],
+  totalBudget: number,
+): { memoryPrompt: string; conversationMessages: LlmMessage[] } {
+  const cleanedMemoryPrompt = memoryPrompt.trim();
+  const cleanedConversationMessages = sanitizeConversationMessages(conversationMessages);
+  if (totalBudget <= 0) {
+    return { memoryPrompt: "", conversationMessages: [] };
+  }
+
+  const memoryTokens = estimateTextTokens(cleanedMemoryPrompt);
+  const conversationTokens = estimateMessagesTokens(cleanedConversationMessages);
+  if (memoryTokens + conversationTokens <= totalBudget) {
+    return {
+      memoryPrompt: cleanedMemoryPrompt,
+      conversationMessages: cleanedConversationMessages,
+    };
+  }
+
+  const { memoryBudget, conversationBudget } = allocateVariableContextBudgets(
+    memoryTokens,
+    conversationTokens,
+    totalBudget,
+  );
+
+  let compactMemoryPrompt = compressMemoryPrompt(cleanedMemoryPrompt, memoryBudget);
+  let compactConversationMessages = compressConversationMessages(cleanedConversationMessages, conversationBudget);
+
+  let total = estimateTextTokens(compactMemoryPrompt) + estimateMessagesTokens(compactConversationMessages);
+  if (total <= totalBudget) {
+    return {
+      memoryPrompt: compactMemoryPrompt,
+      conversationMessages: compactConversationMessages,
+    };
+  }
+
+  const memoryOnlyBudget = Math.max(0, totalBudget - estimateMessagesTokens(compactConversationMessages));
+  compactMemoryPrompt = compressMemoryPrompt(cleanedMemoryPrompt, memoryOnlyBudget);
+  total = estimateTextTokens(compactMemoryPrompt) + estimateMessagesTokens(compactConversationMessages);
+  if (total <= totalBudget) {
+    return {
+      memoryPrompt: compactMemoryPrompt,
+      conversationMessages: compactConversationMessages,
+    };
+  }
+
+  const conversationOnlyBudget = Math.max(0, totalBudget - estimateTextTokens(compactMemoryPrompt));
+  compactConversationMessages = compressConversationMessages(cleanedConversationMessages, conversationOnlyBudget);
+
+  return {
+    memoryPrompt: compactMemoryPrompt,
+    conversationMessages: compactConversationMessages,
+  };
+}
+
+function prepareModelRequest(
+  baseSystemPrompt: string,
+  memoryPrompt: string,
+  conversationMessages: readonly LlmMessage[],
+  currentMessage: string,
+): PreparedModelRequest {
+  const fixedSystemPrompt = buildModelSystemPrompt(baseSystemPrompt).trim();
+  const currentUserMessage: LlmMessage = {
+    role: "user",
+    content: normalizeMessageContent(currentMessage),
+  };
+
+  let usedCompression = false;
+  let fittedVariableContext = {
+    memoryPrompt: memoryPrompt.trim(),
+    conversationMessages: sanitizeConversationMessages(conversationMessages),
+  };
+
+  let systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
+  let messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
+  let estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+
+  const fixedBudget = estimateSystemPromptTokens(fixedSystemPrompt) + estimateMessageTokens(currentUserMessage);
+
+  if (estimatedTokens > contextBudgetConfig.compressThresholdTokens) {
+    const softVariableBudget = Math.max(0, contextBudgetConfig.compressThresholdTokens - fixedBudget);
+    fittedVariableContext = fitVariableContextToBudget(
+      memoryPrompt,
+      conversationMessages,
+      softVariableBudget,
+    );
+    systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
+    messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
+    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+    usedCompression = true;
+  }
+
+  if (estimatedTokens > contextBudgetConfig.limitTokens) {
+    const hardVariableBudget = Math.max(0, contextBudgetConfig.limitTokens - fixedBudget);
+    fittedVariableContext = fitVariableContextToBudget(
+      memoryPrompt,
+      conversationMessages,
+      hardVariableBudget,
+    );
+    systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
+    messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
+    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+    usedCompression = true;
+  }
+
+  if (estimatedTokens > contextBudgetConfig.limitTokens) {
+    const systemAndHistoryBudget = estimateSystemPromptTokens(systemPrompt) + estimateMessagesTokens(fittedVariableContext.conversationMessages);
+    const currentMessageBudget = Math.max(8, contextBudgetConfig.limitTokens - systemAndHistoryBudget - 6);
+    const compactCurrentUserMessage: LlmMessage = {
+      role: "user",
+      content: compactTextToTokenBudget(currentUserMessage.content, currentMessageBudget),
+    };
+    messages = [...fittedVariableContext.conversationMessages, compactCurrentUserMessage];
+    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+    usedCompression = true;
+  }
+
+  if (estimatedTokens > contextBudgetConfig.limitTokens) {
+    systemPrompt = fixedSystemPrompt;
+    messages = [{
+      role: "user",
+      content: compactTextToTokenBudget(
+        currentUserMessage.content,
+        Math.max(8, contextBudgetConfig.limitTokens - estimateSystemPromptTokens(systemPrompt) - 6),
+      ),
+    }];
+    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+    usedCompression = true;
+  }
+
+  return {
+    systemPrompt,
+    messages,
+    estimatedTokens,
+    usedCompression,
+  };
 }
 
 async function switchActiveProfile(profileName: string): Promise<LlmClient> {
@@ -194,12 +683,14 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const envProfile = process.env.LLM_PROFILE?.trim();
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
   const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
+  const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
+  contextBudgetConfig = nextContextBudgetConfig;
   pushMonitorEntry(
     "status",
     "Config Reloaded",
-    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}`,
+    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens})`,
   );
 }
 
@@ -711,6 +1202,10 @@ async function persistIncomingMessage(record: ParsedIncomingMessage): Promise<vo
     return;
   }
 
+  if (isReplyTargetGroup(record.groupId)) {
+    return;
+  }
+
   const nextSequence = ++incomingMessageSequence;
   const run = incomingMessageStoreQueue
     .catch(() => {
@@ -778,7 +1273,30 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     target: WS_TARGET_URL,
     status: monitorStatus,
     history: monitorHistory,
+    conversationPreview: latestConversationPreview,
   };
+}
+
+function updateConversationPreview(preview: MonitorConversationPreview | null): void {
+  latestConversationPreview = preview
+    ? {
+        groupId: preview.groupId,
+        updatedAt: preview.updatedAt,
+        messages: preview.messages.map((message): LlmMessage => ({
+          role: message.role,
+          content: message.content,
+        })),
+        estimatedTokens: preview.estimatedTokens,
+        compressed: preview.compressed,
+        contextLimitTokens: preview.contextLimitTokens,
+        compressThresholdTokens: preview.compressThresholdTokens,
+      }
+    : null;
+
+  broadcastMonitorEvent({
+    type: "conversation",
+    conversationPreview: latestConversationPreview,
+  });
 }
 
 function formatElapsedDuration(startedAt: number, finishedAt: number): string {
@@ -788,23 +1306,159 @@ function formatElapsedDuration(startedAt: number, finishedAt: number): string {
     : `${elapsedMs}ms`;
 }
 
+function normalizeConversationGroupKey(groupId: string | null): string | null {
+  const normalized = groupId?.trim() || null;
+  return normalized;
+}
+
+function isReplyTargetGroup(groupId: string | null): boolean {
+  return normalizeConversationGroupKey(groupId) === String(REPLY_TARGET_GROUP_ID);
+}
+
+function updateLatestNonReplyContextGroup(groupId: string | null): void {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey || isReplyTargetGroup(groupKey)) {
+    return;
+  }
+
+  latestNonReplyContextGroupId = groupKey;
+}
+
+function resolveModelContextGroupId(groupId: string | null): string | null {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey) {
+    return null;
+  }
+
+  if (isReplyTargetGroup(groupKey)) {
+    return latestNonReplyContextGroupId;
+  }
+
+  return groupKey;
+}
+
+function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
+  const referenceTs = parseIsoTimestamp(referenceTime);
+  const filtered = referenceTs === null
+    ? turns
+    : turns.filter((turn) => {
+        const turnTs = parseIsoTimestamp(turn.timestamp);
+        if (turnTs === null) {
+          return true;
+        }
+
+        return turnTs <= referenceTs && referenceTs - turnTs <= THREAD_HARD_CUTOFF_MS;
+      });
+
+  return filtered.slice(-CONVERSATION_HISTORY_LIMIT);
+}
+
+function appendConversationTurn(turn: ConversationTurn): void {
+  const groupKey = normalizeConversationGroupKey(turn.groupId);
+  const content = turn.content.trim();
+  if (!groupKey || !content || isReplyTargetGroup(groupKey)) {
+    return;
+  }
+
+  const existing = conversationHistoryByGroup.get(groupKey) ?? [];
+  const next = pruneConversationTurns(
+    [...existing, { ...turn, content }],
+    turn.timestamp,
+  );
+  conversationHistoryByGroup.set(groupKey, next);
+}
+
+function buildConversationMessages(context: ModelRequestContext, currentMessage: string): LlmMessage[] {
+  const groupKey = normalizeConversationGroupKey(context.groupId);
+  if (!groupKey) {
+    return [];
+  }
+
+  const currentContent = currentMessage.trim();
+  const turns = pruneConversationTurns(
+    conversationHistoryByGroup.get(groupKey) ?? [],
+    context.receivedAt,
+  ).filter((turn) => {
+    return !(
+      turn.role === "user" &&
+      turn.timestamp === context.receivedAt &&
+      turn.content === currentContent
+    );
+  });
+
+  return turns
+    .slice(-CONVERSATION_CONTEXT_WINDOW)
+    .map(formatConversationTurnForModel);
+}
+
 function buildModelSystemPrompt(basePrompt: string): string {
   return `${basePrompt}\n\n${MODEL_DECISION_PROMPT}`;
 }
 
+function formatConversationSenderLabel(senderName: string | null, userId: string | null): string | null {
+  const normalizedSenderName = senderName?.trim() || null;
+  const normalizedUserId = userId?.trim() || null;
+
+  if (normalizedSenderName && normalizedUserId) {
+    return `[${normalizedSenderName}(${normalizedUserId})]`;
+  }
+
+  if (normalizedSenderName) {
+    return `[${normalizedSenderName}]`;
+  }
+
+  if (normalizedUserId) {
+    return `[${normalizedUserId}]`;
+  }
+
+  return null;
+}
+
+function compactSameGroupConversationContent(content: string): string {
+  return normalizeMessageContent(stripConversationPrefix(content));
+}
+
+function formatSameGroupUserContent(
+  content: string,
+  senderName: string | null,
+  userId: string | null,
+): string {
+  const compactContent = compactSameGroupConversationContent(content);
+  const senderLabel = formatConversationSenderLabel(senderName, userId);
+  if (!senderLabel) {
+    return compactContent;
+  }
+
+  return compactContent ? `${senderLabel} ${compactContent}` : senderLabel;
+}
+
+function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
+  const content = turn.role === "user"
+    ? formatSameGroupUserContent(turn.content, turn.senderName, turn.userId)
+    : normalizeMessageContent(turn.content);
+
+  return {
+    role: turn.role,
+    content,
+  };
+}
+
+function formatCurrentMessageForModel(context: ModelRequestContext, currentMessage: string): string {
+  return formatSameGroupUserContent(currentMessage, context.senderName, context.userId);
+}
+
 function formatMemoryLine(record: StoredMemoryRecord): string | null {
   const receivedAt = record.receivedAt ?? "unknown_time";
-  const groupName = record.groupName ?? "unknown_group";
-  const groupId = record.groupId ?? "unknown_group_id";
   const senderName = record.senderName ?? "unknown_user";
   const userId = record.userId ?? "unknown_user_id";
-  const content = record.displayText?.trim() || record.rawMessage?.trim();
+  const contentSource = record.displayText?.trim() || record.rawMessage?.trim();
+  const content = contentSource ? compactSameGroupConversationContent(contentSource) : "";
 
   if (!content) {
     return null;
   }
 
-  return `[${receivedAt}] group=${groupName}(${groupId}) sender=${senderName}(${userId}) ${content}`;
+  return `[${receivedAt}] sender=${senderName}(${userId}) ${content}`;
 }
 
 function parseIsoTimestamp(value: string | null): number | null {
@@ -1048,8 +1702,13 @@ async function buildMemoryPrompt(context: ModelRequestContext, currentMessage: s
     return "";
   }
 
+  const contextGroupId = normalizeConversationGroupKey(context.groupId);
+  if (!contextGroupId) {
+    return "";
+  }
+
   const memories = await store.listRecentMemories({
-    groupId: context.groupId,
+    groupId: contextGroupId,
     limit: THREAD_CANDIDATE_LIMIT + 1,
   });
 
@@ -1086,7 +1745,7 @@ async function buildMemoryPrompt(context: ModelRequestContext, currentMessage: s
 
   return [
     "Recent memory for the same conversation thread:",
-    `- Retrieval scope: group_id=${context.groupId ?? "null"}, recent_group_messages=${THREAD_CANDIDATE_LIMIT}`,
+    `- Retrieval scope: group_id=${contextGroupId}, recent_group_messages=${THREAD_CANDIDATE_LIMIT}`,
     `- Thread rule: time proximity + directed-to-Holly + participant link + text similarity`,
     `- Returned memories: ${lines.length}`,
     lines.join("\n"),
@@ -1291,16 +1950,37 @@ async function sendGroupMessage(groupId: number, message: string): Promise<void>
 async function forwardMessageToModel(message: string, context: ModelRequestContext): Promise<void> {
   const client = getActiveLlmClient();
   const startedAt = Date.now();
-  const memoryPrompt = await buildMemoryPrompt(context, message);
+  const cameFromReplyTargetGroup = isReplyTargetGroup(context.groupId);
+  const effectiveContext: ModelRequestContext = {
+    ...context,
+    groupId: resolveModelContextGroupId(context.groupId),
+  };
+  const memoryPrompt = await buildMemoryPrompt(effectiveContext, message);
+  const conversationMessages = buildConversationMessages(effectiveContext, message);
+  const currentModelMessage = formatCurrentMessageForModel(effectiveContext, message);
+  const preparedRequest = prepareModelRequest(
+    client.systemPrompt,
+    memoryPrompt,
+    conversationMessages,
+    currentModelMessage,
+  );
 
-  pushMonitorEntry("status", "Model Request", message);
+  updateConversationPreview({
+    groupId: effectiveContext.groupId,
+    updatedAt: context.receivedAt,
+    messages: preparedRequest.messages,
+    estimatedTokens: preparedRequest.estimatedTokens,
+    compressed: preparedRequest.usedCompression,
+    contextLimitTokens: contextBudgetConfig.limitTokens,
+    compressThresholdTokens: contextBudgetConfig.compressThresholdTokens,
+  });
+
+  pushMonitorEntry("status", "Model Request", currentModelMessage);
   await appendChatLog("user", message);
 
   const reply = await client.generateText({
-    systemPrompt: [buildModelSystemPrompt(client.systemPrompt), memoryPrompt].filter(Boolean).join("\n\n"),
-    messages: [
-      { role: "user", content: message },
-    ],
+    systemPrompt: preparedRequest.systemPrompt,
+    messages: preparedRequest.messages,
   });
 
   const decision = parseModelDecision(reply);
@@ -1321,6 +2001,16 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
   }
 
   await sendGroupMessage(REPLY_TARGET_GROUP_ID, decision.finalAnswer);
+  if (!cameFromReplyTargetGroup) {
+    appendConversationTurn({
+      groupId: effectiveContext.groupId,
+      role: "assistant",
+      senderName: null,
+      userId: null,
+      content: decision.finalAnswer,
+      timestamp: new Date().toISOString(),
+    });
+  }
   pushMonitorEntry(
     "outgoing",
     "Group Message Sent",
@@ -1439,7 +2129,6 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
-    pushMonitorEntry("incoming", "Incoming Message", message.displayText);
     console.log(`WebSocket client received: ${message.displayText}`);
 
     if (isHollyMessage(message)) {
@@ -1447,6 +2136,15 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
+    updateLatestNonReplyContextGroup(message.groupId);
+    appendConversationTurn({
+      groupId: message.groupId,
+      role: "user",
+      senderName: message.senderName,
+      userId: message.userId,
+      content: message.displayText,
+      timestamp: message.receivedAt,
+    });
     enqueueMessageForModel(message.displayText, {
       groupId: message.groupId,
       userId: message.userId,
@@ -1676,6 +2374,55 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
       display: grid;
       gap: 12px;
     }
+    .conversation-box {
+      display: grid;
+      gap: 10px;
+      margin-top: 6px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+    .conversation-log {
+      display: grid;
+      gap: 10px;
+      max-height: 320px;
+      overflow-y: auto;
+      padding-right: 4px;
+    }
+    .conversation-item {
+      border-radius: 16px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.82);
+    }
+    .conversation-item.user {
+      background: rgba(224, 242, 254, 0.88);
+    }
+    .conversation-item.assistant {
+      background: rgba(237, 233, 254, 0.88);
+    }
+    .conversation-item.system {
+      background: rgba(240, 249, 255, 0.92);
+    }
+    .conversation-item-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+    .conversation-item pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 12px;
+      line-height: 1.55;
+      color: #0f172a;
+    }
     button {
       border: 0;
       border-radius: 999px;
@@ -1738,6 +2485,13 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
           <select id="profileSelect"></select>
           <button id="applyProfile">Switch Model</button>
           <div class="socket-url" id="profileMeta">Loading model profiles...</div>
+          <section class="conversation-box">
+            <p class="hint">Latest same-group <code>messages</code> payload sent to the model.</p>
+            <div class="socket-url" id="conversationMeta">Waiting for the first model request...</div>
+            <div class="conversation-log" id="conversationLog">
+              <div class="empty">No recent conversation messages yet.</div>
+            </div>
+          </section>
         </div>
       </section>
     </section>
@@ -1749,6 +2503,8 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
     const socketUrl = document.getElementById("socketUrl");
     const profileSelect = document.getElementById("profileSelect");
     const profileMeta = document.getElementById("profileMeta");
+    const conversationMeta = document.getElementById("conversationMeta");
+    const conversationLog = document.getElementById("conversationLog");
     const applyProfileButton = document.getElementById("applyProfile");
     const reconnectButton = document.getElementById("reconnect");
     const log = document.getElementById("log");
@@ -1811,34 +2567,94 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
       const time = document.createElement("span");
       time.textContent = new Date(timestamp || Date.now()).toLocaleTimeString();
 
-      const content = document.createElement("pre");
-      content.textContent = formatBody(body);
-
       head.appendChild(heading);
       head.appendChild(time);
       entry.appendChild(head);
-      entry.appendChild(content);
+      if (typeof body === "string" ? body.trim() : body != null) {
+        const content = document.createElement("pre");
+        content.textContent = formatBody(body);
+        entry.appendChild(content);
+      }
       log.prepend(entry);
       log.scrollTop = 0;
+    }
+
+    function renderConversationPreview(preview) {
+      conversationLog.innerHTML = "";
+
+      if (!preview || !Array.isArray(preview.messages) || preview.messages.length === 0) {
+        conversationMeta.textContent = "Waiting for the first model request...";
+        conversationLog.innerHTML = '<div class="empty">No recent conversation messages yet.</div>';
+        return;
+      }
+
+      const groupLabel = preview.groupId || "unknown_group";
+      const updatedLabel = new Date(preview.updatedAt || Date.now()).toLocaleTimeString();
+      const tokenLabel = typeof preview.estimatedTokens === "number" ? preview.estimatedTokens : "?";
+      const limitLabel = typeof preview.contextLimitTokens === "number" ? preview.contextLimitTokens : "?";
+      const compressLabel =
+        typeof preview.compressThresholdTokens === "number" ? preview.compressThresholdTokens : "?";
+      const compressionState = preview.compressed ? "on" : "off";
+      conversationMeta.textContent =
+        "Group: " + groupLabel +
+        " | Messages: " + preview.messages.length +
+        " | Tokens: ~" + tokenLabel + "/" + limitLabel +
+        " | Compress@" + compressLabel +
+        " | Compression: " + compressionState +
+        " | Updated: " + updatedLabel;
+
+      for (const [index, message] of preview.messages.entries()) {
+        const item = document.createElement("article");
+        const roleName =
+          message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
+        item.className = "conversation-item " + roleName;
+
+        const head = document.createElement("div");
+        head.className = "conversation-item-head";
+
+        const role = document.createElement("span");
+        role.textContent =
+          message.role === "assistant" ? "Assistant" : message.role === "system" ? "System" : "User";
+
+        const order = document.createElement("span");
+        order.textContent = "#" + String(index + 1);
+
+        const content = document.createElement("pre");
+        content.textContent = typeof message.content === "string" ? message.content : JSON.stringify(message.content, null, 2);
+
+        head.appendChild(role);
+        head.appendChild(order);
+        item.appendChild(head);
+        item.appendChild(content);
+        conversationLog.appendChild(item);
+      }
     }
 
     function renderSnapshot(payload) {
       renderedEntryIds = new Set();
       socketUrl.textContent = payload.target;
       setStatus(payload.status);
+      renderConversationPreview(payload.conversationPreview);
       log.innerHTML = "";
+      const visibleEntries = Array.isArray(payload.history)
+        ? payload.history.filter((entry) => entry.kind !== "incoming")
+        : [];
 
-      if (!payload.history.length) {
+      if (!visibleEntries.length) {
         log.innerHTML = '<div class="empty">Waiting for WebSocket messages...</div>';
         return;
       }
 
-      for (const entry of payload.history) {
+      for (const entry of visibleEntries) {
         renderEntry(entry);
       }
     }
 
     function renderEntry(entry) {
+      if (entry.kind === "incoming") {
+        return;
+      }
+
       if (renderedEntryIds.has(entry.id)) {
         return;
       }
@@ -1855,6 +2671,11 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
 
       if (payload.type === "status") {
         setStatus(payload.status);
+        return;
+      }
+
+      if (payload.type === "conversation") {
+        renderConversationPreview(payload.conversationPreview);
         return;
       }
 
@@ -2315,6 +3136,7 @@ const MEMORIES_PAGE = `<!DOCTYPE html>
 
 async function bootstrap(): Promise<void> {
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
+  const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -2324,11 +3146,17 @@ async function bootstrap(): Promise<void> {
 
   activeLlmClient = client;
   activeLlmLabel = client.displayName;
+  contextBudgetConfig = loadedContextBudgetConfig;
   incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
     pushMonitorEntry("status", "Qdrant Ready", store.description);
   }
+  pushMonitorEntry(
+    "status",
+    "Context Budget Ready",
+    `limit=${contextBudgetConfig.limitTokens} tokens\ncompress_at=${contextBudgetConfig.compressThresholdTokens} tokens`,
+  );
 
   connectWebSocketClient();
 
