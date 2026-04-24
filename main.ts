@@ -62,6 +62,7 @@ type ModelRequestContext = {
 type ModelDecision = {
   shouldReply: boolean;
   finalAnswer: string;
+  thinkingProcess: string;
   raw: string;
 };
 
@@ -157,7 +158,6 @@ const WS_RECONNECT_DELAY_MS = 3000;
 const WS_HISTORY_LIMIT = 120;
 const APP_SESSION_ID = randomUUID();
 const APP_SESSION_STARTED_AT = new Date().toISOString();
-const REPLY_TARGET_GROUP_ID = 20000002;
 const WS_ACTION_TIMEOUT_MS = 10_000;
 const MEMORY_LOOKBACK_LIMIT = 8;
 const THREAD_CANDIDATE_LIMIT = 24;
@@ -176,13 +176,14 @@ const MODEL_DECISION_PROMPT = [
   "Decide whether Holly should reply to the message.",
   "Return JSON only. Do not use markdown fences or extra explanation.",
   "Required JSON shape:",
-  '{"should_reply": true, "final_answer": "reply text"}',
+  '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
   "Rules:",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
-  "- Do not return any reasoning, analysis, or extra fields.",
+  "- thinking_process must be a short decision summary for logging, not a detailed chain-of-thought.",
+  "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
 ].join("\n");
 
@@ -200,7 +201,6 @@ let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
-let latestNonReplyContextGroupId: string | null = null;
 let pendingWsActions = new Map<string, PendingWsAction>();
 let configWatcher: FSWatcher | null = null;
 let configReloadTimer: NodeJS.Timeout | null = null;
@@ -1202,10 +1202,6 @@ async function persistIncomingMessage(record: ParsedIncomingMessage): Promise<vo
     return;
   }
 
-  if (isReplyTargetGroup(record.groupId)) {
-    return;
-  }
-
   const nextSequence = ++incomingMessageSequence;
   const run = incomingMessageStoreQueue
     .catch(() => {
@@ -1311,30 +1307,14 @@ function normalizeConversationGroupKey(groupId: string | null): string | null {
   return normalized;
 }
 
-function isReplyTargetGroup(groupId: string | null): boolean {
-  return normalizeConversationGroupKey(groupId) === String(REPLY_TARGET_GROUP_ID);
-}
-
-function updateLatestNonReplyContextGroup(groupId: string | null): void {
-  const groupKey = normalizeConversationGroupKey(groupId);
-  if (!groupKey || isReplyTargetGroup(groupKey)) {
-    return;
+function parseReplyGroupId(groupId: string | null): number {
+  const normalized = normalizeConversationGroupKey(groupId);
+  const numeric = normalized ? Number(normalized) : Number.NaN;
+  if (!normalized || !Number.isSafeInteger(numeric) || numeric <= 0) {
+    throw new Error(`Cannot resolve reply group_id from incoming message: ${groupId ?? "null"}`);
   }
 
-  latestNonReplyContextGroupId = groupKey;
-}
-
-function resolveModelContextGroupId(groupId: string | null): string | null {
-  const groupKey = normalizeConversationGroupKey(groupId);
-  if (!groupKey) {
-    return null;
-  }
-
-  if (isReplyTargetGroup(groupKey)) {
-    return latestNonReplyContextGroupId;
-  }
-
-  return groupKey;
+  return numeric;
 }
 
 function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
@@ -1356,7 +1336,7 @@ function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string
 function appendConversationTurn(turn: ConversationTurn): void {
   const groupKey = normalizeConversationGroupKey(turn.groupId);
   const content = turn.content.trim();
-  if (!groupKey || !content || isReplyTargetGroup(groupKey)) {
+  if (!groupKey || !content) {
     return;
   }
 
@@ -1813,7 +1793,9 @@ function sanitizeFinalAnswer(text: string): string {
     /(?:\u6700\u7ec8\u56de\u7b54|\u6700\u7ec8\u56de\u590d|final_answer|final answer)\s*[:\uFF1A]/gi,
   );
 
-  if (/^(?:\u601d\u8def\u6458\u8981|reasoning_summary|reasoning summary|thought summary)\s*[:\uFF1A]?/i.test(cleaned)) {
+  if (
+    /^(?:\u601d\u8def\u6458\u8981|\u601d\u8003\u8fc7\u7a0b|reasoning_summary|reasoning summary|thought summary|thinking_process|thinking process)\s*[:\uFF1A]?/i.test(cleaned)
+  ) {
     const lines = cleaned.split(/\r?\n/);
     const answerLines: string[] = [];
     let skippingMeta = true;
@@ -1829,7 +1811,7 @@ function sanitizeFinalAnswer(text: string): string {
 
       if (skippingMeta) {
         if (
-          /^(?:\u601d\u8def\u6458\u8981|reasoning_summary|reasoning summary|thought summary)\s*[:\uFF1A]?/i.test(line) ||
+          /^(?:\u601d\u8def\u6458\u8981|\u601d\u8003\u8fc7\u7a0b|reasoning_summary|reasoning summary|thought summary|thinking_process|thinking process)\s*[:\uFF1A]?/i.test(line) ||
           /^(?:[-*\u2022]|\d+\.)\s*/.test(line) ||
           /^(?:answer|should_reply|shouldReply|reply)\s*[:\uFF1A]\s*(?:true|false)\s*$/i.test(line)
         ) {
@@ -1851,6 +1833,16 @@ function sanitizeFinalAnswer(text: string): string {
     .trim();
 
   return cleaned;
+}
+
+function sanitizeThinkingProcess(text: string): string {
+  return text
+    .trim()
+    .replace(
+      /^(?:\u601d\u8003\u8fc7\u7a0b|\u601d\u8def\u6458\u8981|thinking_process|thinking process|reasoning_summary|reasoning summary|thought summary)\s*[:\uFF1A]\s*/i,
+      "",
+    )
+    .trim();
 }
 
 function parseModelDecision(raw: string): ModelDecision {
@@ -1876,10 +1868,21 @@ function parseModelDecision(raw: string): ModelDecision {
   const finalAnswer = sanitizeFinalAnswer(
     readDecisionText(payload.final_answer ?? payload.finalAnswer),
   );
+  const thinkingProcess = sanitizeThinkingProcess(
+    readDecisionText(
+      payload.thinking_process ??
+      payload.thinkingProcess ??
+      payload.reasoning_summary ??
+      payload.reasoningSummary ??
+      payload.thought_summary ??
+      payload.thoughtSummary,
+    ),
+  );
 
   return {
     shouldReply,
     finalAnswer,
+    thinkingProcess,
     raw,
   };
 }
@@ -1887,6 +1890,7 @@ function parseModelDecision(raw: string): ModelDecision {
 function formatModelReplyEntry(decision: ModelDecision): string {
   const lines = [
     `should_reply: ${decision.shouldReply}`,
+    `thinking_process: ${decision.thinkingProcess || "(empty)"}`,
     `final_answer: ${decision.finalAnswer || "(empty)"}`,
   ];
 
@@ -1950,10 +1954,10 @@ async function sendGroupMessage(groupId: number, message: string): Promise<void>
 async function forwardMessageToModel(message: string, context: ModelRequestContext): Promise<void> {
   const client = getActiveLlmClient();
   const startedAt = Date.now();
-  const cameFromReplyTargetGroup = isReplyTargetGroup(context.groupId);
+  const replyGroupId = parseReplyGroupId(context.groupId);
   const effectiveContext: ModelRequestContext = {
     ...context,
-    groupId: resolveModelContextGroupId(context.groupId),
+    groupId: normalizeConversationGroupKey(context.groupId),
   };
   const memoryPrompt = await buildMemoryPrompt(effectiveContext, message);
   const conversationMessages = buildConversationMessages(effectiveContext, message);
@@ -2000,21 +2004,19 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     return;
   }
 
-  await sendGroupMessage(REPLY_TARGET_GROUP_ID, decision.finalAnswer);
-  if (!cameFromReplyTargetGroup) {
-    appendConversationTurn({
-      groupId: effectiveContext.groupId,
-      role: "assistant",
-      senderName: null,
-      userId: null,
-      content: decision.finalAnswer,
-      timestamp: new Date().toISOString(),
-    });
-  }
+  await sendGroupMessage(replyGroupId, decision.finalAnswer);
+  appendConversationTurn({
+    groupId: effectiveContext.groupId,
+    role: "assistant",
+    senderName: null,
+    userId: null,
+    content: decision.finalAnswer,
+    timestamp: new Date().toISOString(),
+  });
   pushMonitorEntry(
     "outgoing",
     "Group Message Sent",
-    `group_id=${REPLY_TARGET_GROUP_ID}\n${decision.finalAnswer}`,
+    `group_id=${replyGroupId}\n${decision.finalAnswer}`,
   );
 }
 
@@ -2136,7 +2138,6 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
-    updateLatestNonReplyContextGroup(message.groupId);
     appendConversationTurn({
       groupId: message.groupId,
       role: "user",
