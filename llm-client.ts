@@ -96,6 +96,10 @@ const TOKEN_REFRESH_BUFFER_MS = 300_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 
+function isFetchFailedError(error: unknown): boolean {
+  return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
+}
+
 async function loadConfig(configPath: string): Promise<AppConfig> {
   if (!existsSync(configPath)) {
     throw new Error(`Config file not found: ${configPath}.`);
@@ -444,23 +448,36 @@ function extractCodexText(rawResult: unknown): string {
 async function requestCodexText(model: string, systemPrompt: string, messages: LlmMessage[]): Promise<string> {
   let creds = await getCodexCredentials();
   const body = buildCodexRequest(model, systemPrompt, messages);
+  let retriedFetchFailed = false;
 
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  let authAttempt = 0;
+  while (authAttempt < 2) {
     const headers = buildCodexHeaders(creds);
     headers.Accept = "text/event-stream";
     logCodexRequest(body, headers);
-    const res = await fetch(CODEX_RESPONSES_URL, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+    let res: Response;
+    try {
+      res = await fetch(CODEX_RESPONSES_URL, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      if (!retriedFetchFailed && isFetchFailedError(error)) {
+        retriedFetchFailed = true;
+        console.warn("Codex request fetch failed; retrying once.");
+        continue;
+      }
+      throw error;
+    }
     await logCodexResponse(res);
 
-    if ((res.status === 401 || res.status === 403) && attempt === 0 && creds.refreshToken) {
+    if ((res.status === 401 || res.status === 403) && authAttempt === 0 && creds.refreshToken) {
       const refreshed = await refreshCodexCredentials(creds).catch(() => null);
       if (refreshed) {
         creds = refreshed;
+        authAttempt += 1;
         continue;
       }
     }
