@@ -84,6 +84,16 @@ type ConversationTurn = {
   timestamp: string;
 };
 
+type RepeatState = {
+  normalizedContent: string;
+  originalContent: string;
+  count: number;
+  repeated: boolean;
+  triggeredContents: Set<string>;
+};
+
+type GroupHistoryMessage = Record<string, unknown>;
+
 type MessageSegment = {
   type?: unknown;
   data?: unknown;
@@ -164,8 +174,9 @@ const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
-const CONVERSATION_HISTORY_LIMIT = 24;
-const CONVERSATION_CONTEXT_WINDOW = 6;
+const CONVERSATION_HISTORY_LIMIT = 5000;
+const GROUP_HISTORY_BOOTSTRAP_PAGE_SIZE = 50;
+const GROUP_HISTORY_BOOTSTRAP_MAX_PAGES = 200;
 const DEFAULT_CONTEXT_LIMIT_TOKENS = 128000;
 const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
 const MIN_CONTEXT_LIMIT_TOKENS = 128;
@@ -200,6 +211,8 @@ let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
+let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
+let repeatStateByGroup = new Map<string, RepeatState>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
 let pendingWsActions = new Map<string, PendingWsAction>();
 let configWatcher: FSWatcher | null = null;
@@ -1115,6 +1128,75 @@ function isHollyMessage(message: ParsedIncomingMessage): boolean {
   return (message.senderName ?? "").trim().toLowerCase() === "holly";
 }
 
+function getRepeatableMessageContent(message: ParsedIncomingMessage): {
+  normalizedContent: string;
+  originalContent: string;
+} | null {
+  const originalContent = message.rawMessage?.trim() ?? "";
+  if (!originalContent) {
+    return null;
+  }
+
+  const normalizedContent = originalContent.trim();
+  if (!normalizedContent) {
+    return null;
+  }
+
+  return {
+    normalizedContent,
+    originalContent,
+  };
+}
+
+async function handleRepeaterMessage(message: ParsedIncomingMessage): Promise<void> {
+  const groupKey = normalizeConversationGroupKey(message.groupId);
+  const repeatable = getRepeatableMessageContent(message);
+  if (!groupKey || !repeatable) {
+    return;
+  }
+
+  const existing = repeatStateByGroup.get(groupKey);
+  const triggeredContents = existing?.triggeredContents ?? new Set<string>();
+  const nextState: RepeatState = existing?.normalizedContent === repeatable.normalizedContent
+    ? {
+        ...existing,
+        originalContent: repeatable.originalContent,
+        count: existing.count + 1,
+        triggeredContents,
+      }
+    : {
+        normalizedContent: repeatable.normalizedContent,
+        originalContent: repeatable.originalContent,
+        count: 1,
+        repeated: false,
+        triggeredContents,
+      };
+
+  repeatStateByGroup.set(groupKey, nextState);
+
+  if (
+    nextState.count >= 3 &&
+    !nextState.repeated &&
+    !triggeredContents.has(nextState.normalizedContent)
+  ) {
+    nextState.repeated = true;
+    triggeredContents.add(nextState.normalizedContent);
+    repeatStateByGroup.set(groupKey, nextState);
+    try {
+      await sendGroupMessage(parseReplyGroupId(groupKey), nextState.originalContent);
+      pushMonitorEntry(
+        "outgoing",
+        "Repeater Message Sent",
+        `group_id=${groupKey}\n${nextState.originalContent}`,
+      );
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Repeater Error", `group_id=${groupKey}\n${detail}`);
+      console.error("Failed to send repeater message:", error);
+    }
+  }
+}
+
 function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingMessage {
   const buffer = toBuffer(data);
   const receivedAt = new Date().toISOString();
@@ -1194,6 +1276,112 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
     void error;
     return fallback;
   }
+}
+
+function getLocalDayRange(referenceTime: string): { startMs: number; endMs: number } {
+  const referenceTs = parseIsoTimestamp(referenceTime) ?? Date.now();
+  const start = new Date(referenceTs);
+  start.setHours(0, 0, 0, 0);
+
+  const end = new Date(start);
+  end.setDate(end.getDate() + 1);
+
+  return {
+    startMs: start.getTime(),
+    endMs: end.getTime(),
+  };
+}
+
+function readHistoryMessageTimestampMs(message: GroupHistoryMessage): number | null {
+  const candidates = [
+    message.time,
+    message.message_time,
+    message.msgTime,
+    message.timestamp,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate > 10_000_000_000 ? candidate : candidate * 1000;
+    }
+
+    if (typeof candidate === "string") {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric)) {
+        return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+      }
+
+      const parsed = Date.parse(candidate);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
+}
+
+function readHistoryMessageSequence(message: GroupHistoryMessage): string | null {
+  const candidates = [
+    message.message_seq,
+    message.msg_seq,
+    message.seq,
+    message.message_id,
+    message.msgId,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return String(candidate);
+    }
+  }
+
+  return null;
+}
+
+function extractGroupHistoryMessages(response: Record<string, unknown>): GroupHistoryMessage[] {
+  const data = asObjectRecord(response.data);
+  const messages = data?.messages;
+  if (!Array.isArray(messages)) {
+    return [];
+  }
+
+  return messages
+    .map((message) => asObjectRecord(message))
+    .filter((message): message is GroupHistoryMessage => Boolean(message));
+}
+
+function formatHistoryMessageContent(message: GroupHistoryMessage): string {
+  const rawMessage = stringifyMessageContent(
+    message.raw_message ?? message.message ?? message.content,
+  );
+  return rawMessage?.trim() ?? "";
+}
+
+function historyMessageToConversationTurn(groupId: string, message: GroupHistoryMessage): ConversationTurn | null {
+  const timestampMs = readHistoryMessageTimestampMs(message);
+  const content = formatHistoryMessageContent(message);
+  if (timestampMs === null || !content) {
+    return null;
+  }
+
+  const sender = asObjectRecord(message.sender) ?? {};
+  const senderName = asOptionalText(sender.nickname ?? sender.card ?? message.nickname ?? message.senderName);
+  const userId = asOptionalText(message.user_id ?? sender.user_id ?? sender.uin);
+  const role = senderName?.trim().toLowerCase() === "holly" ? "assistant" : "user";
+
+  return {
+    groupId,
+    role,
+    senderName,
+    userId,
+    content,
+    timestamp: new Date(timestampMs).toISOString(),
+  };
 }
 
 async function persistIncomingMessage(record: ParsedIncomingMessage): Promise<void> {
@@ -1319,6 +1507,7 @@ function parseReplyGroupId(groupId: string | null): number {
 
 function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
   const referenceTs = parseIsoTimestamp(referenceTime);
+  const dayRange = getLocalDayRange(referenceTime);
   const filtered = referenceTs === null
     ? turns
     : turns.filter((turn) => {
@@ -1327,10 +1516,40 @@ function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string
           return true;
         }
 
-        return turnTs <= referenceTs && referenceTs - turnTs <= THREAD_HARD_CUTOFF_MS;
+        return turnTs <= referenceTs && turnTs >= dayRange.startMs && turnTs < dayRange.endMs;
       });
 
   return filtered.slice(-CONVERSATION_HISTORY_LIMIT);
+}
+
+function getConversationTurnKey(turn: ConversationTurn): string {
+  return [
+    turn.timestamp,
+    turn.role,
+    normalizeConversationGroupKey(turn.groupId) ?? "",
+    turn.userId ?? "",
+    turn.senderName ?? "",
+    turn.content,
+  ].join("\u0000");
+}
+
+function mergeConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
+  const deduped = new Map<string, ConversationTurn>();
+  for (const turn of turns) {
+    const content = turn.content.trim();
+    if (!content) {
+      continue;
+    }
+    deduped.set(getConversationTurnKey({ ...turn, content }), { ...turn, content });
+  }
+
+  const sorted = Array.from(deduped.values()).sort((left, right) => {
+    const leftTs = parseIsoTimestamp(left.timestamp) ?? 0;
+    const rightTs = parseIsoTimestamp(right.timestamp) ?? 0;
+    return leftTs - rightTs;
+  });
+
+  return pruneConversationTurns(sorted, referenceTime);
 }
 
 function appendConversationTurn(turn: ConversationTurn): void {
@@ -1341,10 +1560,7 @@ function appendConversationTurn(turn: ConversationTurn): void {
   }
 
   const existing = conversationHistoryByGroup.get(groupKey) ?? [];
-  const next = pruneConversationTurns(
-    [...existing, { ...turn, content }],
-    turn.timestamp,
-  );
+  const next = mergeConversationTurns([...existing, { ...turn, content }], turn.timestamp);
   conversationHistoryByGroup.set(groupKey, next);
 }
 
@@ -1366,9 +1582,135 @@ function buildConversationMessages(context: ModelRequestContext, currentMessage:
     );
   });
 
-  return turns
-    .slice(-CONVERSATION_CONTEXT_WINDOW)
-    .map(formatConversationTurnForModel);
+  return turns.map(formatConversationTurnForModel);
+}
+
+function hasConversationContextForGroup(groupId: string | null, referenceTime: string): boolean {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey) {
+    return false;
+  }
+
+  const existing = conversationHistoryByGroup.get(groupKey) ?? [];
+  const pruned = pruneConversationTurns(existing, referenceTime);
+  if (pruned.length !== existing.length) {
+    if (pruned.length > 0) {
+      conversationHistoryByGroup.set(groupKey, pruned);
+    } else {
+      conversationHistoryByGroup.delete(groupKey);
+    }
+  }
+
+  return pruned.length > 0;
+}
+
+async function bootstrapTodayGroupHistoryContext(groupId: string, referenceTime: string): Promise<void> {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey) {
+    return;
+  }
+
+  const { startMs, endMs } = getLocalDayRange(referenceTime);
+  const loadedTurns: ConversationTurn[] = [];
+  let messageSeq = "0";
+
+  pushMonitorEntry(
+    "status",
+    "Context Bootstrap",
+    `group_id=${groupKey}\nLoading today's group history into context.`,
+  );
+
+  for (let page = 0; page < GROUP_HISTORY_BOOTSTRAP_MAX_PAGES; page += 1) {
+    const response = await sendWsAction("get_group_msg_history", {
+      group_id: groupKey,
+      message_seq: messageSeq,
+      count: GROUP_HISTORY_BOOTSTRAP_PAGE_SIZE,
+      reverse_order: true,
+      reverseOrder: true,
+      disable_get_url: true,
+      parse_mult_msg: false,
+      quick_reply: false,
+    });
+
+    const messages = extractGroupHistoryMessages(response);
+    if (messages.length === 0) {
+      break;
+    }
+
+    let oldestTimestampMs: number | null = null;
+    let oldestSequence: string | null = null;
+    for (const historyMessage of messages) {
+      const timestampMs = readHistoryMessageTimestampMs(historyMessage);
+      const sequence = readHistoryMessageSequence(historyMessage);
+      if (timestampMs !== null && (oldestTimestampMs === null || timestampMs < oldestTimestampMs)) {
+        oldestTimestampMs = timestampMs;
+        oldestSequence = sequence;
+      }
+
+      if (timestampMs === null || timestampMs < startMs || timestampMs >= endMs) {
+        continue;
+      }
+
+      const turn = historyMessageToConversationTurn(groupKey, historyMessage);
+      if (turn) {
+        loadedTurns.push(turn);
+      }
+    }
+
+    if (oldestTimestampMs !== null && oldestTimestampMs < startMs) {
+      break;
+    }
+
+    if (!oldestSequence || oldestSequence === messageSeq) {
+      break;
+    }
+
+    messageSeq = oldestSequence;
+  }
+
+  if (loadedTurns.length === 0) {
+    pushMonitorEntry(
+      "status",
+      "Context Bootstrap",
+      `group_id=${groupKey}\nNo messages found for today's group history.`,
+    );
+    return;
+  }
+
+  const existing = conversationHistoryByGroup.get(groupKey) ?? [];
+  const next = mergeConversationTurns([...existing, ...loadedTurns], referenceTime);
+  conversationHistoryByGroup.set(groupKey, next);
+  pushMonitorEntry(
+    "status",
+    "Context Bootstrap",
+    `group_id=${groupKey}\nLoaded ${next.length} messages from today's group history into context.`,
+  );
+}
+
+async function ensureTodayGroupHistoryContext(groupId: string | null, referenceTime: string): Promise<void> {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey || hasConversationContextForGroup(groupKey, referenceTime)) {
+    return;
+  }
+
+  const existingBootstrap = conversationHistoryBootstrapByGroup.get(groupKey);
+  if (existingBootstrap) {
+    await existingBootstrap;
+    return;
+  }
+
+  const bootstrap = bootstrapTodayGroupHistoryContext(groupKey, referenceTime)
+    .catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Context Bootstrap Error", `group_id=${groupKey}\n${detail}`);
+      console.error(`Failed to load group history for ${groupKey}:`, error);
+    })
+    .finally(() => {
+      conversationHistoryBootstrapByGroup.delete(groupKey);
+    });
+
+  conversationHistoryBootstrapByGroup.set(groupKey, bootstrap);
+  await bootstrap;
 }
 
 function buildModelSystemPrompt(basePrompt: string): string {
@@ -2137,6 +2479,10 @@ function connectWebSocketClient(forceReconnect = false): void {
       pushMonitorEntry("status", "Message Skipped", "Sender is holly; skipping model processing.");
       return;
     }
+
+    await handleRepeaterMessage(message);
+
+    await ensureTodayGroupHistoryContext(message.groupId, message.receivedAt);
 
     appendConversationTurn({
       groupId: message.groupId,

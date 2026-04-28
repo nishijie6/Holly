@@ -94,6 +94,7 @@ const PROJECT_AUTH_PATH = path.join(process.cwd(), ".codex", "auth.json");
 const HOME_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const TOKEN_REFRESH_BUFFER_MS = 300_000;
 const REQUEST_TIMEOUT_MS = 30_000;
+const FETCH_FAILED_MAX_ATTEMPTS = 5;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 
 function isFetchFailedError(error: unknown): boolean {
@@ -448,7 +449,7 @@ function extractCodexText(rawResult: unknown): string {
 async function requestCodexText(model: string, systemPrompt: string, messages: LlmMessage[]): Promise<string> {
   let creds = await getCodexCredentials();
   const body = buildCodexRequest(model, systemPrompt, messages);
-  let retriedFetchFailed = false;
+  let fetchAttempts = 0;
 
   let authAttempt = 0;
   while (authAttempt < 2) {
@@ -457,6 +458,7 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
     logCodexRequest(body, headers);
     let res: Response;
     try {
+      fetchAttempts += 1;
       res = await fetch(CODEX_RESPONSES_URL, {
         method: "POST",
         headers,
@@ -464,9 +466,10 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
-      if (!retriedFetchFailed && isFetchFailedError(error)) {
-        retriedFetchFailed = true;
-        console.warn("Codex request fetch failed; retrying once.");
+      if (isFetchFailedError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+        console.warn(
+          `Codex request fetch failed; retrying (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
+        );
         continue;
       }
       throw error;
