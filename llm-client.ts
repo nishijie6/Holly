@@ -95,10 +95,15 @@ const HOME_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const TOKEN_REFRESH_BUFFER_MS = 300_000;
 const REQUEST_TIMEOUT_MS = 30_000;
 const FETCH_FAILED_MAX_ATTEMPTS = 5;
+const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 
 function isFetchFailedError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function loadConfig(configPath: string): Promise<AppConfig> {
@@ -468,8 +473,9 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
     } catch (error) {
       if (isFetchFailedError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
         console.warn(
-          `Codex request fetch failed; retrying (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
+          `Codex request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
         );
+        await delay(FETCH_FAILED_RETRY_DELAY_MS);
         continue;
       }
       throw error;

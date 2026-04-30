@@ -57,6 +57,7 @@ type ModelRequestContext = {
   senderName: string | null;
   rawMessage: string | null;
   receivedAt: string;
+  repeaterCandidate?: RepeaterCandidate | null;
 };
 
 type ModelDecision = {
@@ -90,6 +91,13 @@ type RepeatState = {
   count: number;
   repeated: boolean;
   triggeredContents: Set<string>;
+};
+
+type RepeaterCandidate = {
+  groupId: string;
+  normalizedContent: string;
+  originalContent: string;
+  count: number;
 };
 
 type GroupHistoryMessage = Record<string, unknown>;
@@ -193,6 +201,8 @@ const MODEL_DECISION_PROMPT = [
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
+  "- If the current message includes a repeater candidate notice, it means the group has repeated the same content at least three times. Decide naturally whether Holly should join the repeat. It is optional, not mandatory.",
+  "- For a repeater candidate, only set should_reply to true if Holly should send exactly the repeated content. Otherwise set should_reply to false.",
   "- thinking_process must be a short decision summary for logging, not a detailed chain-of-thought.",
   "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
@@ -1148,11 +1158,11 @@ function getRepeatableMessageContent(message: ParsedIncomingMessage): {
   };
 }
 
-async function handleRepeaterMessage(message: ParsedIncomingMessage): Promise<void> {
+function buildRepeaterCandidate(message: ParsedIncomingMessage): RepeaterCandidate | null {
   const groupKey = normalizeConversationGroupKey(message.groupId);
   const repeatable = getRepeatableMessageContent(message);
   if (!groupKey || !repeatable) {
-    return;
+    return null;
   }
 
   const existing = repeatStateByGroup.get(groupKey);
@@ -1175,26 +1185,37 @@ async function handleRepeaterMessage(message: ParsedIncomingMessage): Promise<vo
   repeatStateByGroup.set(groupKey, nextState);
 
   if (
-    nextState.count >= 3 &&
-    !nextState.repeated &&
-    !triggeredContents.has(nextState.normalizedContent)
+    nextState.count < 3 ||
+    nextState.repeated ||
+    triggeredContents.has(nextState.normalizedContent)
   ) {
-    nextState.repeated = true;
-    triggeredContents.add(nextState.normalizedContent);
-    repeatStateByGroup.set(groupKey, nextState);
-    try {
-      await sendGroupMessage(parseReplyGroupId(groupKey), nextState.originalContent);
-      pushMonitorEntry(
-        "outgoing",
-        "Repeater Message Sent",
-        `group_id=${groupKey}\n${nextState.originalContent}`,
-      );
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Repeater Error", `group_id=${groupKey}\n${detail}`);
-      console.error("Failed to send repeater message:", error);
-    }
+    return null;
   }
+
+  nextState.repeated = true;
+  triggeredContents.add(nextState.normalizedContent);
+  repeatStateByGroup.set(groupKey, nextState);
+
+  return {
+    groupId: groupKey,
+    normalizedContent: nextState.normalizedContent,
+    originalContent: nextState.originalContent,
+    count: nextState.count,
+  };
+}
+
+function formatRepeaterCandidateNotice(candidate: RepeaterCandidate | null | undefined): string {
+  if (!candidate) {
+    return "";
+  }
+
+  return [
+    "Repeater candidate:",
+    `- The same group message content has appeared ${candidate.count} times consecutively.`,
+    "- This is only a candidate. Decide whether Holly should naturally join the repeat.",
+    "- If joining, final_answer must be exactly the repeated content below.",
+    `- repeated_content: ${candidate.originalContent}`,
+  ].join("\n");
 }
 
 function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingMessage {
@@ -2303,7 +2324,11 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
   };
   const memoryPrompt = await buildMemoryPrompt(effectiveContext, message);
   const conversationMessages = buildConversationMessages(effectiveContext, message);
-  const currentModelMessage = formatCurrentMessageForModel(effectiveContext, message);
+  const repeaterNotice = formatRepeaterCandidateNotice(effectiveContext.repeaterCandidate);
+  const currentModelMessage = [
+    formatCurrentMessageForModel(effectiveContext, message),
+    repeaterNotice,
+  ].filter(Boolean).join("\n\n");
   const preparedRequest = prepareModelRequest(
     client.systemPrompt,
     memoryPrompt,
@@ -2480,7 +2505,14 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
-    await handleRepeaterMessage(message);
+    const repeaterCandidate = buildRepeaterCandidate(message);
+    if (repeaterCandidate) {
+      pushMonitorEntry(
+        "status",
+        "Repeater Candidate",
+        `group_id=${repeaterCandidate.groupId}\ncount=${repeaterCandidate.count}\n${repeaterCandidate.originalContent}`,
+      );
+    }
 
     await ensureTodayGroupHistoryContext(message.groupId, message.receivedAt);
 
@@ -2498,6 +2530,7 @@ function connectWebSocketClient(forceReconnect = false): void {
       senderName: message.senderName,
       rawMessage: message.rawMessage,
       receivedAt: message.receivedAt,
+      repeaterCandidate,
     });
   });
 
