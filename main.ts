@@ -49,7 +49,10 @@ type MonitorConversationPreview = {
   compressThresholdTokens: number;
 };
 
-type ParsedIncomingMessage = Omit<IncomingMessageRecord, "sequence">;
+type ParsedIncomingMessage = Omit<IncomingMessageRecord, "sequence"> & {
+  messageTimestampMs: number | null;
+  messageLagMs: number | null;
+};
 
 type ModelRequestContext = {
   groupId: string | null;
@@ -57,6 +60,7 @@ type ModelRequestContext = {
   senderName: string | null;
   rawMessage: string | null;
   receivedAt: string;
+  messageLagMs: number | null;
   repeaterCandidate?: RepeaterCandidate | null;
 };
 
@@ -182,6 +186,7 @@ const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
+const MESSAGE_REPLY_MAX_AGE_MS = 5 * 60 * 1000;
 const CONVERSATION_HISTORY_LIMIT = 5000;
 const GROUP_HISTORY_BOOTSTRAP_PAGE_SIZE = 50;
 const GROUP_HISTORY_BOOTSTRAP_MAX_PAGES = 200;
@@ -198,6 +203,7 @@ const MODEL_DECISION_PROMPT = [
   '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
   "Rules:",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
+  "- If the current message metadata says message_age_seconds is greater than 300, set should_reply to false because the message is too old.",
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
@@ -409,7 +415,7 @@ function buildCompressedConversationSummary(messages: readonly LlmMessage[], bud
   );
 
   for (const message of messages) {
-    const roleLabel = message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
+    const roleLabel = message.role === "assistant" ? "Holly" : message.role === "system" ? "system" : "user";
     const line = `- ${roleLabel}: ${compactTextToTokenBudget(message.content, perLineBudget)}`;
     const next = `${result}\n${line}`;
     if (estimateTextTokens(next) > budgetTokens) {
@@ -909,6 +915,49 @@ function stringifyMessageContent(value: unknown): string | null {
   return JSON.stringify(value);
 }
 
+function readMessageTimestampMs(record: Record<string, unknown>): number | null {
+  const candidates = [
+    record.msgTime,
+    record.time,
+    record.message_time,
+    record.timestamp,
+  ];
+
+  for (const candidate of candidates) {
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return candidate > 10_000_000_000 ? candidate : candidate * 1000;
+    }
+
+    if (typeof candidate === "string") {
+      const numeric = Number(candidate);
+      if (Number.isFinite(numeric)) {
+        return numeric > 10_000_000_000 ? numeric : numeric * 1000;
+      }
+
+      const parsed = Date.parse(candidate);
+      if (Number.isFinite(parsed)) {
+        return parsed;
+      }
+    }
+  }
+
+  return null;
+}
+
+function formatDisplayMessageTime(timestampMs: number): string {
+  return new Date(timestampMs).toLocaleTimeString("zh-CN", {
+    hour12: false,
+  });
+}
+
+function formatMessageAgeSeconds(lagMs: number | null): string {
+  if (lagMs === null) {
+    return "unknown";
+  }
+
+  return String(Math.floor(lagMs / 1000));
+}
+
 function asObjectRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     return null;
@@ -1221,10 +1270,13 @@ function formatRepeaterCandidateNotice(candidate: RepeaterCandidate | null | und
 function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingMessage {
   const buffer = toBuffer(data);
   const receivedAt = new Date().toISOString();
+  const receivedAtMs = Date.parse(receivedAt);
 
   if (isBinary) {
     return {
       receivedAt,
+      messageTimestampMs: null,
+      messageLagMs: null,
       isBinary: true,
       rawEncoding: "base64",
       rawContent: buffer.toString("base64"),
@@ -1242,6 +1294,8 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
   const content = buffer.toString("utf-8");
   const fallback: ParsedIncomingMessage = {
     receivedAt,
+    messageTimestampMs: null,
+    messageLagMs: null,
     isBinary: false,
     rawEncoding: "utf8",
     rawContent: content,
@@ -1267,10 +1321,15 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
     const senderName = asOptionalText(sender.nickname);
     const userId = asOptionalText(payload.user_id ?? sender.user_id);
     const rawMessage = stringifyMessageContent(payload.raw_message);
+    const messageTimestampMs = readMessageTimestampMs(payload);
+    const messageLagMs = messageTimestampMs === null ? null : receivedAtMs - messageTimestampMs;
+    const displayTime = formatDisplayMessageTime(messageTimestampMs ?? receivedAtMs);
 
     if (messageType !== "group") {
       return {
         ...fallback,
+        messageTimestampMs,
+        messageLagMs,
         messageType,
         groupId,
         groupName,
@@ -1285,13 +1344,15 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
 
     return {
       ...fallback,
+      messageTimestampMs,
+      messageLagMs,
       messageType,
       groupId,
       groupName,
       userId,
       senderName,
       rawMessage,
-      displayText: rawMessage ? `${prefix} ${rawMessage}`.trim() : prefix,
+      displayText: rawMessage ? `${displayTime} ${prefix} ${rawMessage}`.trim() : `${displayTime} ${prefix}`,
     };
   } catch (error) {
     void error;
@@ -1585,6 +1646,16 @@ function appendConversationTurn(turn: ConversationTurn): void {
   conversationHistoryByGroup.set(groupKey, next);
 }
 
+function getLatestConversationTurn(groupId: string | null): ConversationTurn | null {
+  const groupKey = normalizeConversationGroupKey(groupId);
+  if (!groupKey) {
+    return null;
+  }
+
+  const turns = conversationHistoryByGroup.get(groupKey) ?? [];
+  return turns.at(-1) ?? null;
+}
+
 function buildConversationMessages(context: ModelRequestContext, currentMessage: string): LlmMessage[] {
   const groupKey = normalizeConversationGroupKey(context.groupId);
   if (!groupKey) {
@@ -1787,7 +1858,17 @@ function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
 }
 
 function formatCurrentMessageForModel(context: ModelRequestContext, currentMessage: string): string {
-  return formatSameGroupUserContent(currentMessage, context.senderName, context.userId);
+  const metadata = [
+    "Current message metadata:",
+    `- message_age_seconds: ${formatMessageAgeSeconds(context.messageLagMs)}`,
+    `- stale_after_seconds: ${Math.floor(MESSAGE_REPLY_MAX_AGE_MS / 1000)}`,
+    "- If message_age_seconds is greater than stale_after_seconds, do not reply.",
+  ].join("\n");
+
+  return [
+    metadata,
+    formatSameGroupUserContent(currentMessage, context.senderName, context.userId),
+  ].join("\n\n");
 }
 
 function formatMemoryLine(record: StoredMemoryRecord): string | null {
@@ -2371,6 +2452,16 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     return;
   }
 
+  const latestTurn = getLatestConversationTurn(effectiveContext.groupId);
+  if (latestTurn?.role === "assistant") {
+    pushMonitorEntry(
+      "status",
+      "Reply Skipped",
+      "Latest same-group conversation turn is already an assistant message; waiting for another user message before speaking again.",
+    );
+    return;
+  }
+
   await sendGroupMessage(replyGroupId, decision.finalAnswer);
   appendConversationTurn({
     groupId: effectiveContext.groupId,
@@ -2524,12 +2615,23 @@ function connectWebSocketClient(forceReconnect = false): void {
       content: message.displayText,
       timestamp: message.receivedAt,
     });
+
+    if (message.messageLagMs !== null && message.messageLagMs > MESSAGE_REPLY_MAX_AGE_MS) {
+      pushMonitorEntry(
+        "status",
+        "Message Skipped",
+        `Message is older than 5 minutes; added to context but skipping model processing.\nage_seconds=${formatMessageAgeSeconds(message.messageLagMs)}\n${message.displayText}`,
+      );
+      return;
+    }
+
     enqueueMessageForModel(message.displayText, {
       groupId: message.groupId,
       userId: message.userId,
       senderName: message.senderName,
       rawMessage: message.rawMessage,
       receivedAt: message.receivedAt,
+      messageLagMs: message.messageLagMs,
       repeaterCandidate,
     });
   });
@@ -2994,7 +3096,7 @@ const WS_MONITOR_PAGE = `<!DOCTYPE html>
 
         const role = document.createElement("span");
         role.textContent =
-          message.role === "assistant" ? "Assistant" : message.role === "system" ? "System" : "User";
+          message.role === "assistant" ? "Holly" : message.role === "system" ? "System" : "User";
 
         const order = document.createElement("span");
         order.textContent = "#" + String(index + 1);
