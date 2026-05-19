@@ -61,7 +61,6 @@ type ModelRequestContext = {
   rawMessage: string | null;
   receivedAt: string;
   messageLagMs: number | null;
-  repeaterCandidate?: RepeaterCandidate | null;
 };
 
 type ModelDecision = {
@@ -87,21 +86,6 @@ type ConversationTurn = {
   userId: string | null;
   content: string;
   timestamp: string;
-};
-
-type RepeatState = {
-  normalizedContent: string;
-  originalContent: string;
-  count: number;
-  repeated: boolean;
-  triggeredContents: Set<string>;
-};
-
-type RepeaterCandidate = {
-  groupId: string;
-  normalizedContent: string;
-  originalContent: string;
-  count: number;
 };
 
 type GroupHistoryMessage = Record<string, unknown>;
@@ -207,8 +191,6 @@ const MODEL_DECISION_PROMPT = [
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
-  "- If the current message includes a repeater candidate notice, it means the group has repeated the same content at least three times. Decide naturally whether Holly should join the repeat. It is optional, not mandatory.",
-  "- For a repeater candidate, only set should_reply to true if Holly should send exactly the repeated content. Otherwise set should_reply to false.",
   "- thinking_process must be a short decision summary for logging, not a detailed chain-of-thought.",
   "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
@@ -228,7 +210,6 @@ let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
-let repeatStateByGroup = new Map<string, RepeatState>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
 let pendingWsActions = new Map<string, PendingWsAction>();
 let configWatcher: FSWatcher | null = null;
@@ -1185,86 +1166,6 @@ async function enrichMessageWithImageOcr(message: ParsedIncomingMessage): Promis
 
 function isHollyMessage(message: ParsedIncomingMessage): boolean {
   return (message.senderName ?? "").trim().toLowerCase() === "holly";
-}
-
-function getRepeatableMessageContent(message: ParsedIncomingMessage): {
-  normalizedContent: string;
-  originalContent: string;
-} | null {
-  const originalContent = message.rawMessage?.trim() ?? "";
-  if (!originalContent) {
-    return null;
-  }
-
-  const normalizedContent = originalContent.trim();
-  if (!normalizedContent) {
-    return null;
-  }
-
-  return {
-    normalizedContent,
-    originalContent,
-  };
-}
-
-function buildRepeaterCandidate(message: ParsedIncomingMessage): RepeaterCandidate | null {
-  const groupKey = normalizeConversationGroupKey(message.groupId);
-  const repeatable = getRepeatableMessageContent(message);
-  if (!groupKey || !repeatable) {
-    return null;
-  }
-
-  const existing = repeatStateByGroup.get(groupKey);
-  const triggeredContents = existing?.triggeredContents ?? new Set<string>();
-  const nextState: RepeatState = existing?.normalizedContent === repeatable.normalizedContent
-    ? {
-        ...existing,
-        originalContent: repeatable.originalContent,
-        count: existing.count + 1,
-        triggeredContents,
-      }
-    : {
-        normalizedContent: repeatable.normalizedContent,
-        originalContent: repeatable.originalContent,
-        count: 1,
-        repeated: false,
-        triggeredContents,
-      };
-
-  repeatStateByGroup.set(groupKey, nextState);
-
-  if (
-    nextState.count < 3 ||
-    nextState.repeated ||
-    triggeredContents.has(nextState.normalizedContent)
-  ) {
-    return null;
-  }
-
-  nextState.repeated = true;
-  triggeredContents.add(nextState.normalizedContent);
-  repeatStateByGroup.set(groupKey, nextState);
-
-  return {
-    groupId: groupKey,
-    normalizedContent: nextState.normalizedContent,
-    originalContent: nextState.originalContent,
-    count: nextState.count,
-  };
-}
-
-function formatRepeaterCandidateNotice(candidate: RepeaterCandidate | null | undefined): string {
-  if (!candidate) {
-    return "";
-  }
-
-  return [
-    "Repeater candidate:",
-    `- The same group message content has appeared ${candidate.count} times consecutively.`,
-    "- This is only a candidate. Decide whether Holly should naturally join the repeat.",
-    "- If joining, final_answer must be exactly the repeated content below.",
-    `- repeated_content: ${candidate.originalContent}`,
-  ].join("\n");
 }
 
 function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingMessage {
@@ -2405,11 +2306,7 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
   };
   const memoryPrompt = await buildMemoryPrompt(effectiveContext, message);
   const conversationMessages = buildConversationMessages(effectiveContext, message);
-  const repeaterNotice = formatRepeaterCandidateNotice(effectiveContext.repeaterCandidate);
-  const currentModelMessage = [
-    formatCurrentMessageForModel(effectiveContext, message),
-    repeaterNotice,
-  ].filter(Boolean).join("\n\n");
+  const currentModelMessage = formatCurrentMessageForModel(effectiveContext, message);
   const preparedRequest = prepareModelRequest(
     client.systemPrompt,
     memoryPrompt,
@@ -2596,15 +2493,6 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
-    const repeaterCandidate = buildRepeaterCandidate(message);
-    if (repeaterCandidate) {
-      pushMonitorEntry(
-        "status",
-        "Repeater Candidate",
-        `group_id=${repeaterCandidate.groupId}\ncount=${repeaterCandidate.count}\n${repeaterCandidate.originalContent}`,
-      );
-    }
-
     await ensureTodayGroupHistoryContext(message.groupId, message.receivedAt);
 
     appendConversationTurn({
@@ -2632,7 +2520,6 @@ function connectWebSocketClient(forceReconnect = false): void {
       rawMessage: message.rawMessage,
       receivedAt: message.receivedAt,
       messageLagMs: message.messageLagMs,
-      repeaterCandidate,
     });
   });
 
