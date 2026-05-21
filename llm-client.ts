@@ -377,7 +377,7 @@ function buildCodexRequest(model: string, systemPrompt: string, messages: LlmMes
   };
 }
 
-async function readCodexStreamText(res: Response): Promise<string> {
+async function readCodexStreamText(res: Response, model: string): Promise<string> {
   const body = res.body;
   if (!body) {
     return "";
@@ -405,6 +405,15 @@ async function readCodexStreamText(res: Response): Promise<string> {
         event = JSON.parse(payload);
       } catch {
         continue;
+      }
+
+      if ((event.type === "response.completed" || event.type === "response.done") && event.response && typeof event.response === "object") {
+        const usage = (event.response as Record<string, unknown>).usage;
+        if (usage && typeof usage === "object") {
+          const u = usage as Record<string, unknown>;
+          const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+          recordCallTokenUsage(model, num(u.input_tokens), num(u.output_tokens));
+        }
       }
 
       if (event.type === "response.output_text.delta") {
@@ -515,7 +524,7 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
       throw new Error(`Codex API error ${res.status}: ${errorText || "<empty>"}`);
     }
 
-    return readCodexStreamText(res);
+    return readCodexStreamText(res, model);
   }
 
   throw new Error("Codex request failed after retry.");
@@ -716,6 +725,45 @@ export function getLatestClaudeUsage(): ClaudeUsage | null {
   return latestClaudeUsage;
 }
 
+export type CallTokenUsage = {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  capturedAt: number;
+};
+
+let latestCallTokenUsage: CallTokenUsage | null = null;
+
+// Consume the most recent call's token usage exactly once. The model queue is
+// serial, so each generateText() is followed by one consume with no races.
+export function consumeLatestCallTokenUsage(): CallTokenUsage | null {
+  const usage = latestCallTokenUsage;
+  latestCallTokenUsage = null;
+  return usage;
+}
+
+function recordCallTokenUsage(model: string, inputTokens: number, outputTokens: number): void {
+  latestCallTokenUsage = {
+    model,
+    inputTokens: Number.isFinite(inputTokens) ? Math.max(0, inputTokens) : 0,
+    outputTokens: Number.isFinite(outputTokens) ? Math.max(0, outputTokens) : 0,
+    capturedAt: Date.now(),
+  };
+}
+
+function readClaudeUsageTokens(data: unknown): { input: number; output: number } | null {
+  if (!data || typeof data !== "object") return null;
+  const usage = (data as Record<string, unknown>).usage;
+  if (!usage || typeof usage !== "object") return null;
+  const u = usage as Record<string, unknown>;
+  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
+  // Count cache writes/reads as input too, so totals reflect real tokens processed.
+  const input = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+  const output = num(u.output_tokens);
+  if (input === 0 && output === 0) return null;
+  return { input, output };
+}
+
 function parseUsageUtilization(value: string | null): number | null {
   if (value === null) {
     return null;
@@ -833,10 +881,49 @@ async function requestClaudeText(
     }
 
     captureClaudeUsage(res);
-    return extractClaudeText(await res.json());
+    const data = await res.json();
+    const tokens = readClaudeUsageTokens(data);
+    if (tokens) {
+      recordCallTokenUsage(model, tokens.input, tokens.output);
+    }
+    return extractClaudeText(data);
   }
 
   throw new Error("Claude request failed after retry.");
+}
+
+// Minimal request whose only purpose is to capture the rate-limit headers so the
+// usage panel can show data before the first real chat happens.
+export async function probeClaudeUsage(model: string): Promise<ClaudeUsage | null> {
+  try {
+    const creds = await getClaudeCredentials();
+    const body = {
+      model,
+      max_tokens: 1,
+      system: [{ type: "text", text: CLAUDE_CODE_IDENTITY }],
+      messages: [{ role: "user", content: "ping" }],
+    };
+    const res = await fetch(CLAUDE_MESSAGES_URL, {
+      method: "POST",
+      headers: buildClaudeHeaders(creds.accessToken),
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+    });
+    // 429 responses still carry the unified rate-limit headers.
+    if (res.ok || res.status === 429) {
+      captureClaudeUsage(res);
+    }
+    if (res.ok) {
+      const data = await res.json().catch(() => null);
+      const tokens = readClaudeUsageTokens(data);
+      if (tokens) {
+        recordCallTokenUsage(model, tokens.input, tokens.output);
+      }
+    }
+  } catch {
+    // Best-effort probe; fall back to whatever is cached.
+  }
+  return getLatestClaudeUsage();
 }
 
 export async function resolveLlmProfile(configPath: string, requestedProfileName?: string): Promise<ResolvedLlmProfile> {

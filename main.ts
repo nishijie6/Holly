@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, appendFile, readFile } from "node:fs/promises";
+import { mkdir, appendFile, readFile, writeFile } from "node:fs/promises";
 import { existsSync, watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,7 +9,9 @@ import { WebSocket, type RawData } from "ws";
 import YAML from "yaml";
 import {
   createLlmClient,
+  consumeLatestCallTokenUsage,
   getLatestClaudeUsage,
+  probeClaudeUsage,
   listLlmProfiles,
   setActiveLlmProfile,
   type ClaudeUsage,
@@ -138,6 +140,7 @@ type MonitorSnapshot = {
   history: MonitorEntry[];
   conversationPreview: MonitorConversationPreview | null;
   claudeUsage: ClaudeUsage | null;
+  tokenStats: DailyTokenStats;
 };
 
 type MonitorEvent =
@@ -161,7 +164,24 @@ type MonitorEvent =
   | {
       type: "usage";
       claudeUsage: ClaudeUsage | null;
+    }
+  | {
+      type: "tokens";
+      tokenStats: DailyTokenStats;
     };
+
+type ModelTokenStat = {
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+};
+
+type DailyTokenStats = {
+  date: string;
+  models: ModelTokenStat[];
+  totalTokens: number;
+};
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -822,6 +842,100 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 
   const raw = Buffer.concat(chunks).toString("utf-8");
   return raw ? JSON.parse(raw) : {};
+}
+
+const TOKEN_STATS_PATH = join(LOG_DIR, "token-usage.json");
+
+type ModelTokenCounts = { inputTokens: number; outputTokens: number };
+
+let tokenStatsByDate = new Map<string, Map<string, ModelTokenCounts>>();
+let tokenStatsSaveQueue: Promise<void> = Promise.resolve();
+
+function localDateKey(date = new Date()): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+async function loadTokenStats(): Promise<void> {
+  try {
+    const raw = await readFile(TOKEN_STATS_PATH, "utf-8");
+    const parsed = JSON.parse(raw) as Record<string, Record<string, ModelTokenCounts>>;
+    const next = new Map<string, Map<string, ModelTokenCounts>>();
+    for (const [date, models] of Object.entries(parsed)) {
+      const modelMap = new Map<string, ModelTokenCounts>();
+      for (const [model, counts] of Object.entries(models)) {
+        modelMap.set(model, {
+          inputTokens: Number(counts?.inputTokens) || 0,
+          outputTokens: Number(counts?.outputTokens) || 0,
+        });
+      }
+      next.set(date, modelMap);
+    }
+    tokenStatsByDate = next;
+  } catch {
+    // No stats file yet; start with an empty map.
+  }
+}
+
+function persistTokenStats(): void {
+  tokenStatsSaveQueue = tokenStatsSaveQueue
+    .then(async () => {
+      const plain: Record<string, Record<string, ModelTokenCounts>> = {};
+      for (const [date, models] of tokenStatsByDate) {
+        plain[date] = {};
+        for (const [model, counts] of models) {
+          plain[date][model] = counts;
+        }
+      }
+      await mkdir(LOG_DIR, { recursive: true });
+      await writeFile(TOKEN_STATS_PATH, JSON.stringify(plain, null, 2), "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to persist token stats:", error);
+    });
+}
+
+function recordTokenUsage(model: string, inputTokens: number, outputTokens: number): void {
+  if (!model || (inputTokens <= 0 && outputTokens <= 0)) {
+    return;
+  }
+  const date = localDateKey();
+  let models = tokenStatsByDate.get(date);
+  if (!models) {
+    models = new Map<string, ModelTokenCounts>();
+    tokenStatsByDate.set(date, models);
+  }
+  let counts = models.get(model);
+  if (!counts) {
+    counts = { inputTokens: 0, outputTokens: 0 };
+    models.set(model, counts);
+  }
+  counts.inputTokens += inputTokens;
+  counts.outputTokens += outputTokens;
+  persistTokenStats();
+}
+
+function getTodayTokenStats(): DailyTokenStats {
+  const date = localDateKey();
+  const models = tokenStatsByDate.get(date);
+  const list: ModelTokenStat[] = [];
+  let totalTokens = 0;
+  if (models) {
+    for (const [model, counts] of models) {
+      const total = counts.inputTokens + counts.outputTokens;
+      totalTokens += total;
+      list.push({
+        model,
+        inputTokens: counts.inputTokens,
+        outputTokens: counts.outputTokens,
+        totalTokens: total,
+      });
+    }
+  }
+  list.sort((a, b) => b.totalTokens - a.totalTokens);
+  return { date, models: list, totalTokens };
 }
 
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -1582,6 +1696,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     history: monitorHistory,
     conversationPreview: latestConversationPreview,
     claudeUsage: getLatestClaudeUsage(),
+    tokenStats: getTodayTokenStats(),
   };
 }
 
@@ -2484,6 +2599,12 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
 
   broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
 
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+
   const decision = parseModelDecision(reply);
   const content = formatModelReplyEntry(decision);
   await appendChatLog("assistant", content);
@@ -2937,6 +3058,17 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
                 </div>
                 <span style="opacity:.7;">Updated {{ fmtTime(new Date(claudeUsage.capturedAt).toISOString()) }}</span>
               </div>
+              <div v-if="tokenStats && tokenStats.models && tokenStats.models.length" style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted,#64748b);margin-top:4px;">
+                <span>Token Usage &middot; {{ tokenStats.date }}</span>
+                <div v-for="m in tokenStats.models" :key="m.model" style="display:flex;justify-content:space-between;gap:8px;">
+                  <span style="opacity:.85;">{{ m.model }}</span>
+                  <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(m.totalTokens) }}</span>
+                </div>
+                <div style="display:flex;justify-content:space-between;gap:8px;border-top:1px solid #eef2f7;padding-top:2px;font-weight:600;">
+                  <span>Total</span>
+                  <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(tokenStats.totalTokens) }}</span>
+                </div>
+              </div>
               <select v-model="selProfile">
                 <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.displayName }}</option>
               </select>
@@ -3114,6 +3246,7 @@ createApp({
     var renderedIds = new Set();
     var convPreview = ref(null);
     var claudeUsage = ref(null);
+    var tokenStats = ref(null);
     var groupEntries = computed(function() {
       return entries.value.filter(function(e) {
         return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
@@ -3233,6 +3366,7 @@ createApp({
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
       if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
+      if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
       var visible = payload.history || [];
       for (var i = visible.length - 1; i >= 0; i--) { pushEntry(visible[i]); }
@@ -3243,6 +3377,7 @@ createApp({
       if (payload.type === 'status') { wsStatus.value = payload.status; return; }
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
+      if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -3378,9 +3513,22 @@ createApp({
       if (t === 'group') { loadGroups(); }
     });
 
+    function fmtNum(n) {
+      if (typeof n !== 'number' || !isFinite(n)) return '0';
+      return n.toLocaleString('en-US');
+    }
+
+    function refreshUsage() {
+      fetch('/api/usage/refresh', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+        if (d.claudeUsage) { claudeUsage.value = d.claudeUsage; }
+        if (d.tokenStats) { tokenStats.value = d.tokenStats; }
+      }).catch(function() {});
+    }
+
     onMounted(function() {
       connectES();
       loadProfiles();
+      refreshUsage();
     });
 
     onUnmounted(function() {
@@ -3389,12 +3537,12 @@ createApp({
 
     return {
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
-      entries, groupEntries, convPreview, convMetaText, claudeUsage,
+      entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset,
+      fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup
     };
   }
@@ -3406,6 +3554,7 @@ createApp({
 
 async function bootstrap(): Promise<void> {
   await applyProxyConfig(CONFIG_PATH);
+  await loadTokenStats();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
@@ -3430,6 +3579,14 @@ async function bootstrap(): Promise<void> {
   );
 
   connectWebSocketClient();
+
+  // Re-broadcast cached usage + today's token stats every 5 minutes. Keeps
+  // late-joining clients in sync and rolls the token panel over to a new day
+  // even when the group is quiet. Per the chosen policy this timer never probes.
+  setInterval(() => {
+    broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }, 5 * 60 * 1000);
 
   const server = createServer(async (req, res) => {
     try {
@@ -3515,6 +3672,25 @@ async function bootstrap(): Promise<void> {
       if (req.method === "POST" && url.pathname === "/api/ws/reconnect") {
         connectWebSocketClient(true);
         sendJson(res, 200, { message: `Reconnecting to ${WS_TARGET_URL}` });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/usage/refresh") {
+        let usage = getLatestClaudeUsage();
+        // User-selected policy: only probe when there is no cached usage yet.
+        if (!usage) {
+          const current = getActiveLlmClient();
+          if (current.provider === "claude") {
+            usage = await probeClaudeUsage(current.model);
+            const callTokens = consumeLatestCallTokenUsage();
+            if (callTokens) {
+              recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+            }
+            broadcastMonitorEvent({ type: "usage", claudeUsage: usage });
+            broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+          }
+        }
+        sendJson(res, 200, { claudeUsage: usage, tokenStats: getTodayTokenStats() });
         return;
       }
 
