@@ -31,6 +31,7 @@ type MonitorEntry = {
   title: string;
   body: string;
   timestamp: string;
+  label?: string;
 };
 
 type MonitorStatus = {
@@ -113,6 +114,7 @@ type RuntimeLlmConfig = {
 
 type AppConfig = {
   llm?: RuntimeLlmConfig;
+  fetch?: { proxy_url?: string };
 };
 
 type ContextBudgetConfig = {
@@ -147,6 +149,11 @@ type MonitorEvent =
   | {
       type: "conversation";
       conversationPreview: MonitorConversationPreview | null;
+    }
+  | {
+      type: "turn";
+      groupId: string;
+      turn: ConversationTurn;
     };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -165,6 +172,9 @@ const WS_HISTORY_LIMIT = 120;
 const APP_SESSION_ID = randomUUID();
 const APP_SESSION_STARTED_AT = new Date().toISOString();
 const WS_ACTION_TIMEOUT_MS = 10_000;
+const URL_FETCH_TIMEOUT_MS = 10_000;
+const URL_FETCH_MAX_PER_MESSAGE = 2;
+const URL_CONTENT_MAX_CHARS = 3000;
 const MEMORY_LOOKBACK_LIMIT = 8;
 const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
@@ -187,7 +197,6 @@ const MODEL_DECISION_PROMPT = [
   '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
   "Rules:",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
-  "- If the current message metadata says message_age_seconds is greater than 300, set should_reply to false because the message is too old.",
   "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
@@ -195,6 +204,16 @@ const MODEL_DECISION_PROMPT = [
   "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
 ].join("\n");
+const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    should_reply: { type: "boolean" },
+    final_answer: { type: "string" },
+    thinking_process: { type: "string" },
+  },
+  required: ["should_reply", "final_answer", "thinking_process"],
+  additionalProperties: false,
+};
 
 let sessionLogPath: string | null = null;
 let monitorEntryId = 0;
@@ -271,6 +290,19 @@ async function loadContextBudgetConfig(configPath: string): Promise<ContextBudge
     limitTokens,
     compressThresholdTokens,
   };
+}
+
+async function applyProxyConfig(configPath: string): Promise<void> {
+  if (!existsSync(configPath)) return;
+  const raw = await readFile(configPath, "utf-8");
+  const config = (YAML.parse(raw) as AppConfig | null) ?? {};
+  const proxyUrl = config.fetch?.proxy_url?.trim();
+  if (proxyUrl) {
+    process.env.HTTPS_PROXY = proxyUrl;
+    process.env.HTTP_PROXY = proxyUrl;
+    process.env.https_proxy = proxyUrl;
+    process.env.http_proxy = proxyUrl;
+  }
 }
 
 function estimateTextTokens(text: string): number {
@@ -1128,6 +1160,101 @@ async function runNapCatOcr(image: string): Promise<string> {
   return "";
 }
 
+function extractUrlsFromText(text: string): string[] {
+  const full = text.match(/https?:\/\/[^\s\]）\)》"'"']+/g) ?? [];
+  // bare domains like pova.cc or www.example.com/path (not already preceded by ://)
+  const bare = text.match(/(?<![/:@\w])(?:www\.)?[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?(?:\.[a-zA-Z]{2,}){1,3}(?:\/[^\s\]）\)》"'"']*)?(?=[^\w]|$)/g) ?? [];
+  const bareWithScheme = bare
+    .filter((b) => !full.some((f) => f.includes(b)))
+    .map((b) => `https://${b}`);
+  return [...new Set([...full, ...bareWithScheme])]
+    .filter((url) => !/\.(jpg|jpeg|png|gif|webp|mp4|mp3|pdf|svg)(\?|$)/i.test(url))
+    .slice(0, URL_FETCH_MAX_PER_MESSAGE);
+}
+
+function extractTextFromHtml(html: string): string {
+  return html
+    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, " ")
+    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+async function fetchUrlContent(url: string): Promise<string> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => { controller.abort(); }, URL_FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Referer": "https://www.google.com/",
+      },
+    });
+    if (!res.ok) {
+      pushMonitorEntry("status", "URL Fetch Skip", `status=${res.status} url=${url}`);
+      return "";
+    }
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.includes("text/html") && !contentType.includes("text/plain") && !contentType.includes("application/xhtml")) {
+      pushMonitorEntry("status", "URL Fetch Skip", `content-type=${contentType} url=${url}`);
+      return "";
+    }
+    const html = await res.text();
+    const text = extractTextFromHtml(html).slice(0, URL_CONTENT_MAX_CHARS);
+    pushMonitorEntry("status", "URL Fetch OK", `chars=${text.length} url=${url}`);
+    return text;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function enrichMessageWithUrlContent(message: ParsedIncomingMessage): Promise<ParsedIncomingMessage> {
+  if (message.isBinary || message.messageType !== "group" || !message.displayText) {
+    return message;
+  }
+
+  const searchText = [message.rawMessage, message.displayText].filter(Boolean).join(" ");
+  const urls = extractUrlsFromText(searchText);
+  if (urls.length === 0) {
+    return message;
+  }
+
+  pushMonitorEntry("status", "URL Fetch Start", `urls=${urls.join(", ")}`);
+
+  const fetchedBlocks: string[] = [];
+  for (const url of urls) {
+    try {
+      const content = await fetchUrlContent(url);
+      if (content) {
+        fetchedBlocks.push(`[网页内容 ${url}]\n${content}`);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "URL Fetch Error", `url=${url}\n${detail}`);
+      console.error(`Failed to fetch URL ${url}:`, error);
+    }
+  }
+
+  if (fetchedBlocks.length === 0) {
+    return message;
+  }
+
+  return {
+    ...message,
+    displayText: `${message.displayText}\n[网页内容]\n${fetchedBlocks.join("\n---\n")}`.trim(),
+  };
+}
+
 async function enrichMessageWithImageOcr(message: ParsedIncomingMessage): Promise<ParsedIncomingMessage> {
   if (message.isBinary || message.messageType !== "group" || !message.displayText) {
     return message;
@@ -1403,13 +1530,14 @@ function broadcastMonitorEvent(payload: MonitorEvent): void {
   }
 }
 
-function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string): MonitorEntry {
+function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, label?: string): MonitorEntry {
   const entry: MonitorEntry = {
     id: ++monitorEntryId,
     kind,
     title,
     body,
     timestamp: new Date().toISOString(),
+    ...(label ? { label } : {}),
   };
 
   monitorHistory = [...monitorHistory.slice(-(WS_HISTORY_LIMIT - 1)), entry];
@@ -1542,9 +1670,19 @@ function appendConversationTurn(turn: ConversationTurn): void {
     return;
   }
 
+  const normalizedTurn: ConversationTurn = {
+    ...turn,
+    groupId: groupKey,
+    content,
+  };
   const existing = conversationHistoryByGroup.get(groupKey) ?? [];
-  const next = mergeConversationTurns([...existing, { ...turn, content }], turn.timestamp);
+  const next = mergeConversationTurns([...existing, normalizedTurn], turn.timestamp);
   conversationHistoryByGroup.set(groupKey, next);
+  broadcastMonitorEvent({
+    type: "turn",
+    groupId: groupKey,
+    turn: normalizedTurn,
+  });
 }
 
 function getLatestConversationTurn(groupId: string | null): ConversationTurn | null {
@@ -2058,9 +2196,7 @@ async function buildMemoryPrompt(context: ModelRequestContext, currentMessage: s
   const lines = scoredMemories
     .map((item) => {
       const line = formatMemoryLine(item.record);
-      return line
-        ? `${line} [thread_score=${item.score.total.toFixed(2)} sim=${item.score.similarity.toFixed(2)} time=${item.score.time.toFixed(2)} directed=${item.score.directed.toFixed(2)} link=${item.score.participantLink.toFixed(2)} sender=${item.score.sameSender.toFixed(2)}]`
-        : null;
+      return line ? line : null;
     })
     .filter((line): line is string => Boolean(line));
 
@@ -2330,6 +2466,7 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
   const reply = await client.generateText({
     systemPrompt: preparedRequest.systemPrompt,
     messages: preparedRequest.messages,
+    jsonSchema: MODEL_DECISION_JSON_SCHEMA,
   });
 
   const decision = parseModelDecision(reply);
@@ -2339,6 +2476,7 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     "assistant",
     `Model Reply - ${formatElapsedDuration(startedAt, Date.now())}`,
     content,
+    client.model,
   );
 
   if (!decision.shouldReply) {
@@ -2473,7 +2611,8 @@ function connectWebSocketClient(forceReconnect = false): void {
     }
 
     const parsedMessage = parseIncomingMessage(data, isBinary);
-    const message = await enrichMessageWithImageOcr(parsedMessage);
+    const ocrMessage = await enrichMessageWithImageOcr(parsedMessage);
+    const message = await enrichMessageWithUrlContent(ocrMessage);
     try {
       await persistIncomingMessage(message);
     } catch (error) {
@@ -2492,6 +2631,12 @@ function connectWebSocketClient(forceReconnect = false): void {
       pushMonitorEntry("status", "Message Skipped", "Sender is holly; skipping model processing.");
       return;
     }
+
+    pushMonitorEntry(
+      "incoming",
+      "Group Message",
+      `group_id=${message.groupId ?? "unknown"}\n${message.displayText}`,
+    );
 
     await ensureTodayGroupHistoryContext(message.groupId, message.receivedAt);
 
@@ -2547,963 +2692,653 @@ function connectWebSocketClient(forceReconnect = false): void {
   });
 }
 
-const WS_MONITOR_PAGE = `<!DOCTYPE html>
-<html lang="en">
+const UNIFIED_PAGE = `<!DOCTYPE html>
+<html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>WebSocket Monitor</title>
+  <title>Holly</title>
   <style>
     :root {
-      --bg-a: #fdf2f8;
-      --bg-b: #ecfeff;
-      --panel: rgba(255, 255, 255, 0.88);
-      --ink: #172033;
-      --muted: #5b6472;
-      --line: rgba(148, 163, 184, 0.35);
+      --sidebar-w: 220px;
+      --sidebar-bg: #18202e;
+      --sidebar-text: #8899b0;
+      --panel: rgba(255,255,255,0.92);
+      --ink: #1e293b;
+      --muted: #64748b;
+      --line: rgba(148,163,184,0.28);
       --accent: #0f766e;
-      --accent-strong: #155e75;
+      --accent-h: #0d5e57;
+      --radius: 14px;
       --entry-in: #ecfeff;
       --entry-out: #ecfdf5;
       --entry-status: #eff6ff;
       --entry-error: #fff1f2;
       --entry-assistant: #f5f3ff;
     }
-    * { box-sizing: border-box; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: "Segoe UI", sans-serif;
+      display: flex; min-height: 100vh; width: 100%;
+      font-family: "Segoe UI", system-ui, sans-serif;
       color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(244, 114, 182, 0.18), transparent 30%),
-        radial-gradient(circle at top right, rgba(45, 212, 191, 0.20), transparent 28%),
-        linear-gradient(135deg, var(--bg-a), var(--bg-b));
-      padding: 24px;
+      background: linear-gradient(135deg, #f0f4f8, #e8eef5);
     }
-    .shell {
-      width: min(1100px, 100%);
-      margin: 0 auto;
-      display: grid;
-      gap: 18px;
+    #app { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+    .sidebar {
+      width: var(--sidebar-w); min-height: 100vh;
+      background: var(--sidebar-bg);
+      display: flex; flex-direction: column; flex-shrink: 0;
+      position: fixed; left: 0; top: 0; bottom: 0; z-index: 10;
     }
-    .hero, .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 24px 60px rgba(15, 23, 42, 0.08);
+    .brand { padding: 22px 18px 18px; border-bottom: 1px solid rgba(255,255,255,0.07); }
+    .brand-name { font-size: 18px; font-weight: 800; color: #fff; letter-spacing: -0.02em; }
+    .brand-sub { font-size: 11px; color: var(--sidebar-text); margin-top: 2px; }
+    .nav { flex: 1; padding: 14px 10px; display: flex; flex-direction: column; gap: 3px; list-style: none; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 10px 12px; border-radius: 9px; cursor: pointer;
+      color: var(--sidebar-text); font-size: 13px; font-weight: 500;
+      transition: background 0.12s, color 0.12s; user-select: none;
     }
-    .hero {
-      padding: 28px;
+    .nav-item:hover { background: rgba(255,255,255,0.06); color: #c8d6e5; }
+    .nav-item.active { background: rgba(255,255,255,0.11); color: #fff; }
+    .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+    .ws-status {
+      padding: 14px 18px; border-top: 1px solid rgba(255,255,255,0.07);
+      display: flex; align-items: center; gap: 8px;
+      font-size: 11px; color: var(--sidebar-text);
     }
-    .eyebrow {
-      display: inline-block;
-      margin-bottom: 10px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: #0f766e;
-      background: rgba(15, 118, 110, 0.10);
-    }
-    h1 {
-      margin: 0 0 10px;
-      font-size: clamp(30px, 5vw, 52px);
-      line-height: 1;
-    }
-    .hero p {
-      margin: 0;
-      color: var(--muted);
-      max-width: 760px;
-    }
-    .grid {
-      display: grid;
-      grid-template-columns: minmax(0, 1.55fr) minmax(320px, 0.85fr);
-      gap: 18px;
-    }
-    .panel {
-      padding: 22px;
-    }
-    .panel-head {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 12px;
-      margin-bottom: 14px;
-    }
-    .panel-title {
-      margin: 0;
-      font-size: 20px;
-    }
-    .badge {
-      display: inline-flex;
-      align-items: center;
-      padding: 8px 12px;
-      border-radius: 999px;
-      font-size: 13px;
-      font-weight: 700;
-      background: #e2e8f0;
-      color: #334155;
-    }
-    .badge[data-state="open"] {
-      background: #dcfce7;
-      color: #166534;
-    }
-    .badge[data-state="connecting"] {
-      background: #fef3c7;
-      color: #92400e;
-    }
-    .badge[data-state="closed"] {
-      background: #e2e8f0;
-      color: #334155;
-    }
-    .badge[data-state="error"] {
-      background: #ffe4e6;
-      color: #be123c;
-    }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      align-items: center;
-      margin-bottom: 14px;
-    }
-    .socket-url {
-      flex: 1 1 280px;
-      padding: 12px 14px;
-      border-radius: 16px;
-      background: rgba(248, 250, 252, 0.95);
-      border: 1px solid var(--line);
-      font-family: Consolas, "Courier New", monospace;
-      color: #0f172a;
-      word-break: break-all;
-    }
-    .log {
-      min-height: 460px;
-      max-height: 70vh;
-      overflow-y: auto;
-      display: grid;
-      gap: 12px;
-      padding-right: 4px;
-    }
-    .entry {
-      border-radius: 18px;
-      border: 1px solid var(--line);
-      padding: 14px 16px;
-      background: #fff;
-    }
+    .dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; flex-shrink: 0; }
+    .dot.open { background: #22c55e; }
+    .dot.connecting { background: #eab308; animation: pulse 1.2s infinite; }
+    .dot.error { background: #ef4444; }
+    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+    .main { margin-left: var(--sidebar-w); flex: 1; padding: 24px; min-height: 100vh; min-width: 0; width: calc(100% - var(--sidebar-w)); }
+    .ph { margin-bottom: 18px; }
+    .ph-eye { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); margin-bottom: 3px; }
+    .ph-title { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
+    .ph-desc { font-size: 13px; color: var(--muted); margin-top: 3px; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); backdrop-filter: blur(8px); box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
+    .ph2 { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
+    .ph2-title { font-size: 14px; font-weight: 700; }
+    .pb { padding: 16px 18px; }
+    .g2 { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(260px,0.75fr); gap: 16px; }
+    .g2l { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
+    .badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #e2e8f0; color: #334155; }
+    .badge.open { background: #dcfce7; color: #166534; }
+    .badge.connecting { background: #fef3c7; color: #92400e; }
+    .badge.error { background: #ffe4e6; color: #be123c; }
+    .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
+    .url-tag { flex: 1 1 180px; padding: 8px 11px; border-radius: 9px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-family: Consolas,monospace; font-size: 11px; color: #0f172a; word-break: break-all; }
+    button { border: 0; border-radius: 999px; padding: 9px 15px; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; color: #fff; background: var(--accent); transition: background 0.12s; }
+    button:hover { background: var(--accent-h); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    button.sec { color: var(--ink); background: #e2e8f0; }
+    button.sec:hover { background: #cbd5e1; }
+    button.sm { padding: 6px 11px; font-size: 11px; }
+    .log { min-height: 380px; max-height: 66vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 3px; }
+    .group-log { min-height: 180px; max-height: 260px; }
+    .entry { border-radius: 10px; border: 1px solid var(--line); padding: 10px 13px; background: #fff; flex-shrink: 0; }
     .entry.incoming { background: var(--entry-in); }
     .entry.outgoing { background: var(--entry-out); }
     .entry.status { background: var(--entry-status); }
     .entry.error { background: var(--entry-error); }
     .entry.assistant { background: var(--entry-assistant); }
-    .entry-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 10px;
-      margin-bottom: 8px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-    }
-    .entry pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 13px;
-      line-height: 1.6;
-    }
-    .empty {
-      border: 1px dashed var(--line);
-      border-radius: 18px;
-      padding: 22px;
-      color: var(--muted);
-      background: rgba(255, 255, 255, 0.7);
-    }
-    .hint {
-      margin: 0 0 10px;
-      color: var(--muted);
-      line-height: 1.6;
-    }
-    select {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 12px 14px;
-      font: inherit;
-      color: var(--ink);
-      background: rgba(255, 255, 255, 0.94);
-    }
-    .stack {
-      display: grid;
-      gap: 12px;
-    }
-    .conversation-box {
-      display: grid;
-      gap: 10px;
-      margin-top: 6px;
-      padding-top: 14px;
-      border-top: 1px solid var(--line);
-    }
-    .conversation-log {
-      display: grid;
-      gap: 10px;
-      max-height: 320px;
-      overflow-y: auto;
-      padding-right: 4px;
-    }
-    .conversation-item {
-      border-radius: 16px;
-      border: 1px solid var(--line);
-      padding: 12px 14px;
-      background: rgba(255, 255, 255, 0.82);
-    }
-    .conversation-item.user {
-      background: rgba(224, 242, 254, 0.88);
-    }
-    .conversation-item.assistant {
-      background: rgba(237, 233, 254, 0.88);
-    }
-    .conversation-item.system {
-      background: rgba(240, 249, 255, 0.92);
-    }
-    .conversation-item-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 8px;
-      margin-bottom: 6px;
-      font-size: 11px;
-      font-weight: 700;
-      letter-spacing: 0.06em;
-      text-transform: uppercase;
-      color: var(--muted);
-    }
-    .conversation-item pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 12px;
-      line-height: 1.55;
-      color: #0f172a;
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 13px 20px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      color: white;
-      background: var(--accent);
-      transition: background 0.2s ease;
-    }
-    button:hover { background: var(--accent-strong); }
-    button.secondary {
-      color: var(--ink);
-      background: #e2e8f0;
-    }
-    button.secondary:hover {
-      background: #cbd5e1;
-    }
+    .entry-h { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+    .entry pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 13px; line-height: 1.5; }
+    .empty { border: 1px dashed var(--line); border-radius: 10px; padding: 18px; color: var(--muted); background: rgba(255,255,255,0.6); text-align: center; font-size: 13px; }
+    .stack { display: flex; flex-direction: column; gap: 10px; }
+    select { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
+    .meta-tag { padding: 8px 11px; border-radius: 9px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-family: Consolas,monospace; font-size: 11px; color: #0f172a; }
+    .conv-box { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 12px; }
+    .conv-log { display: flex; flex-direction: column; gap: 7px; max-height: 260px; overflow-y: auto; margin-top: 8px; }
+    .ci { border-radius: 9px; border: 1px solid var(--line); padding: 9px 11px; background: rgba(255,255,255,0.8); }
+    .ci.user { background: rgba(224,242,254,0.9); }
+    .ci.assistant { background: rgba(237,233,254,0.9); }
+    .ci.system { background: rgba(240,249,255,0.9); }
+    .ci-h { display: flex; justify-content: space-between; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+    .ci pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 11px; line-height: 1.4; }
+    .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
+    label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
+    input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
+    .mem-meta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
+    .mem-list { display: flex; flex-direction: column; gap: 9px; }
+    .mi { border: 1px solid var(--line); border-radius: 11px; padding: 13px 15px; background: #fff; }
+    .mi-h { display: flex; flex-wrap: wrap; gap: 6px; justify-content: space-between; margin-bottom: 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #475467; }
+    .mi-m { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 7px; color: var(--muted); font-size: 11px; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 12px; line-height: 1.55; }
+    .glist { display: flex; flex-direction: column; gap: 5px; }
+    .gi { padding: 11px 13px; border-radius: 9px; border: 1px solid var(--line); background: #fff; cursor: pointer; transition: background 0.12s; }
+    .gi:hover { background: #f1f5f9; }
+    .gi.active { background: #ecfeff; border-color: #67e8f9; }
+    .gi-name { font-size: 13px; font-weight: 600; }
+    .gi-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
+    /* Group Talk full-height layout */
+    .group-view { display: flex; flex-direction: column; height: calc(100vh - 48px); gap: 0; width: 100%; }
+    .gp-live { flex: none; min-height: 80px; }
+    .gp-resizer { flex: none; height: 6px; cursor: row-resize; background: transparent; position: relative; z-index: 10; transition: background 0.15s; }
+    .gp-resizer:hover, .gp-resizer.dragging { background: #6366f1; }
+    .gp-resizer::before { content: ''; position: absolute; left: 50%; transform: translateX(-50%); top: 2px; width: 36px; height: 2px; border-radius: 2px; background: #cbd5e1; pointer-events: none; }
+    .gp-resizer:hover::before, .gp-resizer.dragging::before { background: #fff; }
+    .gp-bottom { flex: 1; min-height: 0; width: 100%; grid-template-rows: 1fr; margin-top: 16px; }
+    .gp-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+    .gp-scroll { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 0; }
+    .chat-scroll { flex: 1; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; gap: 2px; }
+    /* Full-width message rows */
+    .msg-entry { width: 100%; padding: 10px 16px; border-left: 3px solid transparent; transition: background 0.1s; }
+    .msg-entry:hover { filter: brightness(0.97); }
+    .msg-entry.user { background: #f0f9ff; border-left-color: #38bdf8; }
+    .msg-entry.assistant { background: #f5f3ff; border-left-color: #a78bfa; }
+    .msg-entry.system { background: #f8fafc; border-left-color: #94a3b8; }
+    .msg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
+    .msg-name { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+    .msg-entry.user .msg-name { color: #0369a1; }
+    .msg-entry.assistant .msg-name { color: #7c3aed; }
+    .msg-entry.system .msg-name { color: #64748b; }
+    .msg-time { font-size: 12px; color: var(--muted); flex-shrink: 0; }
+    .msg-body { font-size: 16px; line-height: 1.6; word-break: break-word; white-space: pre-wrap; color: var(--ink); }
+    .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
     @media (max-width: 900px) {
-      .grid {
-        grid-template-columns: 1fr;
-      }
-      .log {
-        min-height: 320px;
-      }
+      .g2, .g2l { grid-template-columns: 1fr; }
+      .fgrid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 640px) {
+      :root { --sidebar-w: 58px; }
+      .brand-name, .brand-sub, .nav-label, .ws-status span:last-child { display: none; }
+      .nav-item { justify-content: center; }
+      .fgrid { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <main class="shell">
-    <section class="hero">
-      <span class="eyebrow">WebSocket</span>
-      <h1>WS To LLM Monitor</h1>
-      <p>This page only shows the backend workflow: receive messages from the local 8082 WebSocket, send them to the active LLM, and display the resulting replies and status changes.</p>
-    </section>
+<div id="app">
+  <nav class="sidebar">
+    <div class="brand">
+      <div class="brand-name">Holly</div>
+      <div class="brand-sub">WS Monitor</div>
+    </div>
+    <ul class="nav">
+      <li class="nav-item" :class="{active: tab === 'agent'}" @click="tab = 'agent'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <rect x="3" y="3" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="14" y="3" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
+          <rect x="3" y="14" width="7" height="7" rx="1" stroke-linecap="round" stroke-linejoin="round"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M14 17.5h7M17.5 14v7"/>
+        </svg>
+        <span class="nav-label">Agent</span>
+      </li>
+      <li class="nav-item" :class="{active: tab === 'memory'}" @click="tab = 'memory'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <ellipse cx="12" cy="5" rx="9" ry="3"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 5v14c0 1.657 4.03 3 9 3s9-1.343 9-3V5"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 12c0 1.657 4.03 3 9 3s9-1.343 9-3"/>
+        </svg>
+        <span class="nav-label">Memory</span>
+      </li>
+      <li class="nav-item" :class="{active: tab === 'group'}" @click="tab = 'group'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M17 8h2a2 2 0 012 2v6a2 2 0 01-2 2h-2v3l-3-3H9a2 2 0 01-2-2v-1"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 8a2 2 0 012-2h10a2 2 0 012 2v5a2 2 0 01-2 2H8l-3 3V8z"/>
+        </svg>
+        <span class="nav-label">Group Talk</span>
+      </li>
+    </ul>
+    <div class="ws-status">
+      <span class="dot" :class="wsStatus.state"></span>
+      <span>{{ wsStatusLabel }}</span>
+    </div>
+  </nav>
 
-    <section class="grid">
-      <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">Live Messages</h2>
-          <span class="badge" id="status" data-state="connecting">Syncing</span>
-        </div>
-        <div class="toolbar">
-          <div class="socket-url" id="socketUrl"></div>
-          <button class="secondary" id="reconnect">Reconnect Client</button>
-        </div>
-        <p class="hint" id="statusDetail">Waiting for backend updates...</p>
-        <div class="log" id="log">
-          <div class="empty" id="emptyState">Waiting for WebSocket messages...</div>
-        </div>
-      </section>
-
-      <section class="panel">
-        <div class="panel-head">
-          <h2 class="panel-title">Model Settings</h2>
-        </div>
-        <div class="stack">
-          <p class="hint">Choose which model profile should process incoming WebSocket messages. The switch is applied immediately and written back to <code>config.yaml</code>.</p>
-          <select id="profileSelect"></select>
-          <button id="applyProfile">Switch Model</button>
-          <div class="socket-url" id="profileMeta">Loading model profiles...</div>
-          <section class="conversation-box">
-            <p class="hint">Latest same-group <code>messages</code> payload sent to the model.</p>
-            <div class="socket-url" id="conversationMeta">Waiting for the first model request...</div>
-            <div class="conversation-log" id="conversationLog">
-              <div class="empty">No recent conversation messages yet.</div>
+  <main class="main">
+    <!-- Agent -->
+    <div v-if="tab === 'agent'">
+      <div class="ph">
+        <div class="ph-eye">WebSocket &#8594; LLM</div>
+        <div class="ph-title">Agent Monitor</div>
+        <div class="ph-desc">Model profile configuration and latest request payload.</div>
+      </div>
+      <div class="panel">
+          <div class="ph2"><span class="ph2-title">Model Settings</span></div>
+          <div class="pb">
+            <div class="stack">
+              <p class="hint">Switch the active LLM profile. Changes apply immediately and are written to config.yaml.</p>
+              <select v-model="selProfile">
+                <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.displayName }}</option>
+              </select>
+              <button @click="switchProfile" :disabled="switching">{{ switching ? 'Switching...' : 'Switch Model' }}</button>
+              <div class="meta-tag">{{ profileMeta }}</div>
+              <div class="conv-box">
+                <p class="hint">Latest <code>messages</code> payload sent to the model.</p>
+                <div class="meta-tag" style="margin-top:8px;word-break:break-word;">{{ convMetaText }}</div>
+                <div class="conv-log">
+                  <div v-if="!convPreview || !convPreview.messages || !convPreview.messages.length" class="empty" style="font-size:11px;">No conversation yet.</div>
+                  <template v-else>
+                    <article v-for="(m, i) in convPreview.messages" :key="i" class="ci" :class="m.role">
+                      <div class="ci-h">
+                        <span>{{ m.role === 'assistant' ? 'Holly' : m.role === 'system' ? 'System' : 'User' }}</span>
+                        <span>#{{ i + 1 }}</span>
+                      </div>
+                      <pre>{{ m.content }}</pre>
+                    </article>
+                  </template>
+                </div>
+              </div>
             </div>
-          </section>
+          </div>
         </div>
-      </section>
-    </section>
+    </div>
+
+    <!-- Memory -->
+    <div v-else-if="tab === 'memory'">
+      <div class="ph">
+        <div class="ph-eye">Qdrant</div>
+        <div class="ph-title">Stored Memories</div>
+        <div class="ph-desc">Browse recent records saved from the upstream WebSocket stream.</div>
+      </div>
+      <div class="panel" style="margin-bottom:14px;">
+        <div class="ph2"><span class="ph2-title">Filters</span></div>
+        <div class="pb">
+          <form class="fgrid" @submit.prevent="loadMemories">
+            <label>Group ID <input v-model="mf.groupId" placeholder="20000001" /></label>
+            <label>User ID <input v-model="mf.userId" placeholder="10000003" /></label>
+            <label>Type
+              <select v-model="mf.messageType">
+                <option value="group">group</option>
+                <option value="">all</option>
+              </select>
+            </label>
+            <label>Limit <input v-model.number="mf.limit" type="number" min="1" max="100" /></label>
+            <button type="submit" style="align-self:flex-end;">Load</button>
+          </form>
+          <div class="mem-meta">
+            <span>{{ memItems.length }} records</span>
+            <span>{{ memCollection || 'Qdrant unavailable' }}</span>
+            <code style="margin-left:auto;font-size:11px;">{{ memPath }}</code>
+          </div>
+          <p class="hint" style="margin-top:5px;">{{ memMsg }}</p>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="ph2"><span class="ph2-title">Results</span></div>
+        <div class="pb">
+          <div class="mem-list">
+            <div v-if="memLoading" class="empty">Loading...</div>
+            <div v-else-if="memErr" class="empty">{{ memErr }}</div>
+            <div v-else-if="!memItems.length" class="empty">No memories matched the current filters.</div>
+            <template v-else>
+              <article v-for="item in memItems" :key="item.sequence" class="mi">
+                <div class="mi-h">
+                  <span>{{ item.receivedAt || 'unknown' }}</span>
+                  <span>seq {{ item.sequence != null ? item.sequence : '-' }}</span>
+                </div>
+                <div class="mi-m">
+                  <span>group: {{ item.groupName || '-' }} ({{ item.groupId || '-' }})</span>
+                  <span>user: {{ item.senderName || '-' }} ({{ item.userId || '-' }})</span>
+                  <span>type: {{ item.messageType || '-' }}</span>
+                </div>
+                <pre>{{ item.displayText || item.rawMessage || item.rawContent || '(empty)' }}</pre>
+              </article>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Group Talk -->
+    <div v-else class="group-view">
+      <div class="panel gp-panel gp-live" :style="{ flexBasis: gpLiveHeight + 'px' }">
+        <div class="ph2">
+          <span class="ph2-title">Live Messages</span>
+          <button class="sec sm" @click="clearEntries">Clear</button>
+        </div>
+        <div class="chat-scroll" style="padding:10px 12px;gap:8px;">
+          <div v-if="!entries.length" class="empty" style="margin:8px;">Waiting for messages&hellip;</div>
+          <template v-else>
+            <article v-for="e in entries" :key="e.id" class="entry" :class="e.kind">
+              <div class="entry-h">
+                <span>{{ e.label || e.kind }} &mdash; {{ e.title }}</span>
+                <span>{{ fmtTime(e.timestamp) }}</span>
+              </div>
+              <pre>{{ fmtBody(e.body) }}</pre>
+            </article>
+          </template>
+        </div>
+      </div>
+
+      <div class="gp-resizer" :class="{ dragging: gpDragging }" @mousedown="onResizerMousedown"></div>
+
+      <div class="g2l gp-bottom">
+        <div class="panel gp-panel">
+          <div class="ph2">
+            <span class="ph2-title">Groups</span>
+            <button class="sec sm" @click="loadGroups">Refresh</button>
+          </div>
+          <div class="gp-scroll">
+            <div v-if="!groups.length" class="empty">No active conversations yet.</div>
+            <div class="glist" v-else>
+              <div v-for="g in groups" :key="g.groupId"
+                class="gi" :class="{active: selGroupId === g.groupId}"
+                @click="selectGroup(g.groupId)">
+                <div class="gi-name">{{ g.groupId }}</div>
+                <div class="gi-meta">{{ g.turnCount }} turns &middot; {{ g.lastTurn ? fmtTime(g.lastTurn.timestamp) : '&ndash;' }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel gp-panel">
+          <div class="ph2">
+            <span class="ph2-title">{{ selGroupId ? 'Group ' + selGroupId : 'Select a group' }}</span>
+            <button v-if="selGroupId" class="sec sm" @click="loadGroupTurns(selGroupId)">Refresh</button>
+          </div>
+          <div class="chat-scroll">
+            <div v-if="!selGroupId" class="empty" style="margin:16px;">Select a group from the list to view its conversation.</div>
+            <div v-else-if="!groupTurns.length" class="empty" style="margin:16px;">No messages in this group today.</div>
+            <template v-else>
+              <div v-for="(t, i) in reversedGroupTurns" :key="i" class="msg-entry" :class="t.role">
+                <div class="msg-head">
+                  <span class="msg-name">{{ t.role === 'assistant' ? 'Holly' : (t.senderName || t.userId || 'User') }}</span>
+                  <span class="msg-time">{{ fmtTime(t.timestamp) }}</span>
+                </div>
+                <div class="msg-body">{{ t.content }}</div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+    </div>
   </main>
+</div>
 
-  <script>
-    const statusBadge = document.getElementById("status");
-    const statusDetail = document.getElementById("statusDetail");
-    const socketUrl = document.getElementById("socketUrl");
-    const profileSelect = document.getElementById("profileSelect");
-    const profileMeta = document.getElementById("profileMeta");
-    const conversationMeta = document.getElementById("conversationMeta");
-    const conversationLog = document.getElementById("conversationLog");
-    const applyProfileButton = document.getElementById("applyProfile");
-    const reconnectButton = document.getElementById("reconnect");
-    const log = document.getElementById("log");
-    const upstreamTarget = ${JSON.stringify(WS_TARGET_URL)};
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script>
+var _wsTarget = ${JSON.stringify(WS_TARGET_URL)};
+var _Vue = Vue;
+var createApp = _Vue.createApp;
+var ref = _Vue.ref;
+var computed = _Vue.computed;
+var onMounted = _Vue.onMounted;
+var onUnmounted = _Vue.onUnmounted;
+var watch = _Vue.watch;
 
-    let eventSource = null;
-    let streamConnected = false;
-    let renderedEntryIds = new Set();
+createApp({
+  setup: function() {
+    var tab = ref('agent');
 
-    function labelForState(state) {
-      if (state === "open") {
-        return "Connected";
-      }
+    // Agent state
+    var wsTargetUrl = ref(_wsTarget);
+    var wsStatus = ref({ state: 'connecting', detail: '', updatedAt: '' });
+    var wsStatusLabel = computed(function() {
+      var s = wsStatus.value.state;
+      if (s === 'open') return 'Connected';
+      if (s === 'connecting') return 'Connecting';
+      if (s === 'error') return 'Error';
+      return 'Disconnected';
+    });
+    var entries = ref([]);
+    var renderedIds = new Set();
+    var convPreview = ref(null);
+    var groupEntries = computed(function() {
+      return entries.value.filter(function(e) {
+        return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
+      });
+    });
+    var profiles = ref([]);
+    var selProfile = ref('');
+    var profileMeta = ref('Loading model profiles...');
+    var switching = ref(false);
+    var convMetaText = computed(function() {
+      var p = convPreview.value;
+      if (!p) return 'Waiting for the first model request...';
+      var g = p.groupId || 'unknown_group';
+      var u = p.updatedAt ? new Date(p.updatedAt).toLocaleTimeString() : '?';
+      var tok = typeof p.estimatedTokens === 'number' ? p.estimatedTokens : '?';
+      var lim = typeof p.contextLimitTokens === 'number' ? p.contextLimitTokens : '?';
+      var cmp = typeof p.compressThresholdTokens === 'number' ? p.compressThresholdTokens : '?';
+      var msgs = (p.messages && p.messages.length) ? p.messages.length : 0;
+      return 'Group: ' + g + '  |  Msgs: ' + msgs + '  |  Tokens: ~' + tok + '/' + lim + '  |  Compress@' + cmp + '  |  ' + (p.compressed ? 'Compressed' : 'Uncompressed') + '  |  ' + u;
+    });
 
-      if (state === "connecting") {
-        return "Connecting";
-      }
+    // Memory state
+    var mf = ref({ groupId: '', userId: '', messageType: 'group', limit: 20 });
+    var memItems = ref([]);
+    var memCollection = ref('');
+    var memLoading = ref(false);
+    var memErr = ref('');
+    var memMsg = ref('');
+    var memPath = ref('/api/memories');
 
-      if (state === "error") {
-        return "Error";
-      }
+    // Group Talk state
+    var groups = ref([]);
+    var selGroupId = ref(null);
+    var groupTurns = ref([]);
+    var reversedGroupTurns = computed(function() { return groupTurns.value.slice().reverse(); });
 
-      return "Disconnected";
+    // Resizer drag state
+    var gpLiveHeight = ref(280);
+    var gpDragging = ref(false);
+    var _dragStartY = 0;
+    var _dragStartH = 0;
+    function onResizerMousedown(e) {
+      gpDragging.value = true;
+      _dragStartY = e.clientY;
+      _dragStartH = gpLiveHeight.value;
+      e.preventDefault();
+      document.addEventListener('mousemove', _onResizerMousemove);
+      document.addEventListener('mouseup', _onResizerMouseup);
+    }
+    function _onResizerMousemove(e) {
+      if (!gpDragging.value) return;
+      var delta = e.clientY - _dragStartY;
+      gpLiveHeight.value = Math.max(80, Math.min(_dragStartH + delta, window.innerHeight - 200));
+    }
+    function _onResizerMouseup() {
+      gpDragging.value = false;
+      document.removeEventListener('mousemove', _onResizerMousemove);
+      document.removeEventListener('mouseup', _onResizerMouseup);
     }
 
-    function setStatus(status) {
-      statusBadge.textContent = labelForState(status.state);
-      statusBadge.dataset.state = status.state;
-      statusDetail.textContent = status.detail || upstreamTarget;
+    // SSE
+    var es = null;
+    var streamConn = false;
+
+    function clearEntries() {
+      entries.value = [];
+      renderedIds.clear();
     }
 
-    function formatBody(body) {
-      if (typeof body !== "string") {
-        return JSON.stringify(body, null, 2);
-      }
-
-      try {
-        return JSON.stringify(JSON.parse(body), null, 2);
-      } catch (error) {
-        void error;
-        return body;
-      }
+    function fmtTime(ts) {
+      if (!ts) return '-';
+      try { return new Date(ts).toLocaleTimeString(); } catch(e) { return String(ts); }
     }
 
-    function appendEntry(kind, title, body, timestamp) {
-      const placeholder = log.querySelector(".empty");
-      if (placeholder) {
-        placeholder.remove();
-      }
-
-      const entry = document.createElement("article");
-      entry.className = "entry " + kind;
-
-      const head = document.createElement("div");
-      head.className = "entry-head";
-
-      const heading = document.createElement("span");
-      heading.textContent = title;
-
-      const time = document.createElement("span");
-      time.textContent = new Date(timestamp || Date.now()).toLocaleTimeString();
-
-      head.appendChild(heading);
-      head.appendChild(time);
-      entry.appendChild(head);
-      if (typeof body === "string" ? body.trim() : body != null) {
-        const content = document.createElement("pre");
-        content.textContent = formatBody(body);
-        entry.appendChild(content);
-      }
-      log.prepend(entry);
-      log.scrollTop = 0;
+    function fmtBody(body) {
+      if (typeof body !== 'string') return JSON.stringify(body, null, 2);
+      try { return JSON.stringify(JSON.parse(body), null, 2); } catch(e) { return body; }
     }
 
-    function renderConversationPreview(preview) {
-      conversationLog.innerHTML = "";
-
-      if (!preview || !Array.isArray(preview.messages) || preview.messages.length === 0) {
-        conversationMeta.textContent = "Waiting for the first model request...";
-        conversationLog.innerHTML = '<div class="empty">No recent conversation messages yet.</div>';
-        return;
-      }
-
-      const groupLabel = preview.groupId || "unknown_group";
-      const updatedLabel = new Date(preview.updatedAt || Date.now()).toLocaleTimeString();
-      const tokenLabel = typeof preview.estimatedTokens === "number" ? preview.estimatedTokens : "?";
-      const limitLabel = typeof preview.contextLimitTokens === "number" ? preview.contextLimitTokens : "?";
-      const compressLabel =
-        typeof preview.compressThresholdTokens === "number" ? preview.compressThresholdTokens : "?";
-      const compressionState = preview.compressed ? "on" : "off";
-      conversationMeta.textContent =
-        "Group: " + groupLabel +
-        " | Messages: " + preview.messages.length +
-        " | Tokens: ~" + tokenLabel + "/" + limitLabel +
-        " | Compress@" + compressLabel +
-        " | Compression: " + compressionState +
-        " | Updated: " + updatedLabel;
-
-      for (const [index, message] of preview.messages.entries()) {
-        const item = document.createElement("article");
-        const roleName =
-          message.role === "assistant" ? "assistant" : message.role === "system" ? "system" : "user";
-        item.className = "conversation-item " + roleName;
-
-        const head = document.createElement("div");
-        head.className = "conversation-item-head";
-
-        const role = document.createElement("span");
-        role.textContent =
-          message.role === "assistant" ? "Holly" : message.role === "system" ? "System" : "User";
-
-        const order = document.createElement("span");
-        order.textContent = "#" + String(index + 1);
-
-        const content = document.createElement("pre");
-        content.textContent = typeof message.content === "string" ? message.content : JSON.stringify(message.content, null, 2);
-
-        head.appendChild(role);
-        head.appendChild(order);
-        item.appendChild(head);
-        item.appendChild(content);
-        conversationLog.appendChild(item);
-      }
+    function pushEntry(entry) {
+      if (renderedIds.has(entry.id)) return;
+      renderedIds.add(entry.id);
+      entries.value.unshift(entry);
+      if (entries.value.length > 120) entries.value.splice(120);
     }
 
     function renderSnapshot(payload) {
-      renderedEntryIds = new Set();
-      socketUrl.textContent = payload.target;
-      setStatus(payload.status);
-      renderConversationPreview(payload.conversationPreview);
-      log.innerHTML = "";
-      const visibleEntries = Array.isArray(payload.history)
-        ? payload.history.filter((entry) => entry.kind !== "incoming")
-        : [];
-
-      if (!visibleEntries.length) {
-        log.innerHTML = '<div class="empty">Waiting for WebSocket messages...</div>';
-        return;
-      }
-
-      for (const entry of visibleEntries) {
-        renderEntry(entry);
-      }
-    }
-
-    function renderEntry(entry) {
-      if (entry.kind === "incoming") {
-        return;
-      }
-
-      if (renderedEntryIds.has(entry.id)) {
-        return;
-      }
-
-      renderedEntryIds.add(entry.id);
-      appendEntry(entry.kind, entry.title, entry.body, entry.timestamp);
+      renderedIds.clear();
+      wsStatus.value = payload.status;
+      convPreview.value = payload.conversationPreview;
+      entries.value = [];
+      var visible = payload.history || [];
+      for (var i = visible.length - 1; i >= 0; i--) { pushEntry(visible[i]); }
     }
 
     function handlePayload(payload) {
-      if (payload.type === "snapshot") {
-        renderSnapshot(payload);
-        return;
-      }
-
-      if (payload.type === "status") {
-        setStatus(payload.status);
-        return;
-      }
-
-      if (payload.type === "conversation") {
-        renderConversationPreview(payload.conversationPreview);
-        return;
-      }
-
-      if (payload.type === "entry") {
-        renderEntry(payload.entry);
-      }
+      if (payload.type === 'snapshot') { renderSnapshot(payload); return; }
+      if (payload.type === 'status') { wsStatus.value = payload.status; return; }
+      if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
+      if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
+      if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
 
-    function connectEventStream() {
-      if (eventSource) {
-        eventSource.close();
-      }
-
-      socketUrl.textContent = upstreamTarget;
-      eventSource = new EventSource("/api/ws/events");
-
-      eventSource.addEventListener("open", () => {
-        if (!streamConnected) {
-          appendEntry("status", "Monitor Stream", "Connected to backend event stream.", new Date().toISOString());
-          streamConnected = true;
+    function connectES() {
+      if (es) { es.close(); }
+      es = new EventSource('/api/ws/events');
+      es.addEventListener('open', function() {
+        if (!streamConn) {
+          pushEntry({ id: Date.now(), kind: 'status', title: 'Monitor Stream', body: 'Connected to backend event stream.', timestamp: new Date().toISOString() });
+          streamConn = true;
         }
       });
-
-      eventSource.addEventListener("snapshot", (event) => {
-        const payload = JSON.parse(event.data);
-        handlePayload(payload);
-      });
-
-      eventSource.onmessage = (event) => {
-        const payload = JSON.parse(event.data);
-        handlePayload(payload);
-      };
-
-      eventSource.onerror = () => {
-        if (!streamConnected) {
-          return;
-        }
-
-        streamConnected = false;
-        appendEntry("error", "Monitor Stream", "Lost connection to backend event stream. The browser will retry automatically.", new Date().toISOString());
+      es.addEventListener('snapshot', function(ev) { handlePayload(JSON.parse(ev.data)); });
+      es.onmessage = function(ev) { handlePayload(JSON.parse(ev.data)); };
+      es.onerror = function() {
+        if (!streamConn) return;
+        streamConn = false;
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Monitor Stream', body: 'Lost connection. Browser will retry automatically.', timestamp: new Date().toISOString() });
       };
     }
 
-    async function loadProfiles() {
-      const result = await fetch("/api/llm/profiles");
-      const data = await result.json();
-      if (!result.ok) {
-        throw new Error(data.error || "Failed to load profiles");
-      }
-
-      profileSelect.innerHTML = "";
-      for (const profile of data.profiles) {
-        const option = document.createElement("option");
-        option.value = profile.name;
-        option.textContent = profile.displayName;
-        option.selected = profile.name === data.active;
-        profileSelect.appendChild(option);
-      }
-
-      profileMeta.textContent = "Active model: " + data.displayName;
-    }
-
-    async function switchProfile() {
-      const profile = profileSelect.value;
-      if (!profile) {
-        return;
-      }
-
-      applyProfileButton.disabled = true;
-
-      try {
-        const result = await fetch("/api/llm/active", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ profile })
+    function loadProfiles() {
+      return fetch('/api/llm/profiles').then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load profiles');
+          profiles.value = d.profiles;
+          selProfile.value = d.active;
+          profileMeta.value = 'Active model: ' + d.displayName;
         });
+      }).catch(function(e) {
+        profileMeta.value = 'Failed: ' + e.message;
+      });
+    }
 
-        const data = await result.json();
-        if (!result.ok) {
-          throw new Error(data.error || "Failed to switch profile");
-        }
+    function switchProfile() {
+      if (!selProfile.value) return;
+      switching.value = true;
+      fetch('/api/llm/active', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ profile: selProfile.value })
+      }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to switch');
+          profileMeta.value = 'Active model: ' + d.displayName;
+          pushEntry({ id: Date.now(), kind: 'status', title: 'Profile Switched', body: d.displayName, timestamp: new Date().toISOString() });
+        });
+      }).catch(function(e) {
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Profile Switch Failed', body: e.message, timestamp: new Date().toISOString() });
+        return loadProfiles();
+      }).finally(function() {
+        switching.value = false;
+      });
+    }
 
-        profileMeta.textContent = "Active model: " + data.displayName;
-        appendEntry("status", "Profile Switched", data.displayName, new Date().toISOString());
-      } catch (error) {
-        appendEntry("error", "Profile Switch Failed", error.message, new Date().toISOString());
-        await loadProfiles().catch(() => {});
-      } finally {
-        applyProfileButton.disabled = false;
+    function reconnect() {
+      fetch('/api/ws/reconnect', { method: 'POST' }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Reconnect failed');
+          pushEntry({ id: Date.now(), kind: 'status', title: 'Reconnect Requested', body: d.message, timestamp: new Date().toISOString() });
+        });
+      }).catch(function(e) {
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Reconnect Failed', body: e.message, timestamp: new Date().toISOString() });
+      });
+    }
+
+    function loadMemories() {
+      var f = mf.value;
+      var p = new URLSearchParams();
+      if (f.groupId && f.groupId.trim()) p.set('group_id', f.groupId.trim());
+      if (f.userId && f.userId.trim()) p.set('user_id', f.userId.trim());
+      if (f.messageType && f.messageType.trim()) p.set('message_type', f.messageType.trim());
+      if (f.limit) p.set('limit', String(f.limit));
+      var path = '/api/memories' + (p.toString() ? '?' + p.toString() : '');
+      memPath.value = path;
+      memLoading.value = true;
+      memErr.value = '';
+      memMsg.value = 'Loading memories...';
+      fetch(path).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load memories');
+          memItems.value = d.items;
+          memCollection.value = d.collection || '';
+          memMsg.value = 'Showing most recent matching records.';
+        });
+      }).catch(function(e) {
+        memErr.value = e.message;
+        memItems.value = [];
+        memMsg.value = e.message;
+      }).finally(function() {
+        memLoading.value = false;
+      });
+    }
+
+    function loadGroups() {
+      fetch('/api/conversations').then(function(r) {
+        return r.json().then(function(d) { groups.value = d.groups || []; });
+      }).catch(function() { groups.value = []; });
+    }
+
+    function loadGroupTurns(groupId) {
+      fetch('/api/conversations/' + encodeURIComponent(groupId)).then(function(r) {
+        return r.json().then(function(d) { groupTurns.value = d.turns || []; });
+      }).catch(function() { groupTurns.value = []; });
+    }
+
+    function selectGroup(groupId) {
+      selGroupId.value = groupId;
+      loadGroupTurns(groupId);
+    }
+
+    function applyGroupTurn(groupId, turn) {
+      if (!groupId || !turn) return;
+      var existingIndex = groups.value.findIndex(function(g) { return g.groupId === groupId; });
+      if (existingIndex === -1) {
+        groups.value.unshift({ groupId: groupId, turnCount: 1, lastTurn: turn });
+      } else {
+        var existing = groups.value[existingIndex];
+        groups.value.splice(existingIndex, 1, {
+          groupId: groupId,
+          turnCount: (existing.turnCount || 0) + 1,
+          lastTurn: turn
+        });
+      }
+      if (selGroupId.value === groupId) {
+        groupTurns.value.push(turn);
       }
     }
 
-    async function reconnectClient() {
-      try {
-        const result = await fetch("/api/ws/reconnect", { method: "POST" });
-        const data = await result.json();
-        if (!result.ok) {
-          throw new Error(data.error || "Reconnect failed");
-        }
-
-        appendEntry("status", "Reconnect Requested", data.message, new Date().toISOString());
-      } catch (error) {
-        appendEntry("error", "Reconnect Failed", error.message, new Date().toISOString());
-      }
-    }
-
-    reconnectButton.addEventListener("click", reconnectClient);
-    applyProfileButton.addEventListener("click", switchProfile);
-
-    window.addEventListener("beforeunload", () => {
-      if (eventSource) {
-        eventSource.close();
-      }
+    watch(tab, function(t) {
+      if (t === 'memory') { loadMemories(); }
+      if (t === 'group') { loadGroups(); }
     });
 
-    connectEventStream();
-    loadProfiles().catch((error) => {
-      profileMeta.textContent = "Failed to load profiles: " + error.message;
-    });
-    socketUrl.textContent = upstreamTarget;
-  </script>
-</body>
-</html>
-`;
-
-const MEMORIES_PAGE = `<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Stored Memories</title>
-  <style>
-    :root {
-      --bg-a: #fff8eb;
-      --bg-b: #eef6ff;
-      --panel: rgba(255, 255, 255, 0.9);
-      --ink: #1f2937;
-      --muted: #667085;
-      --line: rgba(148, 163, 184, 0.32);
-      --accent: #0f766e;
-      --accent-strong: #115e59;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      padding: 24px;
-      font-family: "Segoe UI", sans-serif;
-      color: var(--ink);
-      background:
-        radial-gradient(circle at top left, rgba(251, 191, 36, 0.18), transparent 28%),
-        radial-gradient(circle at top right, rgba(14, 165, 233, 0.14), transparent 30%),
-        linear-gradient(135deg, var(--bg-a), var(--bg-b));
-    }
-    .shell {
-      width: min(1180px, 100%);
-      margin: 0 auto;
-      display: grid;
-      gap: 18px;
-    }
-    .hero, .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 24px;
-      backdrop-filter: blur(10px);
-      box-shadow: 0 20px 50px rgba(15, 23, 42, 0.08);
-    }
-    .hero, .panel-body {
-      padding: 24px;
-    }
-    .eyebrow {
-      display: inline-block;
-      margin-bottom: 10px;
-      padding: 6px 10px;
-      border-radius: 999px;
-      font-size: 12px;
-      font-weight: 700;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: #9a3412;
-      background: rgba(251, 146, 60, 0.14);
-    }
-    h1, h2 {
-      margin: 0;
-    }
-    .hero p, .hint {
-      margin: 10px 0 0;
-      color: var(--muted);
-      line-height: 1.6;
-    }
-    .panel-head {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 12px;
-      padding: 24px 24px 0;
-    }
-    .filters {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr)) auto;
-      gap: 12px;
-      align-items: end;
-    }
-    label {
-      display: grid;
-      gap: 6px;
-      font-size: 13px;
-      font-weight: 700;
-    }
-    input, select {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 12px 14px;
-      font: inherit;
-      color: var(--ink);
-      background: rgba(255, 255, 255, 0.94);
-    }
-    button {
-      border: 0;
-      border-radius: 999px;
-      padding: 12px 18px;
-      font: inherit;
-      font-weight: 700;
-      cursor: pointer;
-      color: white;
-      background: var(--accent);
-    }
-    button:hover { background: var(--accent-strong); }
-    .toolbar {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      align-items: center;
-      justify-content: space-between;
-      margin-top: 16px;
-    }
-    .meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 12px;
-      color: var(--muted);
-      font-size: 14px;
-    }
-    .code {
-      padding: 10px 12px;
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      background: rgba(248, 250, 252, 0.95);
-      font-family: Consolas, "Courier New", monospace;
-      word-break: break-all;
-    }
-    .list {
-      display: grid;
-      gap: 12px;
-    }
-    .item {
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 16px;
-      background: #fff;
-    }
-    .item-head {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      justify-content: space-between;
-      margin-bottom: 10px;
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: #475467;
-    }
-    .item-meta {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-bottom: 10px;
-      color: var(--muted);
-      font-size: 13px;
-    }
-    pre {
-      margin: 0;
-      white-space: pre-wrap;
-      word-break: break-word;
-      font-family: Consolas, "Courier New", monospace;
-      font-size: 13px;
-      line-height: 1.6;
-    }
-    .empty {
-      border: 1px dashed var(--line);
-      border-radius: 18px;
-      padding: 22px;
-      color: var(--muted);
-      background: rgba(255, 255, 255, 0.7);
-    }
-    @media (max-width: 980px) {
-      .filters {
-        grid-template-columns: 1fr 1fr;
-      }
-    }
-    @media (max-width: 640px) {
-      .filters {
-        grid-template-columns: 1fr;
-      }
-    }
-  </style>
-</head>
-<body>
-  <main class="shell">
-    <section class="hero">
-      <span class="eyebrow">Memories</span>
-      <h1>Stored Qdrant Memories</h1>
-      <p>Browse the recent records saved from the upstream WebSocket. By default this page shows recent group messages only, so heartbeat and meta events stay out of the way.</p>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Filters</h2>
-      </div>
-      <div class="panel-body">
-        <form class="filters" id="filters">
-          <label>
-            Group ID
-            <input id="groupId" name="group_id" placeholder="20000001" />
-          </label>
-          <label>
-            User ID
-            <input id="userId" name="user_id" placeholder="10000003" />
-          </label>
-          <label>
-            Message Type
-            <select id="messageType" name="message_type">
-              <option value="group" selected>group</option>
-              <option value="">all</option>
-            </select>
-          </label>
-          <label>
-            Limit
-            <input id="limit" name="limit" type="number" min="1" max="100" value="20" />
-          </label>
-          <button type="submit">Load</button>
-        </form>
-
-        <div class="toolbar">
-          <div class="meta">
-            <span id="resultCount">0 records</span>
-            <span id="collectionName">Loading...</span>
-          </div>
-          <div class="code" id="apiPath">/api/memories</div>
-        </div>
-        <p class="hint" id="statusText">Loading memories...</p>
-      </div>
-    </section>
-
-    <section class="panel">
-      <div class="panel-head">
-        <h2>Results</h2>
-      </div>
-      <div class="panel-body">
-        <div class="list" id="list">
-          <div class="empty">Loading memories...</div>
-        </div>
-      </div>
-    </section>
-  </main>
-
-  <script>
-    const filtersForm = document.getElementById("filters");
-    const groupIdInput = document.getElementById("groupId");
-    const userIdInput = document.getElementById("userId");
-    const messageTypeInput = document.getElementById("messageType");
-    const limitInput = document.getElementById("limit");
-    const resultCount = document.getElementById("resultCount");
-    const collectionName = document.getElementById("collectionName");
-    const apiPath = document.getElementById("apiPath");
-    const statusText = document.getElementById("statusText");
-    const list = document.getElementById("list");
-
-    function escapeHtml(value) {
-      return String(value)
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;")
-        .replaceAll('"', "&quot;");
-    }
-
-    function buildQuery() {
-      const params = new URLSearchParams();
-      if (groupIdInput.value.trim()) params.set("group_id", groupIdInput.value.trim());
-      if (userIdInput.value.trim()) params.set("user_id", userIdInput.value.trim());
-      if (messageTypeInput.value.trim()) params.set("message_type", messageTypeInput.value.trim());
-      if (limitInput.value.trim()) params.set("limit", limitInput.value.trim());
-      return params;
-    }
-
-    function renderItems(items) {
-      if (!items.length) {
-        list.innerHTML = '<div class="empty">No memories matched the current filters.</div>';
-        return;
-      }
-
-      list.innerHTML = items.map((item) => {
-        const text = item.displayText || item.rawMessage || item.rawContent || "(empty)";
-        return [
-          '<article class="item">',
-          '<div class="item-head">',
-          '<span>' + escapeHtml(item.receivedAt || "unknown time") + '</span>',
-          '<span>seq ' + escapeHtml(item.sequence ?? "-") + '</span>',
-          '</div>',
-          '<div class="item-meta">',
-          '<span>group: ' + escapeHtml(item.groupName || "-") + ' (' + escapeHtml(item.groupId || "-") + ')</span>',
-          '<span>user: ' + escapeHtml(item.senderName || "-") + ' (' + escapeHtml(item.userId || "-") + ')</span>',
-          '<span>type: ' + escapeHtml(item.messageType || "-") + '</span>',
-          '</div>',
-          '<pre>' + escapeHtml(text) + '</pre>',
-          '</article>',
-        ].join("");
-      }).join("");
-    }
-
-    async function loadMemories() {
-      const query = buildQuery();
-      const path = "/api/memories" + (query.toString() ? "?" + query.toString() : "");
-      apiPath.textContent = path;
-      statusText.textContent = "Loading memories...";
-
-      try {
-        const result = await fetch(path);
-        const data = await result.json();
-        if (!result.ok) {
-          throw new Error(data.error || "Failed to load memories");
-        }
-
-        resultCount.textContent = data.items.length + " records";
-        collectionName.textContent = data.collection || "Qdrant unavailable";
-        statusText.textContent = "Showing most recent matching records.";
-        renderItems(data.items);
-      } catch (error) {
-        resultCount.textContent = "0 records";
-        collectionName.textContent = "Unavailable";
-        statusText.textContent = error.message;
-        list.innerHTML = '<div class="empty">Failed to load memories.</div>';
-      }
-    }
-
-    filtersForm.addEventListener("submit", (event) => {
-      event.preventDefault();
-      loadMemories();
+    onMounted(function() {
+      connectES();
+      loadProfiles();
     });
 
-    loadMemories();
-  </script>
+    onUnmounted(function() {
+      if (es) { es.close(); }
+    });
+
+    return {
+      tab, wsTargetUrl, wsStatus, wsStatusLabel,
+      entries, groupEntries, convPreview, convMetaText,
+      profiles, selProfile, profileMeta, switching,
+      mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
+      groups, selGroupId, groupTurns, reversedGroupTurns,
+      gpLiveHeight, gpDragging, onResizerMousedown,
+      fmtTime, fmtBody, clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup
+    };
+  }
+}).mount('#app');
+</script>
 </body>
 </html>
 `;
 
 async function bootstrap(): Promise<void> {
+  await applyProxyConfig(CONFIG_PATH);
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
@@ -3533,18 +3368,8 @@ async function bootstrap(): Promise<void> {
     try {
       const url = getRequestUrl(req);
 
-      if (req.method === "GET" && url.pathname === "/") {
-        sendHtml(res, WS_MONITOR_PAGE);
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/ws") {
-        sendHtml(res, WS_MONITOR_PAGE);
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === "/memories") {
-        sendHtml(res, MEMORIES_PAGE);
+      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/ws" || url.pathname === "/memories")) {
+        sendHtml(res, UNIFIED_PAGE);
         return;
       }
 
@@ -3623,6 +3448,22 @@ async function bootstrap(): Promise<void> {
       if (req.method === "POST" && url.pathname === "/api/ws/reconnect") {
         connectWebSocketClient(true);
         sendJson(res, 200, { message: `Reconnecting to ${WS_TARGET_URL}` });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/conversations") {
+        const groups: Array<{ groupId: string; turnCount: number; lastTurn: ConversationTurn | null }> = [];
+        for (const [groupId, turns] of conversationHistoryByGroup.entries()) {
+          groups.push({ groupId, turnCount: turns.length, lastTurn: turns.at(-1) ?? null });
+        }
+        sendJson(res, 200, { groups });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname.startsWith("/api/conversations/")) {
+        const groupId = decodeURIComponent(url.pathname.slice("/api/conversations/".length));
+        const turns = conversationHistoryByGroup.get(groupId) ?? [];
+        sendJson(res, 200, { groupId, turns });
         return;
       }
 

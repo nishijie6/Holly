@@ -14,13 +14,21 @@ export type LlmMessage = {
   content: string;
 };
 
+export type LlmProvider = "codex" | "claude";
+
 type CodexProfileConfig = {
   provider: "codex";
   model?: string;
   system_prompt?: string;
 };
 
-export type LlmProfileConfig = CodexProfileConfig;
+type ClaudeProfileConfig = {
+  provider: "claude";
+  model?: string;
+  system_prompt?: string;
+};
+
+export type LlmProfileConfig = CodexProfileConfig | ClaudeProfileConfig;
 
 type LlmSectionConfig = {
   active?: string;
@@ -34,26 +42,27 @@ type AppConfig = {
 
 export type ResolvedLlmProfile = {
   name: string;
-  provider: "codex";
+  provider: LlmProvider;
   model: string;
   systemPrompt: string;
 };
 
 export type LlmClient = {
   profileName: string;
-  provider: "codex";
+  provider: LlmProvider;
   model: string;
   systemPrompt: string;
   displayName: string;
   generateText(input: {
     messages: LlmMessage[];
     systemPrompt?: string;
+    jsonSchema?: Record<string, unknown>;
   }): Promise<string>;
 };
 
 export type LlmProfileSummary = {
   name: string;
-  provider: "codex";
+  provider: LlmProvider;
   model: string;
   displayName: string;
 };
@@ -97,6 +106,16 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const FETCH_FAILED_MAX_ATTEMPTS = 5;
 const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
+
+const CLAUDE_CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
+const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
+const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
+const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
+// OAuth subscription tokens are only accepted when the first system block is this exact string.
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
+const CLAUDE_MAX_TOKENS = 4096;
 
 function isFetchFailedError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
@@ -502,6 +521,237 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
   throw new Error("Codex request failed after retry.");
 }
 
+type ClaudeCredentials = {
+  accessToken: string;
+  refreshToken: string | null;
+  expiresAt: number | null;
+  raw: Record<string, unknown>;
+};
+
+function asClaudeOauthRecord(file: Record<string, unknown>): Record<string, unknown> {
+  const oauth = file.claudeAiOauth;
+  if (!oauth || typeof oauth !== "object") {
+    throw new Error("claudeAiOauth not found in ~/.claude/.credentials.json");
+  }
+  return oauth as Record<string, unknown>;
+}
+
+async function readClaudeCredentials(): Promise<ClaudeCredentials> {
+  const raw = JSON.parse(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8")) as Record<string, unknown>;
+  const oauth = asClaudeOauthRecord(raw);
+
+  const accessToken = oauth.accessToken;
+  if (typeof accessToken !== "string" || !accessToken) {
+    throw new Error("accessToken not found in claudeAiOauth credentials");
+  }
+
+  return {
+    accessToken,
+    refreshToken: typeof oauth.refreshToken === "string" ? oauth.refreshToken : null,
+    expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
+    raw,
+  };
+}
+
+async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<ClaudeCredentials | null> {
+  if (!creds.refreshToken) {
+    return null;
+  }
+
+  const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "refresh_token",
+      refresh_token: creds.refreshToken,
+      client_id: CLAUDE_OAUTH_CLIENT_ID,
+    }),
+    signal: AbortSignal.timeout(10_000),
+  });
+
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    throw new Error(`Claude token refresh failed (${res.status}): ${body || "<empty>"}`);
+  }
+
+  const data = (await res.json()) as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in?: number;
+  };
+
+  const refreshToken = data.refresh_token ?? creds.refreshToken;
+  const expiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : null;
+  const oauth = {
+    ...asClaudeOauthRecord(creds.raw),
+    accessToken: data.access_token,
+    refreshToken,
+    expiresAt,
+  };
+  const nextRaw = { ...creds.raw, claudeAiOauth: oauth };
+
+  await writeFile(CLAUDE_CREDENTIALS_PATH, JSON.stringify(nextRaw), { encoding: "utf-8", mode: 0o600 });
+
+  return {
+    accessToken: data.access_token,
+    refreshToken,
+    expiresAt,
+    raw: nextRaw,
+  };
+}
+
+async function getClaudeCredentials(): Promise<ClaudeCredentials> {
+  const creds = await readClaudeCredentials();
+  if (!isExpiringSoon(creds.expiresAt)) {
+    return creds;
+  }
+
+  const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
+  return refreshed ?? creds;
+}
+
+function buildClaudeHeaders(accessToken: string): Record<string, string> {
+  return {
+    Authorization: `Bearer ${accessToken}`,
+    "Content-Type": "application/json",
+    "anthropic-version": CLAUDE_ANTHROPIC_VERSION,
+    "anthropic-beta": CLAUDE_OAUTH_BETA,
+  };
+}
+
+function buildClaudeMessages(messages: LlmMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
+  const merged: Array<{ role: "user" | "assistant"; content: string }> = [];
+
+  for (const message of messages) {
+    const content = message.content.trim();
+    if (!content) {
+      continue;
+    }
+
+    const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
+    const last = merged[merged.length - 1];
+    if (last && last.role === role) {
+      last.content = `${last.content}\n${content}`;
+    } else {
+      merged.push({ role, content });
+    }
+  }
+
+  // The Messages API requires the first message to be a user turn.
+  while (merged.length > 0 && merged[0].role === "assistant") {
+    merged.shift();
+  }
+
+  return merged;
+}
+
+function buildClaudeRequestBody(
+  model: string,
+  systemPrompt: string,
+  messages: LlmMessage[],
+  jsonSchema?: Record<string, unknown>,
+): Record<string, unknown> {
+  const system: Array<Record<string, unknown>> = [
+    { type: "text", text: CLAUDE_CODE_IDENTITY },
+  ];
+  const trimmedSystem = systemPrompt.trim();
+  if (trimmedSystem) {
+    // cache_control on the last system block caches the identity + full system prefix together.
+    system.push({ type: "text", text: trimmedSystem, cache_control: { type: "ephemeral" } });
+  } else {
+    system[0].cache_control = { type: "ephemeral" };
+  }
+
+  const body: Record<string, unknown> = {
+    model,
+    max_tokens: CLAUDE_MAX_TOKENS,
+    system,
+    messages: buildClaudeMessages(messages),
+  };
+
+  if (jsonSchema) {
+    // Structured outputs guarantee the response is schema-valid JSON (GA on Opus 4.7 / Sonnet 4.6).
+    body.output_config = { format: { type: "json_schema", schema: jsonSchema } };
+  }
+
+  return body;
+}
+
+function extractClaudeText(data: unknown): string {
+  if (!data || typeof data !== "object") {
+    return "";
+  }
+
+  const content = (data as Record<string, unknown>).content;
+  if (!Array.isArray(content)) {
+    return "";
+  }
+
+  const texts: string[] = [];
+  for (const block of content) {
+    if (block && typeof block === "object" && (block as Record<string, unknown>).type === "text") {
+      const text = (block as Record<string, unknown>).text;
+      if (typeof text === "string") {
+        texts.push(text);
+      }
+    }
+  }
+
+  return texts.join("").trim();
+}
+
+async function requestClaudeText(
+  model: string,
+  systemPrompt: string,
+  messages: LlmMessage[],
+  jsonSchema?: Record<string, unknown>,
+): Promise<string> {
+  let creds = await getClaudeCredentials();
+  const body = buildClaudeRequestBody(model, systemPrompt, messages, jsonSchema);
+  let fetchAttempts = 0;
+
+  let authAttempt = 0;
+  while (authAttempt < 2) {
+    let res: Response;
+    try {
+      fetchAttempts += 1;
+      res = await fetch(CLAUDE_MESSAGES_URL, {
+        method: "POST",
+        headers: buildClaudeHeaders(creds.accessToken),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+      });
+    } catch (error) {
+      if (isFetchFailedError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+        console.warn(
+          `Claude request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
+        );
+        await delay(FETCH_FAILED_RETRY_DELAY_MS);
+        continue;
+      }
+      throw error;
+    }
+
+    if ((res.status === 401 || res.status === 403) && authAttempt === 0 && creds.refreshToken) {
+      const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
+      if (refreshed) {
+        creds = refreshed;
+        authAttempt += 1;
+        continue;
+      }
+    }
+
+    if (!res.ok) {
+      const errorText = await res.text().catch(() => "");
+      throw new Error(`Claude API error ${res.status}: ${errorText || "<empty>"}`);
+    }
+
+    return extractClaudeText(await res.json());
+  }
+
+  throw new Error("Claude request failed after retry.");
+}
+
 export async function resolveLlmProfile(configPath: string, requestedProfileName?: string): Promise<ResolvedLlmProfile> {
   const config = await loadConfig(configPath);
   const llm = config.llm;
@@ -519,8 +769,8 @@ export async function resolveLlmProfile(configPath: string, requestedProfileName
     throw new Error(`LLM profile '${profileName}' not found in ${configPath}.`);
   }
 
-  if (profile.provider !== "codex") {
-    throw new Error(`Only 'codex' provider is supported. Found '${profile.provider}' for '${profileName}'.`);
+  if (profile.provider !== "codex" && profile.provider !== "claude") {
+    throw new Error(`Unsupported provider '${(profile as { provider?: string }).provider}' for '${profileName}'.`);
   }
 
   const model = profile.model?.trim();
@@ -530,7 +780,7 @@ export async function resolveLlmProfile(configPath: string, requestedProfileName
 
   return {
     name: profileName,
-    provider: "codex",
+    provider: profile.provider,
     model,
     systemPrompt: profile.system_prompt ?? llm.system_prompt ?? DEFAULT_SYSTEM_PROMPT,
   };
@@ -557,13 +807,13 @@ export async function listLlmProfiles(configPath: string): Promise<{
       throw new Error(`Missing 'model' for llm profile '${name}' in ${configPath}.`);
     }
 
-    if (profile.provider !== "codex") {
-      throw new Error(`Only 'codex' provider is supported. Found '${profile.provider}' for '${name}'.`);
+    if (profile.provider !== "codex" && profile.provider !== "claude") {
+      throw new Error(`Unsupported provider '${(profile as { provider?: string }).provider}' for '${name}'.`);
     }
 
     return {
       name,
-      provider: "codex" as const,
+      provider: profile.provider,
       model,
       displayName: `${name} (${model})`,
     };
@@ -600,7 +850,7 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
 
   return {
     profileName: profile.name,
-    provider: "codex",
+    provider: profile.provider,
     model: profile.model,
     systemPrompt: profile.systemPrompt,
     displayName: `${profile.name} (${profile.model})`,
@@ -609,6 +859,10 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
         input.messages,
         input.systemPrompt ?? profile.systemPrompt,
       );
+
+      if (profile.provider === "claude") {
+        return requestClaudeText(profile.model, systemPrompt, contents, input.jsonSchema);
+      }
 
       return requestCodexText(profile.model, systemPrompt, contents);
     },
