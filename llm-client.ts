@@ -700,6 +700,92 @@ function extractClaudeText(data: unknown): string {
   return texts.join("").trim();
 }
 
+export type ClaudeUsage = {
+  fiveHourUtilization: number | null;
+  fiveHourResetAt: number | null;
+  fiveHourStatus: string | null;
+  sevenDayUtilization: number | null;
+  sevenDayResetAt: number | null;
+  sevenDayStatus: string | null;
+  capturedAt: number;
+};
+
+let latestClaudeUsage: ClaudeUsage | null = null;
+
+export function getLatestClaudeUsage(): ClaudeUsage | null {
+  return latestClaudeUsage;
+}
+
+function parseUsageUtilization(value: string | null): number | null {
+  if (value === null) {
+    return null;
+  }
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function parseUsageResetMs(value: string | null): number | null {
+  if (value === null) {
+    return null;
+  }
+  const numeric = Number(value);
+  // The reset headers are unix epoch seconds.
+  return Number.isFinite(numeric) ? numeric * 1000 : null;
+}
+
+function captureClaudeUsage(res: Response): void {
+  const headers = res.headers;
+  const usage: ClaudeUsage = {
+    fiveHourUtilization: parseUsageUtilization(headers.get("anthropic-ratelimit-unified-5h-utilization")),
+    fiveHourResetAt: parseUsageResetMs(headers.get("anthropic-ratelimit-unified-5h-reset")),
+    fiveHourStatus: headers.get("anthropic-ratelimit-unified-5h-status"),
+    sevenDayUtilization: parseUsageUtilization(headers.get("anthropic-ratelimit-unified-7d-utilization")),
+    sevenDayResetAt: parseUsageResetMs(headers.get("anthropic-ratelimit-unified-7d-reset")),
+    sevenDayStatus: headers.get("anthropic-ratelimit-unified-7d-status"),
+    capturedAt: Date.now(),
+  };
+
+  if (usage.fiveHourUtilization !== null || usage.sevenDayUtilization !== null) {
+    latestClaudeUsage = usage;
+  }
+}
+
+function parseUsagePercent(value: string | null): number | null {
+  if (value === null || value.trim() === "") {
+    return null;
+  }
+  const numeric = Number(value);
+  // Codex reports an integer percent (0-100); normalize to a 0-1 fraction.
+  return Number.isFinite(numeric) ? numeric / 100 : null;
+}
+
+function codexUsageStatus(utilization: number | null): string | null {
+  if (utilization === null) {
+    return null;
+  }
+  return utilization >= 1 ? "limited" : "allowed";
+}
+
+// Codex exposes 5h (primary) / 7d (secondary) rate-limit windows via x-codex-* headers.
+function captureCodexUsage(res: Response): void {
+  const headers = res.headers;
+  const fiveHourUtilization = parseUsagePercent(headers.get("x-codex-primary-used-percent"));
+  const sevenDayUtilization = parseUsagePercent(headers.get("x-codex-secondary-used-percent"));
+  const usage: ClaudeUsage = {
+    fiveHourUtilization,
+    fiveHourResetAt: parseUsageResetMs(headers.get("x-codex-primary-reset-at")),
+    fiveHourStatus: codexUsageStatus(fiveHourUtilization),
+    sevenDayUtilization,
+    sevenDayResetAt: parseUsageResetMs(headers.get("x-codex-secondary-reset-at")),
+    sevenDayStatus: codexUsageStatus(sevenDayUtilization),
+    capturedAt: Date.now(),
+  };
+
+  if (fiveHourUtilization !== null || sevenDayUtilization !== null) {
+    latestClaudeUsage = usage;
+  }
+}
+
 async function requestClaudeText(
   model: string,
   systemPrompt: string,
@@ -746,6 +832,7 @@ async function requestClaudeText(
       throw new Error(`Claude API error ${res.status}: ${errorText || "<empty>"}`);
     }
 
+    captureClaudeUsage(res);
     return extractClaudeText(await res.json());
   }
 

@@ -9,8 +9,10 @@ import { WebSocket, type RawData } from "ws";
 import YAML from "yaml";
 import {
   createLlmClient,
+  getLatestClaudeUsage,
   listLlmProfiles,
   setActiveLlmProfile,
+  type ClaudeUsage,
   type LlmClient,
   type LlmMessage,
 } from "./llm-client.js";
@@ -135,6 +137,7 @@ type MonitorSnapshot = {
   status: MonitorStatus;
   history: MonitorEntry[];
   conversationPreview: MonitorConversationPreview | null;
+  claudeUsage: ClaudeUsage | null;
 };
 
 type MonitorEvent =
@@ -154,6 +157,10 @@ type MonitorEvent =
       type: "turn";
       groupId: string;
       turn: ConversationTurn;
+    }
+  | {
+      type: "usage";
+      claudeUsage: ClaudeUsage | null;
     };
 
 const __filename = fileURLToPath(import.meta.url);
@@ -197,7 +204,12 @@ const MODEL_DECISION_PROMPT = [
   '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
   "Rules:",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
-  "- If the message is unrelated to Holly, not directed at Holly, or does not require Holly to respond, set should_reply to false.",
+  "- Default to should_reply=false. Only set it to true when at least one reply condition below is clearly met.",
+  "- Reply conditions (set should_reply=true only if one holds): (a) Holly is @-mentioned or addressed by name; (b) the message is a direct question or request to Holly; (c) the topic strongly matches Holly's interests (math, AI, astronomy) and she has something concrete to add; (d) the group is doing a chain/meme bit she can join with one short line; (e) the same content is being repeated and Holly has not already echoed it once.",
+  "- Force should_reply=false when any of these holds, even if a condition above seems to apply: (f) Holly already spoke in the last 5 messages of this thread and is not directly addressed now; (g) the topic is vague or you cannot tell whether it concerns Holly; (h) the content is something Holly does not understand or is unsure about; (i) several people are chatting continuously without addressing Holly; (j) message_age_seconds exceeds stale_after_seconds.",
+  "- For a repeated/echo message, reply at most once; never echo the same content again afterwards.",
+  "- When in doubt, set should_reply=false. Frequent replies make Holly look fake.",
+  "- In thinking_process, first name which reply condition (a-e) is met; if none, set should_reply=false.",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
   "- thinking_process must be a short decision summary for logging, not a detailed chain-of-thought.",
@@ -1569,6 +1581,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     status: monitorStatus,
     history: monitorHistory,
     conversationPreview: latestConversationPreview,
+    claudeUsage: getLatestClaudeUsage(),
   };
 }
 
@@ -2469,6 +2482,8 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     jsonSchema: MODEL_DECISION_JSON_SCHEMA,
   });
 
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+
   const decision = parseModelDecision(reply);
   const content = formatModelReplyEntry(decision);
   await appendChatLog("assistant", content);
@@ -2902,6 +2917,26 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <div class="pb">
             <div class="stack">
               <p class="hint">Switch the active LLM profile. Changes apply immediately and are written to config.yaml.</p>
+              <div v-if="claudeUsage" style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted,#64748b);">
+                <span>Subscription Usage</span>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span style="width:18px;">5h</span>
+                  <div style="width:100px;height:6px;background:#eef2f7;border-radius:4px;overflow:hidden;">
+                    <div :style="{ width: usageWidth(claudeUsage.fiveHourUtilization), height: '100%', background: usageColor(claudeUsage.fiveHourUtilization) }"></div>
+                  </div>
+                  <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.fiveHourUtilization) }}</span>
+                  <span style="opacity:.8;">&middot; resets {{ fmtReset(claudeUsage.fiveHourResetAt) }} &middot; {{ claudeUsage.fiveHourStatus || '-' }}</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:6px;">
+                  <span style="width:18px;">7d</span>
+                  <div style="width:100px;height:6px;background:#eef2f7;border-radius:4px;overflow:hidden;">
+                    <div :style="{ width: usageWidth(claudeUsage.sevenDayUtilization), height: '100%', background: usageColor(claudeUsage.sevenDayUtilization) }"></div>
+                  </div>
+                  <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.sevenDayUtilization) }}</span>
+                  <span style="opacity:.8;">&middot; resets {{ fmtReset(claudeUsage.sevenDayResetAt) }} &middot; {{ claudeUsage.sevenDayStatus || '-' }}</span>
+                </div>
+                <span style="opacity:.7;">Updated {{ fmtTime(new Date(claudeUsage.capturedAt).toISOString()) }}</span>
+              </div>
               <select v-model="selProfile">
                 <option v-for="p in profiles" :key="p.name" :value="p.name">{{ p.displayName }}</option>
               </select>
@@ -3078,6 +3113,7 @@ createApp({
     var entries = ref([]);
     var renderedIds = new Set();
     var convPreview = ref(null);
+    var claudeUsage = ref(null);
     var groupEntries = computed(function() {
       return entries.value.filter(function(e) {
         return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
@@ -3157,6 +3193,34 @@ createApp({
       try { return JSON.stringify(JSON.parse(body), null, 2); } catch(e) { return body; }
     }
 
+    function usagePct(u) {
+      if (typeof u !== 'number') return 'n/a';
+      return (u * 100).toFixed(1) + '%';
+    }
+    function usageWidth(u) {
+      if (typeof u !== 'number') return '0%';
+      return Math.max(0, Math.min(100, u * 100)).toFixed(1) + '%';
+    }
+    function usageColor(u) {
+      if (typeof u !== 'number') return '#cbd5e1';
+      if (u >= 0.9) return '#ef4444';
+      if (u >= 0.6) return '#f59e0b';
+      return '#10b981';
+    }
+    function fmtReset(ms) {
+      if (typeof ms !== 'number') return '-';
+      var diff = ms - Date.now();
+      if (diff <= 0) return 'soon';
+      var mins = Math.round(diff / 60000);
+      if (mins < 60) return 'in ' + mins + 'm';
+      var hrs = Math.floor(mins / 60);
+      var rem = mins % 60;
+      if (hrs < 24) return 'in ' + hrs + 'h' + (rem ? ' ' + rem + 'm' : '');
+      var days = Math.floor(hrs / 24);
+      var remH = hrs % 24;
+      return 'in ' + days + 'd' + (remH ? ' ' + remH + 'h' : '');
+    }
+
     function pushEntry(entry) {
       if (renderedIds.has(entry.id)) return;
       renderedIds.add(entry.id);
@@ -3168,6 +3232,7 @@ createApp({
       renderedIds.clear();
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
+      if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
       entries.value = [];
       var visible = payload.history || [];
       for (var i = visible.length - 1; i >= 0; i--) { pushEntry(visible[i]); }
@@ -3177,6 +3242,7 @@ createApp({
       if (payload.type === 'snapshot') { renderSnapshot(payload); return; }
       if (payload.type === 'status') { wsStatus.value = payload.status; return; }
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
+      if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -3323,12 +3389,13 @@ createApp({
 
     return {
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
-      entries, groupEntries, convPreview, convMetaText,
+      entries, groupEntries, convPreview, convMetaText, claudeUsage,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtBody, clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup
+      fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset,
+      clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup
     };
   }
 }).mount('#app');
