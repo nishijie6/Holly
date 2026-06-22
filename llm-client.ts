@@ -58,6 +58,12 @@ export type LlmClient = {
     systemPrompt?: string;
     jsonSchema?: Record<string, unknown>;
   }): Promise<string>;
+  // Re-send the context with max_tokens=1 purely to refresh the prompt cache.
+  // No-op for non-Claude providers (Anthropic-cache-specific).
+  warmContext(input: {
+    messages: LlmMessage[];
+    systemPrompt?: string;
+  }): Promise<void>;
 };
 
 export type LlmProfileSummary = {
@@ -87,6 +93,7 @@ type CodexRequestBody = {
   model: string;
   input: CodexInputItem[];
   instructions?: string;
+  prompt_cache_key: string;
   store: false;
   stream?: boolean;
   reasoning?: {
@@ -99,6 +106,7 @@ const KEYCHAIN_SERVICE = "Codex Auth";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const CODEX_AUTH_URL = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_PROMPT_CACHE_NAMESPACE = "tsbot-group-chat";
 const PROJECT_AUTH_PATH = path.join(process.cwd(), ".codex", "auth.json");
 const HOME_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const TOKEN_REFRESH_BUFFER_MS = 300_000;
@@ -115,7 +123,18 @@ const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
 const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 // OAuth subscription tokens are only accepted when the first system block is this exact string.
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
-const CLAUDE_MAX_TOKENS = 4096;
+// Opus 4.x supports 128K output tokens; Sonnet 4.6 / Haiku 4.5 cap at 64K.
+function claudeMaxOutputTokens(model: string): number {
+  return /opus/i.test(model) ? 128_000 : 64_000;
+}
+
+type ClaudeRequestOptions = {
+  jsonSchema?: Record<string, unknown>;
+  maxTokens?: number;
+  // Place a 1h cache_control breakpoint on the last message so the conversation
+  // prefix is cached and reused across turns (and refreshed by warmContext).
+  cacheMessageTail?: boolean;
+};
 
 function isFetchFailedError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
@@ -371,6 +390,8 @@ function buildCodexRequest(model: string, systemPrompt: string, messages: LlmMes
     model,
     input,
     instructions: systemPrompt || undefined,
+    // Keep repeated bot instructions and conversation prefixes on the same cache route.
+    prompt_cache_key: `${CODEX_PROMPT_CACHE_NAMESPACE}:${model}`,
     store: false,
     stream: true,
     reasoning: model === "gpt-5.4" ? { effort: "medium" } : undefined,
@@ -651,6 +672,36 @@ function buildClaudeMessages(messages: LlmMessage[]): Array<{ role: "user" | "as
     merged.shift();
   }
 
+  // It must also END with a user turn: a trailing assistant message is treated
+  // as prefill, which the subscription/OAuth models reject ("does not support
+  // assistant message prefill"). This happens on the cache-warm path, which
+  // sends history with no new user turn appended (its empty current message is
+  // dropped above), leaving the bot's own last reply as the final turn.
+  while (merged.length > 0 && merged[merged.length - 1].role === "assistant") {
+    merged.pop();
+  }
+
+  return merged;
+}
+
+function buildClaudeMessagesWithCacheTail(
+  messages: LlmMessage[],
+  cacheTail: boolean,
+): Array<Record<string, unknown>> {
+  const merged = buildClaudeMessages(messages).map((message): Record<string, unknown> => ({
+    role: message.role,
+    content: message.content,
+  }));
+
+  if (cacheTail && merged.length > 0) {
+    const last = merged[merged.length - 1];
+    // Promote the last turn's content to a block array so the cache breakpoint
+    // sits on the conversation tail; the stable prefix before it is reused.
+    last.content = [
+      { type: "text", text: last.content as string, cache_control: { type: "ephemeral", ttl: "1h" } },
+    ];
+  }
+
   return merged;
 }
 
@@ -658,7 +709,7 @@ function buildClaudeRequestBody(
   model: string,
   systemPrompt: string,
   messages: LlmMessage[],
-  jsonSchema?: Record<string, unknown>,
+  options: ClaudeRequestOptions = {},
 ): Record<string, unknown> {
   const system: Array<Record<string, unknown>> = [
     { type: "text", text: CLAUDE_CODE_IDENTITY },
@@ -666,21 +717,21 @@ function buildClaudeRequestBody(
   const trimmedSystem = systemPrompt.trim();
   if (trimmedSystem) {
     // cache_control on the last system block caches the identity + full system prefix together.
-    system.push({ type: "text", text: trimmedSystem, cache_control: { type: "ephemeral" } });
+    system.push({ type: "text", text: trimmedSystem, cache_control: { type: "ephemeral", ttl: "1h" } });
   } else {
-    system[0].cache_control = { type: "ephemeral" };
+    system[0].cache_control = { type: "ephemeral", ttl: "1h" };
   }
 
   const body: Record<string, unknown> = {
     model,
-    max_tokens: CLAUDE_MAX_TOKENS,
+    max_tokens: options.maxTokens ?? claudeMaxOutputTokens(model),
     system,
-    messages: buildClaudeMessages(messages),
+    messages: buildClaudeMessagesWithCacheTail(messages, options.cacheMessageTail ?? false),
   };
 
-  if (jsonSchema) {
+  if (options.jsonSchema) {
     // Structured outputs guarantee the response is schema-valid JSON (GA on Opus 4.7 / Sonnet 4.6).
-    body.output_config = { format: { type: "json_schema", schema: jsonSchema } };
+    body.output_config = { format: { type: "json_schema", schema: options.jsonSchema } };
   }
 
   return body;
@@ -838,10 +889,10 @@ async function requestClaudeText(
   model: string,
   systemPrompt: string,
   messages: LlmMessage[],
-  jsonSchema?: Record<string, unknown>,
+  options: ClaudeRequestOptions = {},
 ): Promise<string> {
   let creds = await getClaudeCredentials();
-  const body = buildClaudeRequestBody(model, systemPrompt, messages, jsonSchema);
+  const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
   let fetchAttempts = 0;
 
   let authAttempt = 0;
@@ -866,12 +917,26 @@ async function requestClaudeText(
       throw error;
     }
 
-    if ((res.status === 401 || res.status === 403) && authAttempt === 0 && creds.refreshToken) {
-      const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
-      if (refreshed) {
-        creds = refreshed;
+    if ((res.status === 401 || res.status === 403) && authAttempt === 0) {
+      // The OAuth credentials are shared with the Claude Code app, which uses
+      // rotating refresh tokens: a concurrent rotation invalidates both the
+      // access token we just sent and our in-hand refresh token. Re-read the
+      // file first — the other process has usually already written fresh
+      // tokens, so we can adopt them instead of spending our now-stale refresh
+      // token on a refresh that would itself 401.
+      const latest = await readClaudeCredentials().catch(() => null);
+      if (latest && latest.accessToken !== creds.accessToken) {
+        creds = latest;
         authAttempt += 1;
         continue;
+      }
+      if (creds.refreshToken) {
+        const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
+        if (refreshed) {
+          creds = refreshed;
+          authAttempt += 1;
+          continue;
+        }
       }
     }
 
@@ -1035,10 +1100,33 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
       );
 
       if (profile.provider === "claude") {
-        return requestClaudeText(profile.model, systemPrompt, contents, input.jsonSchema);
+        return requestClaudeText(profile.model, systemPrompt, contents, {
+          jsonSchema: input.jsonSchema,
+          cacheMessageTail: true,
+        });
       }
 
       return requestCodexText(profile.model, systemPrompt, contents);
+    },
+    async warmContext(input): Promise<void> {
+      if (profile.provider !== "claude") {
+        return;
+      }
+
+      const { systemPrompt, contents } = splitSystemPrompt(
+        input.messages,
+        input.systemPrompt ?? profile.systemPrompt,
+      );
+      if (contents.length === 0) {
+        return;
+      }
+
+      // max_tokens=1: the reply is discarded; the request exists only to write
+      // the 1h prompt cache so the next real reply reads the warmed prefix.
+      await requestClaudeText(profile.model, systemPrompt, contents, {
+        maxTokens: 1,
+        cacheMessageTail: true,
+      });
     },
   };
 }

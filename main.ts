@@ -1,7 +1,7 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { mkdir, appendFile, readFile, writeFile } from "node:fs/promises";
-import { existsSync, watch, type FSWatcher } from "node:fs";
+import { existsSync, readFileSync, watch, type FSWatcher } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -67,6 +67,21 @@ type ModelRequestContext = {
   receivedAt: string;
   messageLagMs: number | null;
 };
+
+type PendingModelMessage = {
+  message: string;
+  context: ModelRequestContext;
+};
+
+class RetryableModelBatchError extends Error {
+  readonly cause: unknown;
+
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = "RetryableModelBatchError";
+    this.cause = cause;
+  }
+}
 
 type ModelDecision = {
   shouldReply: boolean;
@@ -189,12 +204,25 @@ const APP_ROOT = existsSync(join(process.cwd(), "package.json")) ? process.cwd()
 
 const CONFIG_PATH = join(APP_ROOT, "config.yaml");
 const LOG_DIR = join(APP_ROOT, "logs");
+const VENDOR_DIR = join(APP_ROOT, "vendor");
+
+// Serve the Vue runtime from disk so the monitor page never depends on an
+// external CDN (the bot typically runs behind a proxy where unpkg is unreachable
+// from the browser, which would leave the whole page blank).
+const VUE_RUNTIME_SOURCE = (() => {
+  try {
+    return readFileSync(join(VENDOR_DIR, "vue.global.prod.js"), "utf-8");
+  } catch {
+    console.warn("Vendored Vue runtime missing at vendor/vue.global.prod.js; monitor page will not render.");
+    return "";
+  }
+})();
 const HTTP_PORT = 5000;
 const HTTP_HOST = "127.0.0.1";
 const WS_HOST = "127.0.0.1";
 const WS_PORT = 8082;
 const WS_TARGET_URL = `ws://${WS_HOST}:${WS_PORT}`;
-const WS_RECONNECT_DELAY_MS = 3000;
+const WS_RECONNECT_DELAY_MS = 8000;
 const WS_HISTORY_LIMIT = 120;
 const APP_SESSION_ID = randomUUID();
 const APP_SESSION_STARTED_AT = new Date().toISOString();
@@ -208,12 +236,24 @@ const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
 const MESSAGE_REPLY_MAX_AGE_MS = 5 * 60 * 1000;
-const CONVERSATION_HISTORY_LIMIT = 5000;
+const UNREAD_MODEL_FLUSH_INTERVAL_MS = 60 * 1000;
+// Re-send the merged global context with max_tokens=1 on this cadence to keep the
+// 1h prompt cache warm. 20min < the 1h cache TTL, so the cache never goes cold.
+const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
+// Memory-safety ceiling on retained per-group turns. The context_limit_tokens
+// budget (190K) binds well before this many short group turns, so in practice
+// history is "keep everything that fits in the window", not capped by count.
+const CONVERSATION_HISTORY_LIMIT = 50000;
+// The monitor only needs a recent slice; shipping the whole global context over
+// SSE on every request would bloat the payload and freeze the conversation panel.
+const MONITOR_PREVIEW_MESSAGE_LIMIT = 50;
 const GROUP_HISTORY_BOOTSTRAP_PAGE_SIZE = 50;
 const GROUP_HISTORY_BOOTSTRAP_MAX_PAGES = 200;
 const DEFAULT_CONTEXT_LIMIT_TOKENS = 128000;
 const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
 const MIN_CONTEXT_LIMIT_TOKENS = 128;
+// Headroom left below the model's input window for estimation drift + output.
+const CONTEXT_MODEL_WINDOW_MARGIN_TOKENS = 16_000;
 const CONTEXT_RECENT_MESSAGES_TO_KEEP = 2;
 const CONTEXT_MIN_SECTION_BUDGET = 48;
 const MODEL_DECISION_PROMPT = [
@@ -223,16 +263,19 @@ const MODEL_DECISION_PROMPT = [
   "Required JSON shape:",
   '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
   "Rules:",
+  "- Obey the persona and per-group rules in the system prompt above, matched via the group_id shown in the batch header (e.g. a group where Holly may only echo repeats and must otherwise stay silent). Such per-group restrictions override the reply conditions below.",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
+  "- A scheduled request can contain multiple unread same-group messages. Treat them as one recent activity batch and send at most one reply to the content most worth responding to.",
   "- Default to should_reply=false. Only set it to true when at least one reply condition below is clearly met.",
   "- Reply conditions (set should_reply=true only if one holds): (a) Holly is @-mentioned or addressed by name; (b) the message is a direct question or request to Holly; (c) the topic strongly matches Holly's interests (math, AI, astronomy) and she has something concrete to add; (d) the group is doing a chain/meme bit she can join with one short line; (e) the same content is being repeated and Holly has not already echoed it once.",
-  "- Force should_reply=false when any of these holds, even if a condition above seems to apply: (f) Holly already spoke in the last 5 messages of this thread and is not directly addressed now; (g) the topic is vague or you cannot tell whether it concerns Holly; (h) the content is something Holly does not understand or is unsure about; (i) several people are chatting continuously without addressing Holly; (j) message_age_seconds exceeds stale_after_seconds.",
+  "- Force should_reply=false when any of these holds, even if a condition above seems to apply: (f) the topic is vague or you cannot tell whether it concerns Holly; (g) the content is something Holly does not understand or is unsure about; (h) several people are chatting continuously without addressing Holly; (i) message_age_seconds exceeds stale_after_seconds.",
   "- For a repeated/echo message, reply at most once; never echo the same content again afterwards.",
   "- When in doubt, set should_reply=false. Frequent replies make Holly look fake.",
   "- In thinking_process, first name which reply condition (a-e) is met; if none, set should_reply=false.",
+  "- If selecting condition (a) or (b), thinking_process must quote or identify the exact text showing that the message addresses Holly; if no such evidence exists, do not select condition (a) or (b).",
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
-  "- thinking_process must be a short decision summary for logging, not a detailed chain-of-thought.",
+  "- thinking_process must be written in Chinese (简体中文), as a short decision summary for logging, not a detailed chain-of-thought.",
   "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
 ].join("\n");
@@ -259,8 +302,13 @@ let incomingMessageStoreQueue: Promise<void> = Promise.resolve();
 let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
+let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
+// Set whenever the merged global context grows; the warmer only fires when true
+// so quiet periods don't burn rate-limit budget re-warming an unchanged context.
+let globalContextDirty = true;
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
+let conversationHistoryBootstrapDayByGroup = new Map<string, string>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
 let pendingWsActions = new Map<string, PendingWsAction>();
 let configWatcher: FSWatcher | null = null;
@@ -642,6 +690,11 @@ function fitVariableContextToBudget(
   };
 }
 
+function modelContextWindowTokens(model: string): number {
+  // Haiku 4.5 has a 200K window; Opus 4.x and Sonnet 4.6 are 1M.
+  return /haiku/i.test(model) ? 200_000 : 1_000_000;
+}
+
 function prepareModelRequest(
   baseSystemPrompt: string,
   memoryPrompt: string,
@@ -653,6 +706,15 @@ function prepareModelRequest(
     role: "user",
     content: normalizeMessageContent(currentMessage),
   };
+
+  // Clamp the configured budget to the active model's input window so an 800K
+  // global context can't overflow a smaller window (e.g. Haiku's 200K).
+  const modelWindowTokens = modelContextWindowTokens(activeLlmClient?.model ?? "");
+  const limitTokens = Math.min(
+    contextBudgetConfig.limitTokens,
+    Math.max(MIN_CONTEXT_LIMIT_TOKENS, modelWindowTokens - CONTEXT_MODEL_WINDOW_MARGIN_TOKENS),
+  );
+  const compressThresholdTokens = Math.min(contextBudgetConfig.compressThresholdTokens, limitTokens);
 
   let usedCompression = false;
   let fittedVariableContext = {
@@ -666,8 +728,8 @@ function prepareModelRequest(
 
   const fixedBudget = estimateSystemPromptTokens(fixedSystemPrompt) + estimateMessageTokens(currentUserMessage);
 
-  if (estimatedTokens > contextBudgetConfig.compressThresholdTokens) {
-    const softVariableBudget = Math.max(0, contextBudgetConfig.compressThresholdTokens - fixedBudget);
+  if (estimatedTokens > compressThresholdTokens) {
+    const softVariableBudget = Math.max(0, compressThresholdTokens - fixedBudget);
     fittedVariableContext = fitVariableContextToBudget(
       memoryPrompt,
       conversationMessages,
@@ -679,8 +741,8 @@ function prepareModelRequest(
     usedCompression = true;
   }
 
-  if (estimatedTokens > contextBudgetConfig.limitTokens) {
-    const hardVariableBudget = Math.max(0, contextBudgetConfig.limitTokens - fixedBudget);
+  if (estimatedTokens > limitTokens) {
+    const hardVariableBudget = Math.max(0, limitTokens - fixedBudget);
     fittedVariableContext = fitVariableContextToBudget(
       memoryPrompt,
       conversationMessages,
@@ -692,9 +754,9 @@ function prepareModelRequest(
     usedCompression = true;
   }
 
-  if (estimatedTokens > contextBudgetConfig.limitTokens) {
+  if (estimatedTokens > limitTokens) {
     const systemAndHistoryBudget = estimateSystemPromptTokens(systemPrompt) + estimateMessagesTokens(fittedVariableContext.conversationMessages);
-    const currentMessageBudget = Math.max(8, contextBudgetConfig.limitTokens - systemAndHistoryBudget - 6);
+    const currentMessageBudget = Math.max(8, limitTokens - systemAndHistoryBudget - 6);
     const compactCurrentUserMessage: LlmMessage = {
       role: "user",
       content: compactTextToTokenBudget(currentUserMessage.content, currentMessageBudget),
@@ -704,13 +766,13 @@ function prepareModelRequest(
     usedCompression = true;
   }
 
-  if (estimatedTokens > contextBudgetConfig.limitTokens) {
+  if (estimatedTokens > limitTokens) {
     systemPrompt = fixedSystemPrompt;
     messages = [{
       role: "user",
       content: compactTextToTokenBudget(
         currentUserMessage.content,
-        Math.max(8, contextBudgetConfig.limitTokens - estimateSystemPromptTokens(systemPrompt) - 6),
+        Math.max(8, limitTokens - estimateSystemPromptTokens(systemPrompt) - 6),
       ),
     }];
     estimatedTokens = estimateRequestTokens(systemPrompt, messages);
@@ -917,9 +979,10 @@ function recordTokenUsage(model: string, inputTokens: number, outputTokens: numb
   persistTokenStats();
 }
 
-function getTodayTokenStats(): DailyTokenStats {
-  const date = localDateKey();
-  const models = tokenStatsByDate.get(date);
+function buildDailyTokenStats(
+  date: string,
+  models: Map<string, ModelTokenCounts> | undefined,
+): DailyTokenStats {
   const list: ModelTokenStat[] = [];
   let totalTokens = 0;
   if (models) {
@@ -936,6 +999,21 @@ function getTodayTokenStats(): DailyTokenStats {
   }
   list.sort((a, b) => b.totalTokens - a.totalTokens);
   return { date, models: list, totalTokens };
+}
+
+function getTodayTokenStats(): DailyTokenStats {
+  const date = localDateKey();
+  return buildDailyTokenStats(date, tokenStatsByDate.get(date));
+}
+
+// Per-day history (most recent first) for the usage dashboard, plus the
+// combined token total across the returned days.
+function getTokenStatsHistory(limit = 60): { days: DailyTokenStats[]; grandTotal: number } {
+  const dates = Array.from(tokenStatsByDate.keys()).sort().reverse();
+  const limited = limit > 0 ? dates.slice(0, limit) : dates;
+  const days = limited.map((date) => buildDailyTokenStats(date, tokenStatsByDate.get(date)));
+  const grandTotal = days.reduce((sum, day) => sum + day.totalTokens, 0);
+  return { days, grandTotal };
 }
 
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -1263,6 +1341,21 @@ async function sendWsAction(action: string, params: Record<string, unknown>): Pr
   return result;
 }
 
+// When the upstream connection drops, any in-flight action responses can never
+// arrive on it. Fail them immediately with a clear reason instead of letting
+// each sit until WS_ACTION_TIMEOUT_MS fires a misleading "Timed out" error.
+function rejectAllPendingWsActions(reason: string): void {
+  if (pendingWsActions.size === 0) {
+    return;
+  }
+  const pending = Array.from(pendingWsActions.values());
+  pendingWsActions.clear();
+  for (const entry of pending) {
+    clearTimeout(entry.timer);
+    entry.reject(new Error(reason));
+  }
+}
+
 async function runNapCatOcr(image: string): Promise<string> {
   const actions = [".ocr_image", "ocr_image"];
   let lastError: Error | null = null;
@@ -1344,6 +1437,34 @@ async function fetchUrlContent(url: string): Promise<string> {
   }
 }
 
+function toHttpFallbackUrl(url: string): string | null {
+  return /^https:\/\//i.test(url) ? url.replace(/^https:\/\//i, "http://") : null;
+}
+
+async function fetchUrlContentWithFallback(url: string): Promise<{ url: string; content: string }> {
+  let originalError: unknown = null;
+  try {
+    const content = await fetchUrlContent(url);
+    if (content) {
+      return { url, content };
+    }
+  } catch (error) {
+    originalError = error;
+  }
+
+  const fallbackUrl = toHttpFallbackUrl(url);
+  if (!fallbackUrl) {
+    if (originalError) {
+      throw originalError;
+    }
+    return { url, content: "" };
+  }
+
+  pushMonitorEntry("status", "URL Fetch Fallback", `from=${url}\nto=${fallbackUrl}`);
+  const fallbackContent = await fetchUrlContent(fallbackUrl);
+  return { url: fallbackUrl, content: fallbackContent };
+}
+
 async function enrichMessageWithUrlContent(message: ParsedIncomingMessage): Promise<ParsedIncomingMessage> {
   if (message.isBinary || message.messageType !== "group" || !message.displayText) {
     return message;
@@ -1360,7 +1481,8 @@ async function enrichMessageWithUrlContent(message: ParsedIncomingMessage): Prom
   const fetchedBlocks: string[] = [];
   for (const url of urls) {
     try {
-      const content = await fetchUrlContent(url);
+      const fetched = await fetchUrlContentWithFallback(url);
+      const content = fetched.content;
       if (content) {
         fetchedBlocks.push(`[网页内容 ${url}]\n${content}`);
       }
@@ -1526,6 +1648,10 @@ function getLocalDayRange(referenceTime: string): { startMs: number; endMs: numb
     startMs: start.getTime(),
     endMs: end.getTime(),
   };
+}
+
+function getLocalDayBootstrapKey(referenceTime: string): string {
+  return String(getLocalDayRange(referenceTime).startMs);
 }
 
 function readHistoryMessageTimestampMs(message: GroupHistoryMessage): number | null {
@@ -1705,10 +1831,12 @@ function updateConversationPreview(preview: MonitorConversationPreview | null): 
     ? {
         groupId: preview.groupId,
         updatedAt: preview.updatedAt,
-        messages: preview.messages.map((message): LlmMessage => ({
-          role: message.role,
-          content: message.content,
-        })),
+        messages: preview.messages
+          .slice(-MONITOR_PREVIEW_MESSAGE_LIMIT)
+          .map((message): LlmMessage => ({
+            role: message.role,
+            content: message.content,
+          })),
         estimatedTokens: preview.estimatedTokens,
         compressed: preview.compressed,
         contextLimitTokens: preview.contextLimitTokens,
@@ -1746,7 +1874,6 @@ function parseReplyGroupId(groupId: string | null): number {
 
 function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
   const referenceTs = parseIsoTimestamp(referenceTime);
-  const dayRange = getLocalDayRange(referenceTime);
   const filtered = referenceTs === null
     ? turns
     : turns.filter((turn) => {
@@ -1755,7 +1882,10 @@ function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string
           return true;
         }
 
-        return turnTs <= referenceTs && turnTs >= dayRange.startMs && turnTs < dayRange.endMs;
+        // Keep the full per-group history (no daily reset); only drop turns
+        // newer than the message being processed. context_limit_tokens in
+        // prepareModelRequest is what actually bounds what reaches the model.
+        return turnTs <= referenceTs;
       });
 
   return filtered.slice(-CONVERSATION_HISTORY_LIMIT);
@@ -1806,6 +1936,7 @@ function appendConversationTurn(turn: ConversationTurn): void {
   const existing = conversationHistoryByGroup.get(groupKey) ?? [];
   const next = mergeConversationTurns([...existing, normalizedTurn], turn.timestamp);
   conversationHistoryByGroup.set(groupKey, next);
+  globalContextDirty = true;
   broadcastMonitorEvent({
     type: "turn",
     groupId: groupKey,
@@ -1823,25 +1954,60 @@ function getLatestConversationTurn(groupId: string | null): ConversationTurn | n
   return turns.at(-1) ?? null;
 }
 
-function buildConversationMessages(context: ModelRequestContext, currentMessage: string): LlmMessage[] {
+function buildConversationMessages(context: ModelRequestContext, currentMessages: readonly PendingModelMessage[]): LlmMessage[] {
   const groupKey = normalizeConversationGroupKey(context.groupId);
   if (!groupKey) {
     return [];
   }
 
-  const currentContent = currentMessage.trim();
+  const currentTurnKeys = new Set(
+    currentMessages.map((item) => getConversationTurnKey({
+      groupId: groupKey,
+      role: "user",
+      senderName: item.context.senderName,
+      userId: item.context.userId,
+      content: item.message.trim(),
+      timestamp: item.context.receivedAt,
+    })),
+  );
   const turns = pruneConversationTurns(
     conversationHistoryByGroup.get(groupKey) ?? [],
     context.receivedAt,
-  ).filter((turn) => {
-    return !(
-      turn.role === "user" &&
-      turn.timestamp === context.receivedAt &&
-      turn.content === currentContent
-    );
-  });
+  ).filter((turn) => !currentTurnKeys.has(getConversationTurnKey(turn)));
 
   return turns.map(formatConversationTurnForModel);
+}
+
+// Merge every group's history into one chronological context. Used for both the
+// real reply and the cache warmer so they share an identical cacheable prefix.
+function buildGlobalConversationMessages(
+  context: ModelRequestContext,
+  currentMessages: readonly PendingModelMessage[],
+): LlmMessage[] {
+  const groupKey = normalizeConversationGroupKey(context.groupId);
+  const currentTurnKeys = new Set(
+    currentMessages.map((item) => getConversationTurnKey({
+      groupId: groupKey,
+      role: "user",
+      senderName: item.context.senderName,
+      userId: item.context.userId,
+      content: item.message.trim(),
+      timestamp: item.context.receivedAt,
+    })),
+  );
+
+  const allTurns: ConversationTurn[] = [];
+  for (const turns of conversationHistoryByGroup.values()) {
+    for (const turn of turns) {
+      allTurns.push(turn);
+    }
+  }
+
+  // mergeConversationTurns dedupes (by group-aware key), sorts by timestamp, and
+  // prunes anything newer than the message being processed.
+  return mergeConversationTurns(allTurns, context.receivedAt)
+    .filter((turn) => !currentTurnKeys.has(getConversationTurnKey(turn)))
+    .map(formatGlobalConversationTurnForModel);
 }
 
 function hasConversationContextForGroup(groupId: string | null, referenceTime: string): boolean {
@@ -1948,7 +2114,13 @@ async function bootstrapTodayGroupHistoryContext(groupId: string, referenceTime:
 
 async function ensureTodayGroupHistoryContext(groupId: string | null, referenceTime: string): Promise<void> {
   const groupKey = normalizeConversationGroupKey(groupId);
-  if (!groupKey || hasConversationContextForGroup(groupKey, referenceTime)) {
+  if (!groupKey) {
+    return;
+  }
+
+  hasConversationContextForGroup(groupKey, referenceTime);
+  const dayKey = getLocalDayBootstrapKey(referenceTime);
+  if (conversationHistoryBootstrapDayByGroup.get(groupKey) === dayKey) {
     return;
   }
 
@@ -1959,6 +2131,9 @@ async function ensureTodayGroupHistoryContext(groupId: string | null, referenceT
   }
 
   const bootstrap = bootstrapTodayGroupHistoryContext(groupKey, referenceTime)
+    .then(() => {
+      conversationHistoryBootstrapDayByGroup.set(groupKey, dayKey);
+    })
     .catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
       pushMonitorEntry("error", "Context Bootstrap Error", `group_id=${groupKey}\n${detail}`);
@@ -2024,18 +2199,61 @@ function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
   };
 }
 
-function formatCurrentMessageForModel(context: ModelRequestContext, currentMessage: string): string {
-  const metadata = [
-    "Current message metadata:",
-    `- message_age_seconds: ${formatMessageAgeSeconds(context.messageLagMs)}`,
-    `- stale_after_seconds: ${Math.floor(MESSAGE_REPLY_MAX_AGE_MS / 1000)}`,
-    "- If message_age_seconds is greater than stale_after_seconds, do not reply.",
-  ].join("\n");
+// Like formatConversationTurnForModel but preserves group labeling so a merged
+// cross-group log stays unambiguous about which group each line belongs to.
+function formatGlobalConversationTurnForModel(turn: ConversationTurn): LlmMessage {
+  if (turn.role === "user") {
+    // Keep the raw "群聊 [群名(群号)] [发送人(编号)] 内容" prefix intact.
+    return { role: "user", content: normalizeMessageContent(turn.content) };
+  }
 
-  return [
-    metadata,
-    formatSameGroupUserContent(currentMessage, context.senderName, context.userId),
-  ].join("\n\n");
+  // Assistant turns carry only Holly's reply text; tag the group she spoke in.
+  const groupTag = turn.groupId ? `[群${turn.groupId}] ` : "";
+  return { role: "assistant", content: `${groupTag}${normalizeMessageContent(turn.content)}` };
+}
+
+function getCurrentMessageLagMs(context: ModelRequestContext): number {
+  const receivedAtMs = parseIsoTimestamp(context.receivedAt) ?? Date.now();
+  const queuedMs = Math.max(0, Date.now() - receivedAtMs);
+  return Math.max(0, context.messageLagMs ?? 0) + queuedMs;
+}
+
+// Local wall-clock time for the model. Injected into the per-request batch
+// message (the cache tail), never the cached system prefix, so the constantly
+// changing value never busts the 1h prompt cache.
+function formatLocalDateTimeForModel(date = new Date()): string {
+  const weekday = "日一二三四五六"[date.getDay()];
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())} 星期${weekday}`;
+}
+
+function formatUnreadMessagesForModel(messages: readonly PendingModelMessage[]): string {
+  // The batch is single-group (queued per group), so any message carries the
+  // current group_id. Surface it so the system prompt's per-group rules (e.g.
+  // "group_id=20000003 只复读") can actually be applied — the compact message
+  // format strips the group prefix, so this is the model's only signal of which
+  // group it is in. Lives in the per-request tail, so it costs no prompt cache.
+  const groupId = normalizeConversationGroupKey(messages.at(-1)?.context.groupId ?? null);
+  const lines = [
+    "Scheduled unread-message scan for this group:",
+    `- current_time: ${formatLocalDateTimeForModel()}`,
+    ...(groupId ? [`- group_id: ${groupId}`] : []),
+    `- unread_message_count: ${messages.length}`,
+    `- stale_after_seconds: ${Math.floor(MESSAGE_REPLY_MAX_AGE_MS / 1000)}`,
+    "- Decide whether to reply to anything in this unread batch. Send at most one reply.",
+  ];
+
+  for (const [index, item] of messages.entries()) {
+    lines.push(
+      "",
+      `Unread message ${index + 1}:`,
+      `- message_age_seconds: ${formatMessageAgeSeconds(item.context.messageLagMs)}`,
+      formatSameGroupUserContent(item.message, item.context.senderName, item.context.userId),
+    );
+  }
+
+  return lines.join("\n");
 }
 
 function formatMemoryLine(record: StoredMemoryRecord): string | null {
@@ -2287,7 +2505,11 @@ function computeConversationThreadScore(
   };
 }
 
-async function buildMemoryPrompt(context: ModelRequestContext, currentMessage: string): Promise<string> {
+async function buildMemoryPrompt(
+  context: ModelRequestContext,
+  currentMessage: string,
+  excludedMessages: readonly string[] = [currentMessage],
+): Promise<string> {
   const store = incomingMessageStore;
   if (!store) {
     return "";
@@ -2303,8 +2525,9 @@ async function buildMemoryPrompt(context: ModelRequestContext, currentMessage: s
     limit: THREAD_CANDIDATE_LIMIT + 1,
   });
 
+  const excludedMessageSet = new Set(excludedMessages.map((message) => message.trim()));
   const scoredMemories = memories
-    .filter((record) => (record.displayText?.trim() || record.rawMessage?.trim()) !== currentMessage.trim())
+    .filter((record) => !excludedMessageSet.has(record.displayText?.trim() || record.rawMessage?.trim() || ""))
     .map((record) => ({
       record,
       score: computeConversationThreadScore(context, currentMessage, record),
@@ -2498,19 +2721,19 @@ function parseModelDecision(raw: string): ModelDecision {
 
 function formatModelReplyEntry(decision: ModelDecision): string {
   const lines = [
-    `should_reply: ${decision.shouldReply}`,
-    `thinking_process: ${decision.thinkingProcess || "(empty)"}`,
-    `final_answer: ${decision.finalAnswer || "(empty)"}`,
+    `是否回复: ${decision.shouldReply ? "是" : "否"}`,
+    `思考过程: ${decision.thinkingProcess || "（空）"}`,
+    `最终回复: ${decision.finalAnswer || "（空）"}`,
   ];
 
   if (!decision.shouldReply) {
-    lines.push("reply_status: skipped");
-    lines.push("skip_reason: Model marked the message as unrelated; nothing will be sent.");
+    lines.push("回复状态: 跳过");
+    lines.push("跳过原因: 模型判定该消息与自己无关，不会发送。");
   } else if (!decision.finalAnswer) {
-    lines.push("reply_status: skipped");
-    lines.push("skip_reason: Model chose to reply but final_answer is empty.");
+    lines.push("回复状态: 跳过");
+    lines.push("跳过原因: 模型选择回复，但最终回复内容为空。");
   } else {
-    lines.push("reply_status: ready_to_send");
+    lines.push("回复状态: 待发送");
   }
 
   return lines.join("\n");
@@ -2560,22 +2783,43 @@ async function sendGroupMessage(groupId: number, message: string): Promise<void>
   });
 }
 
-async function forwardMessageToModel(message: string, context: ModelRequestContext): Promise<void> {
+async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
+  const messages = pendingMessages
+    .map((item) => ({
+      ...item,
+      context: {
+        ...item.context,
+        messageLagMs: getCurrentMessageLagMs(item.context),
+      },
+    }))
+    .filter((item) => (item.context.messageLagMs ?? 0) <= MESSAGE_REPLY_MAX_AGE_MS);
+
+  if (messages.length === 0) {
+    pushMonitorEntry("status", "Unread Batch Skipped", "All queued messages became stale before the scheduled model scan ran.");
+    return;
+  }
+
   const client = getActiveLlmClient();
   const startedAt = Date.now();
+  const latestMessage = messages[messages.length - 1];
+  const batchMessage = formatUnreadMessagesForModel(messages);
+  const context = latestMessage.context;
   const replyGroupId = parseReplyGroupId(context.groupId);
   const effectiveContext: ModelRequestContext = {
     ...context,
     groupId: normalizeConversationGroupKey(context.groupId),
   };
-  const memoryPrompt = await buildMemoryPrompt(effectiveContext, message);
-  const conversationMessages = buildConversationMessages(effectiveContext, message);
-  const currentModelMessage = formatCurrentMessageForModel(effectiveContext, message);
+  const memoryPrompt = await buildMemoryPrompt(
+    effectiveContext,
+    batchMessage,
+    messages.map((item) => item.message),
+  );
+  const conversationMessages = buildGlobalConversationMessages(effectiveContext, messages);
   const preparedRequest = prepareModelRequest(
     client.systemPrompt,
     memoryPrompt,
     conversationMessages,
-    currentModelMessage,
+    batchMessage,
   );
 
   updateConversationPreview({
@@ -2588,14 +2832,19 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     compressThresholdTokens: contextBudgetConfig.compressThresholdTokens,
   });
 
-  pushMonitorEntry("status", "Model Request", currentModelMessage);
-  await appendChatLog("user", message);
+  pushMonitorEntry("status", "Scheduled Model Request", batchMessage);
+  await appendChatLog("user", batchMessage);
 
-  const reply = await client.generateText({
-    systemPrompt: preparedRequest.systemPrompt,
-    messages: preparedRequest.messages,
-    jsonSchema: MODEL_DECISION_JSON_SCHEMA,
-  });
+  let reply: string;
+  try {
+    reply = await client.generateText({
+      systemPrompt: preparedRequest.systemPrompt,
+      messages: preparedRequest.messages,
+      jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+    });
+  } catch (error) {
+    throw new RetryableModelBatchError("Model request failed; unread batch will be retried.", error);
+  }
 
   broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
 
@@ -2605,7 +2854,12 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
     broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
   }
 
-  const decision = parseModelDecision(reply);
+  let decision: ModelDecision;
+  try {
+    decision = parseModelDecision(reply);
+  } catch (error) {
+    throw new RetryableModelBatchError("Model response was invalid; unread batch will be retried.", error);
+  }
   const content = formatModelReplyEntry(decision);
   await appendChatLog("assistant", content);
   pushMonitorEntry(
@@ -2649,19 +2903,146 @@ async function forwardMessageToModel(message: string, context: ModelRequestConte
   );
 }
 
-function enqueueMessageForModel(message: string, context: ModelRequestContext): void {
+function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
   modelQueue = modelQueue
     .catch(() => {
       // Keep the queue alive after a previous failure.
     })
     .then(async () => {
-      await forwardMessageToModel(message, context);
+      await forwardUnreadMessagesToModel(messages);
     })
     .catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
+      if (error instanceof RetryableModelBatchError) {
+        restoreUnreadBatchForModel(messages);
+      }
       pushMonitorEntry("error", "Model Error", detail);
       console.error("Model request failed:", error);
     });
+}
+
+async function warmGlobalContext(): Promise<void> {
+  if (!globalContextDirty) {
+    return;
+  }
+
+  const client = activeLlmClient;
+  if (!client || client.provider !== "claude") {
+    // Only Anthropic prompt caching benefits from warming.
+    return;
+  }
+
+  const warmRequestContext: ModelRequestContext = {
+    groupId: null,
+    userId: null,
+    senderName: null,
+    rawMessage: null,
+    receivedAt: new Date().toISOString(),
+    messageLagMs: null,
+  };
+
+  const conversationMessages = buildGlobalConversationMessages(warmRequestContext, []);
+  if (conversationMessages.length === 0) {
+    globalContextDirty = false;
+    return;
+  }
+
+  // Build the same system + history prefix a real reply uses (empty current
+  // message, no memory) so the warmed cache is the one the next reply reads.
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationMessages, "");
+  if (prepared.messages.length === 0) {
+    globalContextDirty = false;
+    return;
+  }
+
+  // Clear before awaiting so messages arriving during the call re-arm the flag.
+  globalContextDirty = false;
+  const startedAt = Date.now();
+  await client.warmContext({
+    systemPrompt: prepared.systemPrompt,
+    messages: prepared.messages,
+  });
+
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+
+  pushMonitorEntry(
+    "status",
+    `Context Warmed - ${formatElapsedDuration(startedAt, Date.now())}`,
+    `Refreshed prompt cache with ${prepared.messages.length} messages (~${prepared.estimatedTokens} tokens).`,
+  );
+}
+
+function scheduleGlobalContextWarm(): void {
+  // Serialize on the model queue so warming never races a real reply; concurrent
+  // requests sharing a prefix would all miss the cache.
+  modelQueue = modelQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      await warmGlobalContext();
+    })
+    .catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Context Warm Error", detail);
+      console.error("Context warm failed:", error);
+    });
+}
+
+function restoreUnreadBatchForModel(messages: PendingModelMessage[]): void {
+  const groupKey = normalizeConversationGroupKey(messages[0]?.context.groupId ?? null);
+  if (!groupKey || messages.length === 0) {
+    return;
+  }
+
+  const pendingMessages = unreadModelMessagesByGroup.get(groupKey) ?? [];
+  unreadModelMessagesByGroup.set(groupKey, [...messages, ...pendingMessages]);
+  pushMonitorEntry(
+    "status",
+    "Unread Batch Restored",
+    `group_id=${groupKey}\nrestored_messages=${messages.length}\nunread_messages=${messages.length + pendingMessages.length}`,
+  );
+}
+
+function queueUnreadMessageForModel(message: string, context: ModelRequestContext): number | null {
+  const groupKey = normalizeConversationGroupKey(context.groupId);
+  if (!groupKey) {
+    pushMonitorEntry("status", "Message Skipped", "Cannot schedule model processing without a group_id.");
+    return null;
+  }
+
+  const pendingMessages = unreadModelMessagesByGroup.get(groupKey) ?? [];
+  pendingMessages.push({
+    message,
+    context: {
+      ...context,
+      groupId: groupKey,
+    },
+  });
+  unreadModelMessagesByGroup.set(groupKey, pendingMessages);
+  return pendingMessages.length;
+}
+
+function flushUnreadMessagesToModel(): void {
+  if (unreadModelMessagesByGroup.size === 0) {
+    return;
+  }
+
+  const batches = Array.from(unreadModelMessagesByGroup.entries());
+  unreadModelMessagesByGroup.clear();
+  for (const [groupId, messages] of batches) {
+    pushMonitorEntry(
+      "status",
+      "Unread Batch Ready",
+      `group_id=${groupId}\nunread_messages=${messages.length}`,
+    );
+    enqueueUnreadBatchForModel(messages);
+  }
 }
 
 function handleMonitorStream(req: IncomingMessage, res: ServerResponse): void {
@@ -2691,7 +3072,7 @@ function scheduleWebSocketReconnect(reason: string): void {
     return;
   }
 
-  pushMonitorEntry("status", "Reconnect Scheduled", `${reason}\nRetrying in 3 seconds.`);
+  pushMonitorEntry("status", "Reconnect Scheduled", `${reason}\nRetrying in ${WS_RECONNECT_DELAY_MS / 1000} seconds.`);
   wsReconnectTimer = setTimeout(() => {
     wsReconnectTimer = null;
     connectWebSocketClient();
@@ -2713,6 +3094,9 @@ function connectWebSocketClient(forceReconnect = false): void {
     if (forceReconnect && state !== WebSocket.CLOSED) {
       wsClient.removeAllListeners();
       wsClient.terminate();
+      // terminate() drops the socket without firing our close handler, so clear
+      // any in-flight actions here too.
+      rejectAllPendingWsActions("Upstream WebSocket force-reconnected before the action response arrived.");
     }
 
     wsClient = null;
@@ -2768,12 +3152,6 @@ function connectWebSocketClient(forceReconnect = false): void {
       return;
     }
 
-    pushMonitorEntry(
-      "incoming",
-      "Group Message",
-      `group_id=${message.groupId ?? "unknown"}\n${message.displayText}`,
-    );
-
     await ensureTodayGroupHistoryContext(message.groupId, message.receivedAt);
 
     appendConversationTurn({
@@ -2785,7 +3163,26 @@ function connectWebSocketClient(forceReconnect = false): void {
       timestamp: message.receivedAt,
     });
 
-    if (message.messageLagMs !== null && message.messageLagMs > MESSAGE_REPLY_MAX_AGE_MS) {
+    const isStale = message.messageLagMs !== null && message.messageLagMs > MESSAGE_REPLY_MAX_AGE_MS;
+    const unreadCount = isStale
+      ? null
+      : queueUnreadMessageForModel(message.displayText, {
+          groupId: message.groupId,
+          userId: message.userId,
+          senderName: message.senderName,
+          rawMessage: message.rawMessage,
+          receivedAt: message.receivedAt,
+          messageLagMs: message.messageLagMs,
+        });
+
+    pushMonitorEntry(
+      "incoming",
+      "Group Message",
+      `group_id=${message.groupId ?? "unknown"}\n${message.displayText}` +
+        (unreadCount !== null ? `\nunread_messages=${unreadCount}` : ""),
+    );
+
+    if (isStale) {
       pushMonitorEntry(
         "status",
         "Message Skipped",
@@ -2793,20 +3190,12 @@ function connectWebSocketClient(forceReconnect = false): void {
       );
       return;
     }
-
-    enqueueMessageForModel(message.displayText, {
-      groupId: message.groupId,
-      userId: message.userId,
-      senderName: message.senderName,
-      rawMessage: message.rawMessage,
-      receivedAt: message.receivedAt,
-      messageLagMs: message.messageLagMs,
-    });
   });
 
   client.on("close", (code, reasonBuffer) => {
     if (wsClient === client) {
       wsClient = null;
+      rejectAllPendingWsActions("Upstream WebSocket disconnected before the action response arrived.");
     }
 
     const reason = reasonBuffer.toString("utf-8").trim();
@@ -2934,6 +3323,17 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .ci.system { background: rgba(240,249,255,0.9); }
     .ci-h { display: flex; justify-content: space-between; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
     .ci pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 11px; line-height: 1.4; }
+    .usage-total-row { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 16px; margin-bottom: 14px; border-radius: 10px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-size: 14px; font-weight: 700; color: var(--ink); }
+    .usage-day { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: rgba(255,255,255,0.7); }
+    .usage-day-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
+    .usage-date { font-size: 13px; font-weight: 700; color: var(--ink); }
+    .usage-day-total { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); }
+    .usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .usage-table th { text-align: right; font-weight: 600; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
+    .usage-table th:first-child { text-align: left; }
+    .usage-table td { text-align: right; padding: 4px 6px; font-variant-numeric: tabular-nums; color: var(--ink); border-bottom: 1px solid rgba(226,232,240,0.5); }
+    .usage-table td:first-child { text-align: left; font-family: Consolas,monospace; color: var(--muted); word-break: break-all; }
+    .usage-table tr:last-child td { border-bottom: 0; }
     .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
     input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
@@ -3018,6 +3418,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </svg>
         <span class="nav-label">Group Talk</span>
       </li>
+      <li class="nav-item" :class="{active: tab === 'usage'}" @click="tab = 'usage'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M3 3v18h18"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M7 14l3-3 3 3 4-5"/>
+        </svg>
+        <span class="nav-label">Usage</span>
+      </li>
     </ul>
     <div class="ws-status">
       <span class="dot" :class="wsStatus.state"></span>
@@ -3098,8 +3505,43 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Memory -->
     <div v-else-if="tab === 'memory'">
       <div class="ph">
+        <div class="ph-eye">Memory</div>
+        <div class="ph-title">Memory</div>
+        <div class="ph-desc">短期记忆（会话历史·内存，重启会丢） 与 长期记忆（Qdrant·持久化保留）。</div>
+      </div>
+
+      <div class="panel" style="margin-bottom:14px;">
+        <div class="ph2">
+          <span class="ph2-title">短期记忆 &middot; 会话历史</span>
+          <button class="sec sm" @click="loadGroups">Refresh</button>
+        </div>
+        <div class="pb">
+          <p class="hint">模型每次回复时直接看到的近期对话上下文，按群存在内存里，重启后丢失。</p>
+          <label style="display:block;margin-top:8px;font-size:12px;color:var(--muted);">Group
+            <select v-model="selGroupId" @change="onPickShortTermGroup" style="margin-top:4px;">
+              <option :value="null">Select a group</option>
+              <option v-for="g in groups" :key="g.groupId" :value="g.groupId">{{ g.groupId }} ({{ g.turnCount }} turns)</option>
+            </select>
+          </label>
+          <div class="chat-scroll" style="margin-top:10px;max-height:340px;border:1px solid #eef2f7;border-radius:8px;">
+            <div v-if="!selGroupId" class="empty" style="margin:16px;">Select a group to view its short-term conversation.</div>
+            <div v-else-if="!groupTurns.length" class="empty" style="margin:16px;">No short-term messages for this group.</div>
+            <template v-else>
+              <div v-for="(t, i) in reversedGroupTurns" :key="i" class="msg-entry" :class="t.role">
+                <div class="msg-head">
+                  <span class="msg-name">{{ t.role === 'assistant' ? 'Holly' : (t.senderName || t.userId || 'User') }}</span>
+                  <span class="msg-time">{{ fmtTime(t.timestamp) }}</span>
+                </div>
+                <div class="msg-body">{{ t.content }}</div>
+              </div>
+            </template>
+          </div>
+        </div>
+      </div>
+
+      <div class="ph" style="margin-top:18px;">
         <div class="ph-eye">Qdrant</div>
-        <div class="ph-title">Stored Memories</div>
+        <div class="ph-title">长期记忆 &middot; Stored Memories</div>
         <div class="ph-desc">Browse recent records saved from the upstream WebSocket stream.</div>
       </div>
       <div class="panel" style="margin-bottom:14px;">
@@ -3152,7 +3594,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     </div>
 
     <!-- Group Talk -->
-    <div v-else class="group-view">
+    <div v-else-if="tab === 'group'" class="group-view">
       <div class="panel gp-panel gp-live" :style="{ flexBasis: gpLiveHeight + 'px' }">
         <div class="ph2">
           <span class="ph2-title">Live Messages</span>
@@ -3214,10 +3656,53 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </div>
       </div>
     </div>
+
+    <!-- Usage -->
+    <div v-else-if="tab === 'usage'">
+      <div class="ph">
+        <div class="ph-eye">Token</div>
+        <div class="ph-title">每日 Token 用量</div>
+        <div class="ph-desc">按日期与模型统计的 token 使用量（input + output），含每日合计。</div>
+      </div>
+      <div class="panel">
+        <div class="ph2">
+          <span class="ph2-title">Daily Token Usage</span>
+          <button class="sec sm" @click="loadUsageHistory">Refresh</button>
+        </div>
+        <div class="pb">
+          <div v-if="!usageHistory.length" class="empty">No token usage recorded yet.</div>
+          <template v-else>
+            <div class="usage-total-row">
+              <span>合计 &middot; 最近 {{ usageHistory.length }} 天</span>
+              <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(usageGrandTotal) }} tokens</span>
+            </div>
+            <div v-for="day in usageHistory" :key="day.date" class="usage-day">
+              <div class="usage-day-head">
+                <span class="usage-date">{{ day.date }}</span>
+                <span class="usage-day-total">{{ fmtNum(day.totalTokens) }} tokens</span>
+              </div>
+              <table class="usage-table">
+                <thead>
+                  <tr><th>Model</th><th>Input</th><th>Output</th><th>Total</th></tr>
+                </thead>
+                <tbody>
+                  <tr v-for="m in day.models" :key="m.model">
+                    <td>{{ m.model }}</td>
+                    <td>{{ fmtNum(m.inputTokens) }}</td>
+                    <td>{{ fmtNum(m.outputTokens) }}</td>
+                    <td>{{ fmtNum(m.totalTokens) }}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </template>
+        </div>
+      </div>
+    </div>
   </main>
 </div>
 
-<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="/vendor/vue.global.prod.js"></script>
 <script>
 var _wsTarget = ${JSON.stringify(WS_TARGET_URL)};
 var _Vue = Vue;
@@ -3247,6 +3732,8 @@ createApp({
     var convPreview = ref(null);
     var claudeUsage = ref(null);
     var tokenStats = ref(null);
+    var usageHistory = ref([]);
+    var usageGrandTotal = ref(0);
     var groupEntries = computed(function() {
       return entries.value.filter(function(e) {
         return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
@@ -3377,7 +3864,7 @@ createApp({
       if (payload.type === 'status') { wsStatus.value = payload.status; return; }
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
-      if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; return; }
+      if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); } return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -3404,7 +3891,8 @@ createApp({
       return fetch('/api/llm/profiles').then(function(r) {
         return r.json().then(function(d) {
           if (!r.ok) throw new Error(d.error || 'Failed to load profiles');
-          profiles.value = d.profiles;
+          // Hide Haiku: its 200K window can't hold the 800K global context.
+          profiles.value = d.profiles.filter(function(p) { return !/haiku/i.test(p.model); });
           selProfile.value = d.active;
           profileMeta.value = 'Active model: ' + d.displayName;
         });
@@ -3490,6 +3978,11 @@ createApp({
       loadGroupTurns(groupId);
     }
 
+    function onPickShortTermGroup() {
+      if (selGroupId.value) { loadGroupTurns(selGroupId.value); }
+      else { groupTurns.value = []; }
+    }
+
     function applyGroupTurn(groupId, turn) {
       if (!groupId || !turn) return;
       var existingIndex = groups.value.findIndex(function(g) { return g.groupId === groupId; });
@@ -3509,8 +4002,9 @@ createApp({
     }
 
     watch(tab, function(t) {
-      if (t === 'memory') { loadMemories(); }
+      if (t === 'memory') { loadMemories(); loadGroups(); }
       if (t === 'group') { loadGroups(); }
+      if (t === 'usage') { loadUsageHistory(); }
     });
 
     function fmtNum(n) {
@@ -3523,6 +4017,15 @@ createApp({
         if (d.claudeUsage) { claudeUsage.value = d.claudeUsage; }
         if (d.tokenStats) { tokenStats.value = d.tokenStats; }
       }).catch(function() {});
+    }
+
+    function loadUsageHistory() {
+      fetch('/api/usage/history').then(function(r) {
+        return r.json().then(function(d) {
+          usageHistory.value = d.days || [];
+          usageGrandTotal.value = d.grandTotal || 0;
+        });
+      }).catch(function() { usageHistory.value = []; usageGrandTotal.value = 0; });
     }
 
     onMounted(function() {
@@ -3538,12 +4041,14 @@ createApp({
     return {
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
       entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
+      usageHistory, usageGrandTotal,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
       fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
-      clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup
+      clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
+      loadUsageHistory
     };
   }
 }).mount('#app');
@@ -3580,6 +4085,13 @@ async function bootstrap(): Promise<void> {
 
   connectWebSocketClient();
 
+  // Review unread group activity in batches so Holly responds to a conversation,
+  // rather than reacting immediately to each incoming message.
+  setInterval(flushUnreadMessagesToModel, UNREAD_MODEL_FLUSH_INTERVAL_MS);
+
+  // Keep the merged global context's 1h prompt cache warm; skips when idle.
+  setInterval(scheduleGlobalContextWarm, CONTEXT_WARM_INTERVAL_MS);
+
   // Re-broadcast cached usage + today's token stats every 5 minutes. Keeps
   // late-joining clients in sync and rolls the token panel over to a new day
   // even when the group is quiet. Per the chosen policy this timer never probes.
@@ -3591,6 +4103,15 @@ async function bootstrap(): Promise<void> {
   const server = createServer(async (req, res) => {
     try {
       const url = getRequestUrl(req);
+
+      if (req.method === "GET" && url.pathname === "/vendor/vue.global.prod.js") {
+        res.writeHead(VUE_RUNTIME_SOURCE ? 200 : 404, {
+          "Content-Type": "application/javascript; charset=utf-8",
+          "Cache-Control": "public, max-age=86400",
+        });
+        res.end(VUE_RUNTIME_SOURCE || "// Vendored Vue runtime missing");
+        return;
+      }
 
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/ws" || url.pathname === "/memories")) {
         sendHtml(res, UNIFIED_PAGE);
@@ -3691,6 +4212,15 @@ async function bootstrap(): Promise<void> {
           }
         }
         sendJson(res, 200, { claudeUsage: usage, tokenStats: getTodayTokenStats() });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/usage/history") {
+        const limitParam = Number(url.searchParams.get("limit") || "60");
+        const limit = Number.isFinite(limitParam)
+          ? Math.max(1, Math.min(365, Math.floor(limitParam)))
+          : 60;
+        sendJson(res, 200, getTokenStatsHistory(limit));
         return;
       }
 
