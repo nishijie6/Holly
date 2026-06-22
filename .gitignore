@@ -7,4 +7,8 @@ __pycache__/
 *.log
 .env
 .env.*
+
+# Local / credentials — never commit
+.codex/auth.json
+.claude/settings.local.json
 /config.yaml
