@@ -34,6 +34,7 @@ import {
 } from "./proactive-engine.js";
 import { searchWeb, type SearchResult } from "./web-search.js";
 import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt } from "./decision-prompt.js";
+import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
@@ -286,6 +287,16 @@ const DEFAULT_SEARCH_CONFIG: SearchRuntimeConfig = {
   timeoutMs: 10_000,
 };
 
+type AiToneRuntimeConfig = {
+  enabled: boolean;
+  threshold: number;
+};
+
+const DEFAULT_AI_TONE_CONFIG: AiToneRuntimeConfig = {
+  enabled: true,
+  threshold: 0.6,
+};
+
 const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   enabled: true,
   mode: "shadow",
@@ -326,6 +337,9 @@ let hollyStateStore: HollyStateStore | null = null;
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
+let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
+let aiToneClassifier: AiToneClassifier | null = null;
+let aiToneShadowQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // Set whenever the merged global context grows; the warmer only fires when true
 // so quiet periods don't burn rate-limit budget re-warming an unchanged context.
@@ -472,6 +486,26 @@ async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig
     enabled: typeof s.enabled === "boolean" ? s.enabled : base.enabled,
     topK: readProactiveCount(s.top_k, base.topK),
     timeoutMs: readProactiveCount(s.timeout_ms, base.timeoutMs),
+  };
+}
+
+// Read the optional `ai_tone:` config section. Shadow-only signal — scores each
+// outgoing reply and logs it, never blocks. Hot-reloaded by the config watcher.
+async function loadAiToneConfig(configPath: string): Promise<AiToneRuntimeConfig> {
+  const base = { ...DEFAULT_AI_TONE_CONFIG };
+  if (!existsSync(configPath)) return base;
+  let parsed: { ai_tone?: Record<string, unknown> } | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { ai_tone?: Record<string, unknown> } | null) ?? {};
+  } catch {
+    return base;
+  }
+  const a = parsed?.ai_tone;
+  if (!a || typeof a !== "object") return base;
+  const threshold = typeof a.threshold === "number" ? a.threshold : Number(a.threshold);
+  return {
+    enabled: typeof a.enabled === "boolean" ? a.enabled : base.enabled,
+    threshold: Number.isFinite(threshold) && threshold > 0 && threshold < 1 ? threshold : base.threshold,
   };
 }
 
@@ -937,11 +971,13 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
+  const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
   proactiveConfig = nextProactiveConfig;
   searchConfig = nextSearchConfig;
+  aiToneConfig = nextAiToneConfig;
   hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
   pushMonitorEntry(
     "status",
@@ -3126,6 +3162,9 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     return;
   }
 
+  // Shadow: score the reply's AI tone before sending (log-only, never blocks).
+  recordOutgoingAiTone(decision.finalAnswer, replyGroupId);
+
   await sendGroupMessage(replyGroupId, decision.finalAnswer);
   appendConversationTurn({
     groupId: effectiveContext.groupId,
@@ -3230,6 +3269,48 @@ function scheduleGlobalContextWarm(): void {
       const detail = error instanceof Error ? error.message : String(error);
       pushMonitorEntry("error", "Context Warm Error", detail);
       console.error("Context warm failed:", error);
+    });
+}
+
+const AI_TONE_SHADOW_LOG_PATH = join(LOG_DIR, "ai-tone.jsonl");
+
+// Shadow signal: score an outgoing reply's "AI tone" and log it. Never blocks
+// the send — observe-only while the model is calibrated for Holly's short,
+// technical replies (it currently over-flags those; see ai-tone.ts).
+function recordOutgoingAiTone(text: string, groupId: number | string | null): void {
+  const classifier = aiToneClassifier;
+  if (!classifier || !aiToneConfig.enabled) return;
+  const cleaned = text.trim();
+  if (!cleaned) return;
+
+  let result;
+  try {
+    result = classifier.predict(cleaned, aiToneConfig.threshold);
+  } catch {
+    return;
+  }
+
+  pushMonitorEntry(
+    "status",
+    `AI-Tone(shadow) ${result.label} P(AI)=${result.prob.toFixed(2)}`,
+    `group=${groupId ?? "?"}\n${cleaned}`,
+  );
+
+  const record = {
+    ts: new Date().toISOString(),
+    group: String(groupId ?? ""),
+    prob: Number(result.prob.toFixed(4)),
+    isAI: result.isAI,
+    label: result.label,
+    text: cleaned,
+  };
+  aiToneShadowQueue = aiToneShadowQueue
+    .then(async () => {
+      await mkdir(LOG_DIR, { recursive: true });
+      await appendFile(AI_TONE_SHADOW_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to write ai-tone shadow log:", error);
     });
 }
 
@@ -4421,6 +4502,7 @@ async function bootstrap(): Promise<void> {
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
+  const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -4433,6 +4515,8 @@ async function bootstrap(): Promise<void> {
   contextBudgetConfig = loadedContextBudgetConfig;
   proactiveConfig = loadedProactiveConfig;
   searchConfig = loadedSearchConfig;
+  aiToneConfig = loadedAiToneConfig;
+  aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   incomingMessageStore = store;
   startConfigWatcher();
