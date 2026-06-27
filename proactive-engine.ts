@@ -105,9 +105,10 @@ export function buildProactiveRevivePrompt(threadSummary: string): string {
     "判断 Holly 现在要不要【主动】把这个话题捡回来，自然地说一句。",
     "只有当她确实有具体的东西能补、并且这一句不尬、不像硬找话时，才 should_reply=true。",
     "拿不准、或只是为了说话而说话 → should_reply=false。",
-    "返回 JSON，shape 与之前一致：",
-    '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要"}',
+    "返回 JSON，shape：",
+    '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要", "need_search": false, "search_query": ""}',
     "final_answer 必须是一句简短中文、单行、不 @ 任何人；should_reply=false 时 final_answer 为空字符串。",
+    "need_search 固定为 false，search_query 留空字符串（主动开口不走搜索）。",
   ].join("\n");
 }
 

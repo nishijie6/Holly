@@ -5,11 +5,12 @@
   "type": "module",
   "scripts": {
     "build": "tsc",
-    "start": "set NODE_USE_ENV_PROXY=1&& node dist/main.js",
-    "dev": "set NODE_USE_ENV_PROXY=1&& tsx main.ts",
+    "start": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env dist/main.js",
+    "dev": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env --import tsx main.ts",
     "llm:test": "set NODE_USE_ENV_PROXY=1&& tsx test.ts",
     "test": "node --import tsx --test \"test/*.test.ts\"",
-    "eval:proactive": "set NODE_USE_ENV_PROXY=1&& tsx proactive-eval.ts"
+    "eval:proactive": "set NODE_USE_ENV_PROXY=1&& tsx proactive-eval.ts",
+    "search:test": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env --import tsx web-search.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.17.0",

@@ -32,6 +32,7 @@ import {
   type ProactiveDecision,
   type ProactiveDeps,
 } from "./proactive-engine.js";
+import { searchWeb, type SearchResult } from "./web-search.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
@@ -269,7 +270,7 @@ const MODEL_DECISION_PROMPT = [
   "Decide whether Holly should reply to the message.",
   "Return JSON only. Do not use markdown fences or extra explanation.",
   "Required JSON shape:",
-  '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary"}',
+  '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary", "need_search": false, "search_query": ""}',
   "Rules:",
   "- Obey the persona and per-group rules in the system prompt above, matched via the group_id shown in the batch header (e.g. a group where Holly may only echo repeats and must otherwise stay silent). Such per-group restrictions override the reply conditions below.",
   "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
@@ -284,8 +285,10 @@ const MODEL_DECISION_PROMPT = [
   '- When should_reply is false, final_answer must be an empty string "".',
   "- final_answer is the text that will be sent to the group if should_reply is true.",
   "- thinking_process must be written in Chinese (简体中文), as a short decision summary for logging, not a detailed chain-of-thought.",
-  "- Do not return any extra fields beyond should_reply, final_answer, and thinking_process.",
+  "- Do not return any extra fields beyond should_reply, final_answer, thinking_process, need_search, and search_query.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
+  "- need_search/search_query:当『要不要回复』或『怎么回复』取决于一个你不确定的外部事实或最新信息(具体新闻、数据、某物现状、近况)时,把 need_search 设为 true,search_query 写一个简短中文搜索词;此时 should_reply 和 final_answer 先随意填(会被忽略,系统会带着搜索结果再问你一次)。",
+  "- 只有真正需要外部事实才 need_search=true;闲聊、玩梗、你已经知道或能合理推断的事一律 need_search=false 且 search_query 留空字符串。",
 ].join("\n");
 const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
   type: "object",
@@ -293,14 +296,31 @@ const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
     should_reply: { type: "boolean" },
     final_answer: { type: "string" },
     thinking_process: { type: "string" },
+    // "查一下再答":当决定取决于一个不确定的外部事实时,模型置 need_search=true +
+    // search_query;系统搜完带结果再问一次。required(而非 optional)以兼容严格结构化
+    // 输出的 provider;主动式/非搜索场景固定 need_search=false。
+    need_search: { type: "boolean" },
+    search_query: { type: "string" },
   },
-  required: ["should_reply", "final_answer", "thinking_process"],
+  required: ["should_reply", "final_answer", "thinking_process", "need_search", "search_query"],
   additionalProperties: false,
 };
 
 // Proactive Holly (slice 1): how often the engine wakes to consider reviving a
 // dropped interest thread. Shares the 60s cadence with the reactive flush.
 const PROACTIVE_TICK_INTERVAL_MS = 60 * 1000;
+
+type SearchRuntimeConfig = {
+  enabled: boolean;
+  topK: number;
+  timeoutMs: number;
+};
+
+const DEFAULT_SEARCH_CONFIG: SearchRuntimeConfig = {
+  enabled: true,
+  topK: 5,
+  timeoutMs: 10_000,
+};
 
 const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   enabled: true,
@@ -341,6 +361,7 @@ let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 let hollyStateStore: HollyStateStore | null = null;
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let proactiveShadowQueue: Promise<void> = Promise.resolve();
+let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // Set whenever the merged global context grows; the warmer only fires when true
 // so quiet periods don't burn rate-limit budget re-warming an unchanged context.
@@ -467,6 +488,26 @@ async function loadProactiveConfig(configPath: string): Promise<ProactiveConfig>
     maxReplyChars: readProactiveCount(p.max_reply_chars, base.maxReplyChars),
     interestKeywords: readProactiveStringArray(p.interest_keywords, base.interestKeywords),
     echoOnlyGroups: readProactiveStringArray(p.echo_only_groups, base.echoOnlyGroups),
+  };
+}
+
+// Read the optional `search:` config section. The API key is NOT here — it comes
+// from the SERPER_API_KEY env var (see .env). Hot-reloaded by the config watcher.
+async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig> {
+  const base = { ...DEFAULT_SEARCH_CONFIG };
+  if (!existsSync(configPath)) return base;
+  let parsed: { search?: Record<string, unknown> } | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { search?: Record<string, unknown> } | null) ?? {};
+  } catch {
+    return base;
+  }
+  const s = parsed?.search;
+  if (!s || typeof s !== "object") return base;
+  return {
+    enabled: typeof s.enabled === "boolean" ? s.enabled : base.enabled,
+    topK: readProactiveCount(s.top_k, base.topK),
+    timeoutMs: readProactiveCount(s.timeout_ms, base.timeoutMs),
   };
 }
 
@@ -931,10 +972,12 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
+  const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
   proactiveConfig = nextProactiveConfig;
+  searchConfig = nextSearchConfig;
   hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
   pushMonitorEntry(
     "status",
@@ -2896,6 +2939,119 @@ async function sendGroupMessage(groupId: number, message: string): Promise<void>
   });
 }
 
+function parseLookupRequest(raw: string): { needSearch: boolean; searchQuery: string } {
+  try {
+    const parsed = JSON.parse(unwrapJsonBlock(raw)) as Record<string, unknown>;
+    const flag =
+      parsed.need_search === true ||
+      parsed.needSearch === true ||
+      parsed.need_search === "true" ||
+      parsed.needSearch === "true";
+    const query =
+      typeof parsed.search_query === "string"
+        ? parsed.search_query.trim()
+        : typeof parsed.searchQuery === "string"
+          ? parsed.searchQuery.trim()
+          : "";
+    return { needSearch: flag && query.length > 0, searchQuery: query };
+  } catch {
+    return { needSearch: false, searchQuery: "" };
+  }
+}
+
+function formatSearchResultsForModel(query: string, results: readonly SearchResult[]): string {
+  if (results.length === 0) {
+    return `[搜索结果] 关于「${query}」没有查到相关资料。`;
+  }
+  const lines = results.map(
+    (result, index) => `${index + 1}. ${result.title}\n   ${result.snippet}\n   来源: ${result.url}`,
+  );
+  return `[搜索结果] 关于「${query}」查到以下资料(仅供参考,自行判断可信度):\n${lines.join("\n")}`;
+}
+
+// "查一下再答" step (snippets-only, reactive). If the first decision asked to look
+// something up, run the search and re-ask the model with the snippets injected
+// into the current-message slot (same cached system+history prefix). Returns the
+// reply to parse: the original one when no search was requested, the second-pass
+// reply when it was, or a stay-silent decision when search was wanted but
+// unavailable (so a placeholder first answer is never sent).
+async function applyLookupIfRequested(
+  firstReply: string,
+  ctx: {
+    client: LlmClient;
+    memoryPrompt: string;
+    conversationMessages: readonly LlmMessage[];
+    batchMessage: string;
+    startedAt: number;
+  },
+): Promise<string> {
+  const lookup = parseLookupRequest(firstReply);
+  if (!lookup.needSearch) {
+    return firstReply;
+  }
+
+  if (!searchConfig.enabled || !process.env.SERPER_API_KEY) {
+    pushMonitorEntry(
+      "status",
+      "Web Search Unavailable",
+      `query=${lookup.searchQuery}(搜索未启用或缺 SERPER_API_KEY,保持沉默)`,
+    );
+    return JSON.stringify({
+      should_reply: false,
+      final_answer: "",
+      thinking_process: "想查证但搜索不可用,保持沉默",
+      need_search: false,
+      search_query: "",
+    });
+  }
+
+  pushMonitorEntry("status", "Web Search", `query=${lookup.searchQuery}`);
+  let results: SearchResult[] = [];
+  try {
+    results = await searchWeb(lookup.searchQuery, { topK: searchConfig.topK, timeoutMs: searchConfig.timeoutMs });
+  } catch (error) {
+    pushMonitorEntry("error", "Web Search Failed", error instanceof Error ? error.message : String(error));
+  }
+
+  const resultsBlock = formatSearchResultsForModel(lookup.searchQuery, results);
+  const augmentedMessage =
+    `${ctx.batchMessage}\n\n${resultsBlock}\n\n` +
+    "(以上是你刚查到的资料,请据此决定要不要回复并作答;need_search 设为 false,不要再要求搜索。)";
+  const prepared = prepareModelRequest(
+    ctx.client.systemPrompt,
+    ctx.memoryPrompt,
+    ctx.conversationMessages,
+    augmentedMessage,
+  );
+
+  pushMonitorEntry("status", "Search-Augmented Model Request", `${results.length} 条结果\n${resultsBlock}`);
+  let secondReply: string;
+  try {
+    secondReply = await ctx.client.generateText({
+      systemPrompt: prepared.systemPrompt,
+      messages: prepared.messages,
+      jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+    });
+  } catch (error) {
+    pushMonitorEntry("error", "Search Re-ask Failed", error instanceof Error ? error.message : String(error));
+    return JSON.stringify({
+      should_reply: false,
+      final_answer: "",
+      thinking_process: "搜索后重问失败,保持沉默",
+      need_search: false,
+      search_query: "",
+    });
+  }
+
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+  return secondReply;
+}
+
 async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
   const messages = pendingMessages
     .map((item) => ({
@@ -2966,6 +3122,15 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
     broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
   }
+
+  // "查一下再答": if the model asked to look something up, search and re-ask.
+  reply = await applyLookupIfRequested(reply, {
+    client,
+    memoryPrompt,
+    conversationMessages,
+    batchMessage,
+    startedAt,
+  });
 
   let decision: ModelDecision;
   try {
@@ -4294,6 +4459,7 @@ async function bootstrap(): Promise<void> {
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
+  const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -4305,6 +4471,7 @@ async function bootstrap(): Promise<void> {
   activeLlmLabel = client.displayName;
   contextBudgetConfig = loadedContextBudgetConfig;
   proactiveConfig = loadedProactiveConfig;
+  searchConfig = loadedSearchConfig;
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   incomingMessageStore = store;
   startConfigWatcher();
