@@ -194,6 +194,33 @@ async function ensureCollection(
   await ensurePayloadIndexes(client, config.collectionName);
 }
 
+// A stale undici keep-alive socket against Qdrant surfaces as
+// `TypeError: fetch failed` with cause `UND_ERR_SOCKET` / "other side closed":
+// the pooled connection was closed by the server (or the local proxy's
+// connection tracker) but undici reused it before noticing. One retry runs on a
+// fresh connection. Mirrors the existing "retry Codex fetch failures once".
+function isTransientConnectionError(error: unknown, depth = 0): boolean {
+  if (!error || typeof error !== "object" || depth > 4) return false;
+  const e = error as { code?: unknown; message?: unknown; cause?: unknown };
+  if (typeof e.code === "string" && (e.code === "UND_ERR_SOCKET" || e.code === "ECONNRESET" || e.code === "EPIPE")) {
+    return true;
+  }
+  if (typeof e.message === "string" && /other side closed|socket hang up|ECONNRESET/i.test(e.message)) {
+    return true;
+  }
+  return isTransientConnectionError(e.cause, depth + 1);
+}
+
+async function withQdrantRetry<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!isTransientConnectionError(error)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    return operation();
+  }
+}
+
 export async function createIncomingMessageStore(
   configPath: string,
   options: {
@@ -212,6 +239,10 @@ export async function createIncomingMessageStore(
     apiKey: config.apiKey,
     timeout: config.timeoutMs,
     checkCompatibility: false,
+    // Shrink the keep-alive pool: fewer idle sockets to go stale between the
+    // bursty incoming messages. This client doesn't expose undici's
+    // keepAliveTimeout/pipelining, so withQdrantRetry is the real guard.
+    maxConnections: 1,
   });
 
   try {
@@ -232,7 +263,7 @@ export async function createIncomingMessageStore(
     collectionName: config.collectionName,
     description,
     async saveMessage(record): Promise<void> {
-      await client.upsert(config.collectionName, {
+      await withQdrantRetry(() => client.upsert(config.collectionName, {
         wait: true,
         points: [
           {
@@ -260,7 +291,7 @@ export async function createIncomingMessageStore(
             },
           },
         ],
-      });
+      }));
     },
     async listRecentMemories(input): Promise<StoredMemoryRecord[]> {
       const conditions: Array<Record<string, unknown>> = [];
@@ -289,7 +320,7 @@ export async function createIncomingMessageStore(
         });
       }
 
-      const result = await client.scroll(config.collectionName, {
+      const result = await withQdrantRetry(() => client.scroll(config.collectionName, {
         limit: input.limit,
         with_payload: true,
         with_vector: false,
@@ -298,7 +329,7 @@ export async function createIncomingMessageStore(
           direction: "desc",
         },
         filter: conditions.length > 0 ? { must: conditions } : undefined,
-      });
+      }));
 
       return result.points
         .map((point) => {

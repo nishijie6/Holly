@@ -382,6 +382,18 @@ async function applyProxyConfig(configPath: string): Promise<void> {
     process.env.HTTP_PROXY = proxyUrl;
     process.env.https_proxy = proxyUrl;
     process.env.http_proxy = proxyUrl;
+    // The proxy is for outbound web fetches (Anthropic API, URL previews). Keep
+    // loopback services — Qdrant :6333, the NapCat WS, the local monitor — OFF
+    // the proxy: routing 127.0.0.1 through Clash/Mihomo can reset the connection
+    // ("other side closed"). Merge with any NO_PROXY the user already set.
+    const localNoProxy = ["127.0.0.1", "localhost", "::1"];
+    const existingNoProxy = (process.env.NO_PROXY ?? process.env.no_proxy ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    const mergedNoProxy = Array.from(new Set([...existingNoProxy, ...localNoProxy])).join(",");
+    process.env.NO_PROXY = mergedNoProxy;
+    process.env.no_proxy = mergedNoProxy;
   }
 }
 
