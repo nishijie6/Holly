@@ -27,6 +27,7 @@ import {
 import { HollyStateStore } from "./holly-state.js";
 import {
   runProactiveTick,
+  buildProactiveRevivePrompt,
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
@@ -300,25 +301,6 @@ const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
 // Proactive Holly (slice 1): how often the engine wakes to consider reviving a
 // dropped interest thread. Shares the 60s cadence with the reactive flush.
 const PROACTIVE_TICK_INTERVAL_MS = 60 * 1000;
-
-// The proactive decision instruction. It rides in the *current message* slot so
-// the cached system + global-history prefix is reused (6A) — only this tail
-// differs from a reactive call, so the proactive call hits the prompt cache.
-function buildProactiveRevivePrompt(threadSummary: string): string {
-  return [
-    "现在没有人 @ Holly，群里已经冷场了一会儿。",
-    "冷场前，群里聊过下面这个可能和 Holly 兴趣（数学/AI/天文）相关、但没继续下去的话题：",
-    "---",
-    threadSummary,
-    "---",
-    "判断 Holly 现在要不要【主动】把这个话题捡回来，自然地说一句。",
-    "只有当她确实有具体的东西能补、并且这一句不尬、不像硬找话时，才 should_reply=true。",
-    "拿不准、或只是为了说话而说话 → should_reply=false。",
-    "返回 JSON，shape 与之前一致：",
-    '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要"}',
-    "final_answer 必须是一句简短中文、单行、不 @ 任何人；should_reply=false 时 final_answer 为空字符串。",
-  ].join("\n");
-}
 
 const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   enabled: true,
