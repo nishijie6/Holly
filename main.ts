@@ -24,6 +24,13 @@ import {
   type IncomingMessageStore,
   type StoredMemoryRecord,
 } from "./qdrant-store.js";
+import { HollyStateStore } from "./holly-state.js";
+import {
+  runProactiveTick,
+  type ProactiveConfig,
+  type ProactiveDecision,
+  type ProactiveDeps,
+} from "./proactive-engine.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
@@ -290,6 +297,52 @@ const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
+// Proactive Holly (slice 1): how often the engine wakes to consider reviving a
+// dropped interest thread. Shares the 60s cadence with the reactive flush.
+const PROACTIVE_TICK_INTERVAL_MS = 60 * 1000;
+
+// The proactive decision instruction. It rides in the *current message* slot so
+// the cached system + global-history prefix is reused (6A) — only this tail
+// differs from a reactive call, so the proactive call hits the prompt cache.
+function buildProactiveRevivePrompt(threadSummary: string): string {
+  return [
+    "现在没有人 @ Holly，群里已经冷场了一会儿。",
+    "冷场前，群里聊过下面这个可能和 Holly 兴趣（数学/AI/天文）相关、但没继续下去的话题：",
+    "---",
+    threadSummary,
+    "---",
+    "判断 Holly 现在要不要【主动】把这个话题捡回来，自然地说一句。",
+    "只有当她确实有具体的东西能补、并且这一句不尬、不像硬找话时，才 should_reply=true。",
+    "拿不准、或只是为了说话而说话 → should_reply=false。",
+    "返回 JSON，shape 与之前一致：",
+    '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要"}',
+    "final_answer 必须是一句简短中文、单行、不 @ 任何人；should_reply=false 时 final_answer 为空字符串。",
+  ].join("\n");
+}
+
+const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
+  enabled: true,
+  mode: "shadow",
+  liveGroupAllowlist: [],
+  lullMinMs: 10 * 60 * 1000,
+  lullDeadzoneMs: 3 * 60 * 60 * 1000,
+  interestWindowMs: 45 * 60 * 1000,
+  perGroupDailyCap: 6,
+  globalDailyCap: 20,
+  cooldownMs: 30 * 60 * 1000,
+  observationWindowMs: 15 * 60 * 1000,
+  successWindowMs: 10 * 60 * 1000,
+  backoffMultiplier: 1.5,
+  engagedTtlMs: 60 * 60 * 1000,
+  maxReplyChars: 80,
+  interestKeywords: [
+    "数学", "微积分", "代数", "几何", "概率", "统计", "素数", "方程", "math",
+    "AI", "人工智能", "机器学习", "深度学习", "神经网络", "大模型", "算法", "llm", "gpt", "transformer",
+    "天文", "星空", "星系", "宇宙", "行星", "恒星", "黑洞", "望远镜", "nasa", "卫星", "月球", "火星",
+  ],
+  echoOnlyGroups: ["20000003"],
+};
+
 let sessionLogPath: string | null = null;
 let monitorEntryId = 0;
 let wsClient: WebSocket | null = null;
@@ -303,6 +356,9 @@ let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
+let hollyStateStore: HollyStateStore | null = null;
+let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
+let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // Set whenever the merged global context grows; the warmer only fires when true
 // so quiet periods don't burn rate-limit budget re-warming an unchanged context.
@@ -369,6 +425,66 @@ async function loadContextBudgetConfig(configPath: string): Promise<ContextBudge
   return {
     limitTokens,
     compressThresholdTokens,
+  };
+}
+
+function readProactiveMinutesMs(value: unknown, defaultMs: number): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric * 60 * 1000) : defaultMs;
+}
+
+function readProactiveCount(value: unknown, defaultValue: number): number {
+  const numeric = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? Math.floor(numeric) : defaultValue;
+}
+
+function readProactiveStringArray(value: unknown, defaultValue: string[]): string[] {
+  if (!Array.isArray(value)) return defaultValue;
+  return value
+    .filter((item): item is string | number => typeof item === "string" || typeof item === "number")
+    .map((item) => String(item).trim())
+    .filter(Boolean);
+}
+
+// Read the optional `proactive:` config section; any missing/invalid field falls
+// back to DEFAULT_PROACTIVE_CONFIG. Durations are authored in minutes for
+// readability and converted to ms here. Hot-reloaded by the config watcher (P4).
+async function loadProactiveConfig(configPath: string): Promise<ProactiveConfig> {
+  const base: ProactiveConfig = {
+    ...DEFAULT_PROACTIVE_CONFIG,
+    liveGroupAllowlist: [...DEFAULT_PROACTIVE_CONFIG.liveGroupAllowlist],
+    interestKeywords: [...DEFAULT_PROACTIVE_CONFIG.interestKeywords],
+    echoOnlyGroups: [...DEFAULT_PROACTIVE_CONFIG.echoOnlyGroups],
+  };
+  if (!existsSync(configPath)) return base;
+
+  let parsed: { proactive?: Record<string, unknown> } | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { proactive?: Record<string, unknown> } | null) ?? {};
+  } catch {
+    return base;
+  }
+  const p = parsed?.proactive;
+  if (!p || typeof p !== "object") return base;
+
+  const multiplier = typeof p.backoff_multiplier === "number" ? p.backoff_multiplier : Number(p.backoff_multiplier);
+  return {
+    enabled: typeof p.enabled === "boolean" ? p.enabled : base.enabled,
+    mode: p.mode === "live" ? "live" : "shadow",
+    liveGroupAllowlist: readProactiveStringArray(p.live_group_allowlist, base.liveGroupAllowlist),
+    lullMinMs: readProactiveMinutesMs(p.lull_min_minutes, base.lullMinMs),
+    lullDeadzoneMs: readProactiveMinutesMs(p.lull_deadzone_minutes, base.lullDeadzoneMs),
+    interestWindowMs: readProactiveMinutesMs(p.interest_window_minutes, base.interestWindowMs),
+    perGroupDailyCap: readProactiveCount(p.per_group_daily_cap, base.perGroupDailyCap),
+    globalDailyCap: readProactiveCount(p.global_daily_cap, base.globalDailyCap),
+    cooldownMs: readProactiveMinutesMs(p.cooldown_minutes, base.cooldownMs),
+    observationWindowMs: readProactiveMinutesMs(p.observation_window_minutes, base.observationWindowMs),
+    successWindowMs: readProactiveMinutesMs(p.success_window_minutes, base.successWindowMs),
+    backoffMultiplier: Number.isFinite(multiplier) && multiplier >= 1 ? multiplier : base.backoffMultiplier,
+    engagedTtlMs: readProactiveMinutesMs(p.engaged_ttl_minutes, base.engagedTtlMs),
+    maxReplyChars: readProactiveCount(p.max_reply_chars, base.maxReplyChars),
+    interestKeywords: readProactiveStringArray(p.interest_keywords, base.interestKeywords),
+    echoOnlyGroups: readProactiveStringArray(p.echo_only_groups, base.echoOnlyGroups),
   };
 }
 
@@ -832,9 +948,12 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
   const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
+  proactiveConfig = nextProactiveConfig;
+  hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
   pushMonitorEntry(
     "status",
     "Config Reloaded",
@@ -3006,6 +3125,124 @@ function scheduleGlobalContextWarm(): void {
     });
 }
 
+const PROACTIVE_SHADOW_LOG_PATH = join(LOG_DIR, "proactive-shadow.jsonl");
+
+function appendProactiveShadowLog(record: Record<string, unknown>): void {
+  proactiveShadowQueue = proactiveShadowQueue
+    .then(async () => {
+      await mkdir(LOG_DIR, { recursive: true });
+      await appendFile(PROACTIVE_SHADOW_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to write proactive shadow log:", error);
+    });
+}
+
+// Gate B (6A): reuse the exact cached system + global-history prefix a reactive
+// reply uses; the proactive instruction rides only in the current-message slot,
+// so this call hits the 1h prompt cache instead of reprocessing the full context.
+async function evaluateProactiveRevival(
+  groupKey: string,
+  threadSummary: string,
+): Promise<ProactiveDecision | null> {
+  const client = activeLlmClient;
+  if (!client) return null;
+
+  const context: ModelRequestContext = {
+    groupId: groupKey,
+    userId: null,
+    senderName: null,
+    rawMessage: null,
+    receivedAt: new Date().toISOString(),
+    messageLagMs: null,
+  };
+  const conversationMessages = buildGlobalConversationMessages(context, []);
+  const instruction = buildProactiveRevivePrompt(threadSummary);
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationMessages, instruction);
+  if (prepared.messages.length === 0) return null;
+
+  let reply: string;
+  try {
+    reply = await client.generateText({
+      systemPrompt: prepared.systemPrompt,
+      messages: prepared.messages,
+      jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+    });
+  } catch (error) {
+    pushMonitorEntry("error", "Proactive Model Error", error instanceof Error ? error.message : String(error));
+    return null;
+  }
+
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+
+  try {
+    const decision = parseModelDecision(reply);
+    return {
+      shouldReply: decision.shouldReply,
+      finalAnswer: decision.finalAnswer,
+      thinkingProcess: decision.thinkingProcess,
+    };
+  } catch {
+    // Invalid JSON → fail safe: treat as "do not speak".
+    return null;
+  }
+}
+
+function buildProactiveDeps(): ProactiveDeps | null {
+  const store = hollyStateStore;
+  if (!store) return null;
+  return {
+    now: () => Date.now(),
+    listGroups: () => Array.from(conversationHistoryByGroup.keys()),
+    getHistory: (groupKey) => conversationHistoryByGroup.get(groupKey) ?? [],
+    evaluateRevival: evaluateProactiveRevival,
+    send: sendGroupMessage,
+    appendAssistantTurn: (groupKey, text) =>
+      appendConversationTurn({
+        groupId: groupKey,
+        role: "assistant",
+        senderName: null,
+        userId: null,
+        content: text,
+        timestamp: new Date().toISOString(),
+      }),
+    parseGroupId: (groupKey) => {
+      const numeric = Number(groupKey);
+      return Number.isSafeInteger(numeric) && numeric > 0 ? numeric : null;
+    },
+    log: (kind, title, body) => {
+      pushMonitorEntry(kind, title, body);
+    },
+    shadowLog: appendProactiveShadowLog,
+    config: proactiveConfig,
+    state: store,
+  };
+}
+
+// Serialize on the model queue so the proactive tick never races a reactive
+// reply or the cache warmer (shared prefix → all-or-nothing cache hits).
+function scheduleProactiveTick(): void {
+  const deps = buildProactiveDeps();
+  if (!deps || !deps.config.enabled) return;
+  modelQueue = modelQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      await runProactiveTick(deps);
+    })
+    .catch((error) => {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Proactive Tick Error", detail);
+      console.error("Proactive tick failed:", error);
+    });
+}
+
 function restoreUnreadBatchForModel(messages: PendingModelMessage[]): void {
   const groupKey = normalizeConversationGroupKey(messages[0]?.context.groupId ?? null);
   if (!groupKey || messages.length === 0) {
@@ -4074,6 +4311,7 @@ async function bootstrap(): Promise<void> {
   await loadTokenStats();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -4084,6 +4322,8 @@ async function bootstrap(): Promise<void> {
   activeLlmClient = client;
   activeLlmLabel = client.displayName;
   contextBudgetConfig = loadedContextBudgetConfig;
+  proactiveConfig = loadedProactiveConfig;
+  hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
@@ -4103,6 +4343,15 @@ async function bootstrap(): Promise<void> {
 
   // Keep the merged global context's 1h prompt cache warm; skips when idle.
   setInterval(scheduleGlobalContextWarm, CONTEXT_WARM_INTERVAL_MS);
+
+  // Proactive Holly (slice 1): on a timer, consider reviving a dropped interest
+  // thread during a lull. Default mode=shadow (logs only, never sends).
+  pushMonitorEntry(
+    "status",
+    "Proactive Ready",
+    `mode=${proactiveConfig.mode} enabled=${proactiveConfig.enabled}\nlull_min=${Math.round(proactiveConfig.lullMinMs / 60000)}min cap=${proactiveConfig.perGroupDailyCap}/group global=${proactiveConfig.globalDailyCap}`,
+  );
+  setInterval(scheduleProactiveTick, PROACTIVE_TICK_INTERVAL_MS);
 
   // Re-broadcast cached usage + today's token stats every 5 minutes. Keeps
   // late-joining clients in sync and rolls the token panel over to a new day
