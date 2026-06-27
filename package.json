@@ -10,7 +10,8 @@
     "llm:test": "set NODE_USE_ENV_PROXY=1&& tsx test.ts",
     "test": "node --import tsx --test \"test/*.test.ts\"",
     "eval:proactive": "set NODE_USE_ENV_PROXY=1&& tsx proactive-eval.ts",
-    "search:test": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env --import tsx web-search.ts"
+    "search:test": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env --import tsx web-search.ts",
+    "search-flow:test": "set NODE_USE_ENV_PROXY=1&& node --env-file-if-exists=.env --import tsx search-flow-eval.ts"
   },
   "dependencies": {
     "@qdrant/js-client-rest": "^1.17.0",
