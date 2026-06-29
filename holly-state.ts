@@ -18,6 +18,14 @@ export type PendingObservation = {
   threadKey: string;
 };
 
+export type HollyAutonomyState = {
+  lastWorldObservationAt: number;
+  lastWorldObservationAttemptAt: number;
+  worldObservationDailyDate: string;
+  worldObservationDailyCount: number;
+  nextWorldTopicIndex: number;
+};
+
 export type HollyGroupState = {
   lastProactiveAt: number; // ms epoch, 0 = never
   backoffLevel: number; // 0..n,温和退避:有效阈值 ×(multiplier ^ level)
@@ -32,6 +40,7 @@ export type HollyStatePersisted = {
   version: 1;
   globalDailyDate: string;
   globalDailyCount: number;
+  autonomy: HollyAutonomyState;
   groups: Record<string, HollyGroupState>;
 };
 
@@ -53,8 +62,40 @@ function freshGroupState(dateKey: string): HollyGroupState {
   };
 }
 
+function freshAutonomyState(dateKey: string): HollyAutonomyState {
+  return {
+    lastWorldObservationAt: 0,
+    lastWorldObservationAttemptAt: 0,
+    worldObservationDailyDate: dateKey,
+    worldObservationDailyCount: 0,
+    nextWorldTopicIndex: 0,
+  };
+}
+
 function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
+}
+
+function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyState {
+  const base = freshAutonomyState(dateKey);
+  if (!value || typeof value !== "object") {
+    return base;
+  }
+  const v = value as Record<string, unknown>;
+  return {
+    lastWorldObservationAt: isFiniteNumber(v.lastWorldObservationAt) ? v.lastWorldObservationAt : 0,
+    lastWorldObservationAttemptAt: isFiniteNumber(v.lastWorldObservationAttemptAt)
+      ? v.lastWorldObservationAttemptAt
+      : 0,
+    worldObservationDailyDate:
+      typeof v.worldObservationDailyDate === "string" ? v.worldObservationDailyDate : dateKey,
+    worldObservationDailyCount: isFiniteNumber(v.worldObservationDailyCount)
+      ? Math.max(0, Math.floor(v.worldObservationDailyCount))
+      : 0,
+    nextWorldTopicIndex: isFiniteNumber(v.nextWorldTopicIndex)
+      ? Math.max(0, Math.floor(v.nextWorldTopicIndex))
+      : 0,
+  };
 }
 
 // Defensive parse: anything malformed degrades to a default, never throws.
@@ -92,6 +133,7 @@ function coercePersisted(raw: unknown, dateKey: string): HollyStatePersisted {
     version: 1,
     globalDailyDate: dateKey,
     globalDailyCount: 0,
+    autonomy: freshAutonomyState(dateKey),
     groups: {},
   };
   if (!raw || typeof raw !== "object") return empty;
@@ -106,6 +148,7 @@ function coercePersisted(raw: unknown, dateKey: string): HollyStatePersisted {
     version: 1,
     globalDailyDate: typeof r.globalDailyDate === "string" ? r.globalDailyDate : dateKey,
     globalDailyCount: isFiniteNumber(r.globalDailyCount) ? Math.max(0, Math.floor(r.globalDailyCount)) : 0,
+    autonomy: coerceAutonomyState(r.autonomy, dateKey),
     groups,
   };
 }
@@ -144,6 +187,10 @@ export class HollyStateStore {
       this.data.globalDailyDate = today;
       this.data.globalDailyCount = 0;
     }
+    if (this.data.autonomy.worldObservationDailyDate !== today) {
+      this.data.autonomy.worldObservationDailyDate = today;
+      this.data.autonomy.worldObservationDailyCount = 0;
+    }
     for (const g of Object.values(this.data.groups)) {
       if (g.dailyDate !== today) {
         g.dailyDate = today;
@@ -163,6 +210,10 @@ export class HollyStateStore {
 
   globalDailyCount(): number {
     return this.data.globalDailyCount;
+  }
+
+  getAutonomyState(): HollyAutonomyState {
+    return this.data.autonomy;
   }
 
   isThreadEngaged(groupKey: string, threadKey: string, now = Date.now()): boolean {

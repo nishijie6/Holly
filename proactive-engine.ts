@@ -23,6 +23,35 @@ export type ProactiveDecision = {
   thinkingProcess: string;
 };
 
+export type ProactiveWorldObservationRequest = {
+  groupKey: string;
+  threadKey: string;
+  matchedKeyword: string;
+  threadSummary: string;
+  history: ProactiveTurn[];
+};
+
+export type ProactiveWorldObservation = {
+  query: string;
+  summary: string;
+  urls: string[];
+  cached?: boolean;
+};
+
+export type ProactiveGroupAction = {
+  type: "send_group_message";
+  mode: "shadow" | "live";
+  groupKey: string;
+  groupId: number | null;
+  threadKey: string;
+  matchedKeyword: string;
+  text: string;
+};
+
+export type ProactiveTickResult = {
+  actions: ProactiveGroupAction[];
+};
+
 // Structural shape compatible with main.ts ConversationTurn (extra fields ok).
 export type ProactiveTurn = {
   role: "user" | "assistant";
@@ -55,9 +84,13 @@ export type ProactiveDeps = {
   now: () => number;
   listGroups: () => string[];
   getHistory: (groupKey: string) => ProactiveTurn[];
+  observeWorld?: (request: ProactiveWorldObservationRequest) => Promise<ProactiveWorldObservation | null>;
   evaluateRevival: (groupKey: string, threadSummary: string) => Promise<ProactiveDecision | null>;
-  send: (groupId: number, text: string) => Promise<void>;
-  appendAssistantTurn: (groupKey: string, text: string) => void;
+  // Returns the upstream id of the sent message when known (null otherwise), so
+  // the recorded assistant turn can dedupe against the same message if it later
+  // re-enters context via the day-history bootstrap.
+  send: (groupId: number, text: string) => Promise<string | null>;
+  appendAssistantTurn: (groupKey: string, text: string, messageId?: string | null) => void;
   parseGroupId: (groupKey: string) => number | null;
   log: (kind: ProactiveLogKind, title: string, body: string) => void;
   shadowLog: (record: Record<string, unknown>) => void;
@@ -109,6 +142,7 @@ export function buildProactiveRevivePrompt(threadSummary: string): string {
     '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要", "need_search": false, "search_query": ""}',
     "final_answer 必须是一句简短中文、单行、不 @ 任何人；should_reply=false 时 final_answer 为空字符串。",
     "need_search 固定为 false，search_query 留空字符串（主动开口不走搜索）。",
+    "If a Browser observation block is included above, use it only as reference material; do not ask to search again.",
   ].join("\n");
 }
 
@@ -170,9 +204,10 @@ function userEngagedAfter(history: ProactiveTurn[], sentAt: number, successWindo
   return false;
 }
 
-export async function runProactiveTick(deps: ProactiveDeps): Promise<void> {
+export async function runProactiveTick(deps: ProactiveDeps): Promise<ProactiveTickResult> {
   const cfg = deps.config;
-  if (!cfg.enabled) return;
+  const actions: ProactiveGroupAction[] = [];
+  if (!cfg.enabled) return { actions };
 
   const now = deps.now();
   deps.state.rollDaily(now);
@@ -223,9 +258,41 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<void> {
     if (deps.state.isThreadEngaged(groupKey, thread.threadKey, now)) continue;
 
     // ⑤ 门控B:模型判要不要捡 + 写话
+    let threadSummary = thread.summary;
+    let worldObservation: ProactiveWorldObservation | null = null;
+    if (deps.observeWorld) {
+      try {
+        worldObservation = await deps.observeWorld({
+          groupKey,
+          threadKey: thread.threadKey,
+          matchedKeyword: thread.matchedKeyword,
+          threadSummary: thread.summary,
+          history,
+        });
+      } catch (error) {
+        deps.log("error", "Proactive browser observation failed", error instanceof Error ? error.message : String(error));
+      }
+      if (worldObservation?.summary) {
+        const sources = worldObservation.urls.length > 0
+          ? worldObservation.urls.map((url, index) => `${index + 1}. ${url}`).join("\n")
+          : "(none)";
+        deps.log(
+          "status",
+          worldObservation.cached ? "Proactive browser observation cached" : "Proactive browser observation",
+          `group=${groupKey} keyword=${thread.matchedKeyword}\nquery=${worldObservation.query}\n${sources}`,
+        );
+        threadSummary = [
+          thread.summary,
+          "",
+          "Holly browsed the web for this dropped topic before deciding whether to revive it:",
+          worldObservation.summary,
+        ].join("\n");
+      }
+    }
+
     let decision: ProactiveDecision | null;
     try {
-      decision = await deps.evaluateRevival(groupKey, thread.summary);
+      decision = await deps.evaluateRevival(groupKey, threadSummary);
     } catch (error) {
       deps.log("error", "Proactive 门控B失败", error instanceof Error ? error.message : String(error));
       continue;
@@ -259,9 +326,25 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<void> {
         keyword: thread.matchedKeyword,
         threadKey: thread.threadKey,
         lullMs: lull,
+        worldObservation: worldObservation
+          ? {
+              query: worldObservation.query,
+              urls: worldObservation.urls,
+              cached: worldObservation.cached === true,
+            }
+          : null,
         wouldSend: decision.finalAnswer,
         thinking: decision.thinkingProcess,
         state: deps.state.snapshotForLog(groupKey),
+      });
+      actions.push({
+        type: "send_group_message",
+        mode: "shadow",
+        groupKey,
+        groupId: deps.parseGroupId(groupKey),
+        threadKey: thread.threadKey,
+        matchedKeyword: thread.matchedKeyword,
+        text: decision.finalAnswer,
       });
       continue;
     }
@@ -283,15 +366,25 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<void> {
 
     const groupId = deps.parseGroupId(groupKey);
     if (groupId === null) continue;
+    let sentMessageId: string | null;
     try {
-      await deps.send(groupId, decision.finalAnswer);
+      sentMessageId = await deps.send(groupId, decision.finalAnswer);
     } catch (error) {
       deps.log("error", "Proactive 发送失败", error instanceof Error ? error.message : String(error));
       continue;
     }
-    deps.appendAssistantTurn(groupKey, decision.finalAnswer);
+    deps.appendAssistantTurn(groupKey, decision.finalAnswer, sentMessageId);
     deps.state.recordProactive(groupKey, thread.threadKey, now);
     mutated = true;
+    actions.push({
+      type: "send_group_message",
+      mode: "live",
+      groupKey,
+      groupId,
+      threadKey: thread.threadKey,
+      matchedKeyword: thread.matchedKeyword,
+      text: decision.finalAnswer,
+    });
     deps.log("outgoing", "Proactive 主动发言(live)",
       `group=${groupId} keyword=${thread.matchedKeyword}\n${decision.finalAnswer}`);
   }
@@ -299,4 +392,5 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<void> {
   if (mutated) {
     await deps.state.save();
   }
+  return { actions };
 }

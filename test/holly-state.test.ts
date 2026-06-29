@@ -62,6 +62,25 @@ test("rollDaily: resets per-day counters when the local date changes", async () 
   assert.equal(store.getGroup("g1").dailyCount, 0);
 });
 
+test("autonomy state: persists world observation cadence", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  const autonomy = store.getAutonomyState();
+  autonomy.lastWorldObservationAt = 123;
+  autonomy.lastWorldObservationAttemptAt = 456;
+  autonomy.worldObservationDailyCount = 2;
+  autonomy.nextWorldTopicIndex = 1;
+  await store.save();
+
+  const reloaded = await HollyStateStore.load(path, TTL);
+  const persisted = reloaded.getAutonomyState();
+  assert.equal(persisted.lastWorldObservationAt, 123);
+  assert.equal(persisted.lastWorldObservationAttemptAt, 456);
+  assert.equal(persisted.worldObservationDailyCount, 2);
+  assert.equal(persisted.nextWorldTopicIndex, 1);
+  await rm(path, { force: true });
+});
+
 test("settleObservation: null when nothing pending", async () => {
   const store = await HollyStateStore.load(tmpPath(), TTL);
   const r = store.settleObservation("g1", {

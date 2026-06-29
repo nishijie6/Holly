@@ -31,8 +31,21 @@ import {
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
+  type ProactiveTickResult,
+  type ProactiveWorldObservation,
+  type ProactiveWorldObservationRequest,
 } from "./proactive-engine.js";
+import {
+  runAutonomyLoop,
+  type AutonomyConfig,
+  type AutonomyWorldObservationRequest,
+} from "./autonomy-engine.js";
 import { searchWeb, type SearchResult } from "./web-search.js";
+import {
+  browseTopicWithBrowserAgent,
+  type BrowserAgentConfig,
+  type BrowserTopicObservation,
+} from "./browser-agent.js";
 import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt } from "./decision-prompt.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 
@@ -68,6 +81,10 @@ type MonitorConversationPreview = {
 type ParsedIncomingMessage = Omit<IncomingMessageRecord, "sequence"> & {
   messageTimestampMs: number | null;
   messageLagMs: number | null;
+  // Upstream (NapCat/OneBot) message id. The same physical message can reach the
+  // context twice — once live, once via day-history bootstrap — with different
+  // timestamp/content formatting; this id is the stable key that dedupes them.
+  messageId: string | null;
 };
 
 type ModelRequestContext = {
@@ -77,22 +94,16 @@ type ModelRequestContext = {
   rawMessage: string | null;
   receivedAt: string;
   messageLagMs: number | null;
+  // Carried so the "current batch" turns can be matched against (and filtered
+  // out of) the stored history by their stable upstream id. Optional because
+  // synthetic contexts (cache warm, proactive revival) have no source message.
+  messageId?: string | null;
 };
 
 type PendingModelMessage = {
   message: string;
   context: ModelRequestContext;
 };
-
-class RetryableModelBatchError extends Error {
-  readonly cause: unknown;
-
-  constructor(message: string, cause: unknown) {
-    super(message);
-    this.name = "RetryableModelBatchError";
-    this.cause = cause;
-  }
-}
 
 type ModelDecision = {
   shouldReply: boolean;
@@ -117,6 +128,10 @@ type ConversationTurn = {
   userId: string | null;
   content: string;
   timestamp: string;
+  // Stable upstream id when known. Lets the same physical message dedupe across
+  // the live and day-history-bootstrap paths, which format timestamp/content
+  // differently. Absent on locally-authored assistant turns (no upstream id).
+  messageId?: string | null;
 };
 
 type GroupHistoryMessage = Record<string, unknown>;
@@ -145,6 +160,8 @@ type RuntimeLlmConfig = {
 type AppConfig = {
   llm?: RuntimeLlmConfig;
   fetch?: { proxy_url?: string };
+  autonomy?: Record<string, unknown>;
+  browser_agent?: Record<string, unknown>;
 };
 
 type ContextBudgetConfig = {
@@ -248,6 +265,20 @@ const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
 const MESSAGE_REPLY_MAX_AGE_MS = 5 * 60 * 1000;
 const UNREAD_MODEL_FLUSH_INTERVAL_MS = 60 * 1000;
+// How long an ingested upstream message id is remembered for duplicate-delivery
+// suppression. Well beyond the staleness + retry window, so any reconnect re-push
+// of a recent message is recognised as a duplicate. The map is also size-capped.
+const INGESTED_MESSAGE_TTL_MS = 60 * 60 * 1000;
+const INGESTED_MESSAGE_SWEEP_THRESHOLD = 4096;
+// A batch whose model call fails is retried IN PLACE within the same scan, up to
+// this many attempts, then dropped — never re-queued for a later flush. Re-queuing
+// was the source of cross-scan re-processing (the same already-scanned messages
+// reappearing in scan after scan in old session logs). The messages stay in
+// history, so the next incoming message still gives the model a fresh chance.
+const MODEL_DECISION_MAX_ATTEMPTS = 2;
+// Short pause before an in-place retry of a transient (network/timeout) failure,
+// to ride out a brief blip. Invalid-JSON retries re-roll immediately (no delay).
+const MODEL_DECISION_RETRY_DELAY_MS = 2000;
 // Re-send the merged global context with max_tokens=1 on this cadence to keep the
 // 1h prompt cache warm. 20min < the 1h cache TTL, so the cache never goes cold.
 const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
@@ -287,6 +318,24 @@ const DEFAULT_SEARCH_CONFIG: SearchRuntimeConfig = {
   timeoutMs: 10_000,
 };
 
+type BrowserAgentRuntimeConfig = BrowserAgentConfig & {
+  cooldownMs: number;
+  querySuffix: string;
+};
+
+const DEFAULT_BROWSER_AGENT_CONFIG: BrowserAgentRuntimeConfig = {
+  enabled: false,
+  executablePath: null,
+  proxyUrl: null,
+  searchTopK: 5,
+  maxPages: 2,
+  timeoutMs: 15_000,
+  launchTimeoutMs: 10_000,
+  contentMaxChars: 1800,
+  cooldownMs: 3 * 60 * 60 * 1000,
+  querySuffix: "latest updates",
+};
+
 type AiToneRuntimeConfig = {
   enabled: boolean;
   threshold: number;
@@ -320,6 +369,15 @@ const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   echoOnlyGroups: ["20000003"],
 };
 
+const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
+  enabled: true,
+  worldObservationEnabled: false,
+  worldObservationIntervalMs: 3 * 60 * 60 * 1000,
+  worldObservationRetryMs: 15 * 60 * 1000,
+  maxWorldObservationsPerDay: 6,
+  worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
+};
+
 let sessionLogPath: string | null = null;
 let monitorEntryId = 0;
 let wsClient: WebSocket | null = null;
@@ -333,10 +391,21 @@ let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
+// Upstream message ids we've already ingested from the live WS stream, with the
+// time we first saw them. NapCat can re-deliver the same message (notably after a
+// reconnect), and without this guard a re-delivery would be queued and judged a
+// second time even though we already handled it. Bounded by TTL + a size sweep.
+let ingestedMessageAtMsById = new Map<string, number>();
 let hollyStateStore: HollyStateStore | null = null;
+let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
+let autonomyQueue: Promise<void> = Promise.resolve();
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
+let browserAgentConfig: BrowserAgentRuntimeConfig = DEFAULT_BROWSER_AGENT_CONFIG;
+let browserObservationCache = new Map<string, { observedAtMs: number; observation: ProactiveWorldObservation }>();
+let browserObservationAttemptAtMs = new Map<string, number>();
+let worldObservationMemory: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
 let aiToneShadowQueue: Promise<void> = Promise.resolve();
@@ -471,6 +540,44 @@ async function loadProactiveConfig(configPath: string): Promise<ProactiveConfig>
 
 // Read the optional `search:` config section. The API key is NOT here — it comes
 // from the SERPER_API_KEY env var (see .env). Hot-reloaded by the config watcher.
+async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
+  const base: AutonomyConfig = {
+    ...DEFAULT_AUTONOMY_CONFIG,
+    worldTopics: [...DEFAULT_AUTONOMY_CONFIG.worldTopics],
+  };
+  if (!existsSync(configPath)) return base;
+
+  let parsed: { autonomy?: Record<string, unknown> } | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { autonomy?: Record<string, unknown> } | null) ?? {};
+  } catch {
+    return base;
+  }
+  const a = parsed?.autonomy;
+  if (!a || typeof a !== "object") return base;
+
+  return {
+    enabled: typeof a.enabled === "boolean" ? a.enabled : base.enabled,
+    worldObservationEnabled:
+      typeof a.world_observation_enabled === "boolean"
+        ? a.world_observation_enabled
+        : base.worldObservationEnabled,
+    worldObservationIntervalMs: readProactiveMinutesMs(
+      a.world_observation_interval_minutes,
+      base.worldObservationIntervalMs,
+    ),
+    worldObservationRetryMs: readProactiveMinutesMs(
+      a.world_observation_retry_minutes,
+      base.worldObservationRetryMs,
+    ),
+    maxWorldObservationsPerDay: readProactiveCount(
+      a.max_world_observations_per_day,
+      base.maxWorldObservationsPerDay,
+    ),
+    worldTopics: readProactiveStringArray(a.world_topics, base.worldTopics),
+  };
+}
+
 async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig> {
   const base = { ...DEFAULT_SEARCH_CONFIG };
   if (!existsSync(configPath)) return base;
@@ -491,6 +598,43 @@ async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig
 
 // Read the optional `ai_tone:` config section. Shadow-only signal — scores each
 // outgoing reply and logs it, never blocks. Hot-reloaded by the config watcher.
+function readOptionalString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value.trim() : null;
+}
+
+// Browser agent config for Holly's autonomous world observations. The autonomy
+// loop decides when to call it; group proactive actions only read cached
+// observations so they do not start browser work inside the model queue.
+async function loadBrowserAgentConfig(configPath: string): Promise<BrowserAgentRuntimeConfig> {
+  const base: BrowserAgentRuntimeConfig = { ...DEFAULT_BROWSER_AGENT_CONFIG };
+  if (!existsSync(configPath)) return base;
+  let parsed: AppConfig | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as AppConfig | null) ?? {};
+  } catch {
+    return base;
+  }
+  const b = parsed.browser_agent;
+  if (!b || typeof b !== "object") {
+    return {
+      ...base,
+      proxyUrl: parsed.fetch?.proxy_url?.trim() || base.proxyUrl,
+    };
+  }
+  return {
+    enabled: typeof b.enabled === "boolean" ? b.enabled : base.enabled,
+    executablePath: readOptionalString(b.executable_path) ?? base.executablePath,
+    proxyUrl: readOptionalString(b.proxy_url) ?? parsed.fetch?.proxy_url?.trim() ?? base.proxyUrl,
+    searchTopK: readProactiveCount(b.search_top_k, base.searchTopK),
+    maxPages: readProactiveCount(b.max_pages, base.maxPages),
+    timeoutMs: readProactiveCount(b.timeout_ms, base.timeoutMs),
+    launchTimeoutMs: readProactiveCount(b.launch_timeout_ms, base.launchTimeoutMs),
+    contentMaxChars: readProactiveCount(b.content_max_chars, base.contentMaxChars),
+    cooldownMs: readProactiveMinutesMs(b.cooldown_minutes, base.cooldownMs),
+    querySuffix: readOptionalString(b.query_suffix) ?? base.querySuffix,
+  };
+}
+
 async function loadAiToneConfig(configPath: string): Promise<AiToneRuntimeConfig> {
   const base = { ...DEFAULT_AI_TONE_CONFIG };
   if (!existsSync(configPath)) return base;
@@ -969,14 +1113,19 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
   const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const nextAutonomyConfig = await loadAutonomyConfig(CONFIG_PATH);
   const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
+  const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
+  autonomyConfig = nextAutonomyConfig;
   proactiveConfig = nextProactiveConfig;
   searchConfig = nextSearchConfig;
+  browserAgentConfig = nextBrowserAgentConfig;
+  browserObservationAttemptAtMs = new Map();
   aiToneConfig = nextAiToneConfig;
   hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
   pushMonitorEntry(
@@ -1286,6 +1435,25 @@ function stringifyMessageContent(value: unknown): string | null {
   }
 
   return JSON.stringify(value);
+}
+
+// The canonical upstream id for a single message. Read it the same way from a
+// live event payload and from a get_group_msg_history record so the two derived
+// turns share one dedup key (see getConversationTurnKey). Prefer message_id —
+// it is stable across both APIs, unlike message_seq which only history returns.
+function readUpstreamMessageId(record: Record<string, unknown>): string | null {
+  const candidates = [record.message_id, record.messageId, record.msgId, record.msg_id];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+
+    if (typeof candidate === "number" && Number.isFinite(candidate)) {
+      return String(candidate);
+    }
+  }
+
+  return null;
 }
 
 function readMessageTimestampMs(record: Record<string, unknown>): number | null {
@@ -1720,6 +1888,7 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
       userId: null,
       senderName: null,
       rawMessage: null,
+      messageId: null,
     };
   }
 
@@ -1739,6 +1908,7 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
     userId: null,
     senderName: null,
     rawMessage: null,
+    messageId: null,
   };
 
   try {
@@ -1755,6 +1925,7 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
     const rawMessage = stringifyMessageContent(payload.raw_message);
     const messageTimestampMs = readMessageTimestampMs(payload);
     const messageLagMs = messageTimestampMs === null ? null : receivedAtMs - messageTimestampMs;
+    const messageId = readUpstreamMessageId(payload);
     const displayTime = formatDisplayMessageTime(messageTimestampMs ?? receivedAtMs);
 
     if (messageType !== "group") {
@@ -1784,6 +1955,7 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
       userId,
       senderName,
       rawMessage,
+      messageId,
       displayText: rawMessage ? `${displayTime} ${prefix} ${rawMessage}`.trim() : `${displayTime} ${prefix}`,
     };
   } catch (error) {
@@ -1899,6 +2071,7 @@ function historyMessageToConversationTurn(groupId: string, message: GroupHistory
     userId,
     content,
     timestamp: new Date(timestampMs).toISOString(),
+    messageId: readUpstreamMessageId(message),
   };
 }
 
@@ -2048,6 +2221,15 @@ function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string
 }
 
 function getConversationTurnKey(turn: ConversationTurn): string {
+  // When the upstream message id is known, key on it alone (per group/role). The
+  // live event and the day-history bootstrap render the same message with
+  // different timestamps and content prefixes, so a content-based key would let
+  // a boundary message slip into the merged context twice; the id collapses them.
+  if (turn.messageId) {
+    const group = normalizeConversationGroupKey(turn.groupId) ?? "";
+    return ["id", group, turn.role, turn.messageId].join("\u0000");
+  }
+
   return [
     turn.timestamp,
     turn.role,
@@ -2124,6 +2306,7 @@ function buildConversationMessages(context: ModelRequestContext, currentMessages
       userId: item.context.userId,
       content: item.message.trim(),
       timestamp: item.context.receivedAt,
+      messageId: item.context.messageId,
     })),
   );
   const turns = pruneConversationTurns(
@@ -2149,6 +2332,7 @@ function buildGlobalConversationMessages(
       userId: item.context.userId,
       content: item.message.trim(),
       timestamp: item.context.receivedAt,
+      messageId: item.context.messageId,
     })),
   );
 
@@ -2929,11 +3113,15 @@ function handleWsActionResponse(content: string): boolean {
   return true;
 }
 
-async function sendGroupMessage(groupId: number, message: string): Promise<void> {
-  await sendWsAction("send_group_msg", {
+// Returns the upstream id of the sent message when NapCat reports one, so the
+// assistant turn we record can share its dedup key with the same message if it
+// later re-enters context via the day-history bootstrap. null when unavailable.
+async function sendGroupMessage(groupId: number, message: string): Promise<string | null> {
+  const response = await sendWsAction("send_group_msg", {
       group_id: groupId,
       message,
   });
+  return readUpstreamMessageId(asObjectRecord(response.data) ?? {});
 }
 
 function parseLookupRequest(raw: string): { needSearch: boolean; searchQuery: string } {
@@ -3101,40 +3289,68 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
   pushMonitorEntry("status", "Scheduled Model Request", batchMessage);
   await appendChatLog("user", batchMessage);
 
-  let reply: string;
-  try {
-    reply = await client.generateText({
-      systemPrompt: preparedRequest.systemPrompt,
-      messages: preparedRequest.messages,
-      jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+  // Judge the batch with a small IN-PLACE retry budget. A transient model failure
+  // (network/timeout) or a malformed reply is retried within this same scan; the
+  // batch is never put back on the unread queue, so an already-scanned batch can't
+  // reappear in a later scan and be re-judged (the cross-scan re-processing that
+  // filled old session logs). If every attempt fails the batch is dropped — the
+  // messages remain in history, so the next incoming message still lets the model
+  // weigh in on them.
+  let decision: ModelDecision | null = null;
+  for (let attempt = 1; attempt <= MODEL_DECISION_MAX_ATTEMPTS && decision === null; attempt += 1) {
+    let reply: string;
+    try {
+      reply = await client.generateText({
+        systemPrompt: preparedRequest.systemPrompt,
+        messages: preparedRequest.messages,
+        jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (attempt < MODEL_DECISION_MAX_ATTEMPTS) {
+        pushMonitorEntry("status", "Model Request Retry", `attempt=${attempt}/${MODEL_DECISION_MAX_ATTEMPTS} (transient)\n${detail}`);
+        await new Promise((resolve) => setTimeout(resolve, MODEL_DECISION_RETRY_DELAY_MS));
+        continue;
+      }
+      pushMonitorEntry("error", "Unread Batch Dropped", `Model request failed after ${attempt} attempts; dropped (kept in context).\n${detail}`);
+      console.error("Model request failed; dropping unread batch:", error);
+      return;
+    }
+
+    broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+    const callTokens = consumeLatestCallTokenUsage();
+    if (callTokens) {
+      recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+      broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+    }
+
+    // "查一下再答": if the model asked to look something up, search and re-ask.
+    reply = await applyLookupIfRequested(reply, {
+      client,
+      memoryPrompt,
+      conversationMessages,
+      batchMessage,
+      startedAt,
     });
-  } catch (error) {
-    throw new RetryableModelBatchError("Model request failed; unread batch will be retried.", error);
+
+    try {
+      decision = parseModelDecision(reply);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      if (attempt < MODEL_DECISION_MAX_ATTEMPTS) {
+        pushMonitorEntry("status", "Model Request Retry", `attempt=${attempt}/${MODEL_DECISION_MAX_ATTEMPTS} (invalid JSON)\n${detail}`);
+        continue;
+      }
+      pushMonitorEntry("error", "Unread Batch Dropped", `Model reply was invalid after ${attempt} attempts; dropped (kept in context).\n${detail}`);
+      console.error("Model reply invalid; dropping unread batch:", error);
+      return;
+    }
   }
 
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-
-  const callTokens = consumeLatestCallTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  if (decision === null) {
+    return;
   }
 
-  // "查一下再答": if the model asked to look something up, search and re-ask.
-  reply = await applyLookupIfRequested(reply, {
-    client,
-    memoryPrompt,
-    conversationMessages,
-    batchMessage,
-    startedAt,
-  });
-
-  let decision: ModelDecision;
-  try {
-    decision = parseModelDecision(reply);
-  } catch (error) {
-    throw new RetryableModelBatchError("Model response was invalid; unread batch will be retried.", error);
-  }
   const content = formatModelReplyEntry(decision);
   await appendChatLog("assistant", content);
   pushMonitorEntry(
@@ -3165,7 +3381,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
   // Shadow: score the reply's AI tone before sending (log-only, never blocks).
   recordOutgoingAiTone(decision.finalAnswer, replyGroupId);
 
-  await sendGroupMessage(replyGroupId, decision.finalAnswer);
+  const sentMessageId = await sendGroupMessage(replyGroupId, decision.finalAnswer);
   appendConversationTurn({
     groupId: effectiveContext.groupId,
     role: "assistant",
@@ -3173,6 +3389,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     userId: null,
     content: decision.finalAnswer,
     timestamp: new Date().toISOString(),
+    messageId: sentMessageId,
   });
   pushMonitorEntry(
     "outgoing",
@@ -3186,14 +3403,12 @@ function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
     .catch(() => {
       // Keep the queue alive after a previous failure.
     })
-    .then(async () => {
-      await forwardUnreadMessagesToModel(messages);
-    })
+    .then(() => forwardUnreadMessagesToModel(messages))
     .catch((error) => {
+      // forwardUnreadMessagesToModel handles model/parse failures internally (it
+      // retries in place, then drops). Anything reaching here is an unexpected
+      // error; drop the batch (never re-queue) and log it.
       const detail = error instanceof Error ? error.message : String(error);
-      if (error instanceof RetryableModelBatchError) {
-        restoreUnreadBatchForModel(messages);
-      }
       pushMonitorEntry("error", "Model Error", detail);
       console.error("Model request failed:", error);
     });
@@ -3327,6 +3542,173 @@ function appendProactiveShadowLog(record: Record<string, unknown>): void {
     });
 }
 
+const WORLD_OBSERVATION_LOG_PATH = join(LOG_DIR, "world-observations.jsonl");
+const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
+
+function appendWorldObservationLog(record: Record<string, unknown>): void {
+  proactiveShadowQueue = proactiveShadowQueue
+    .then(async () => {
+      await mkdir(LOG_DIR, { recursive: true });
+      await appendFile(WORLD_OBSERVATION_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to write world observation log:", error);
+    });
+}
+
+function compactBrowserQueryText(text: string): string {
+  return text
+    .replace(/\[CQ:[^\]]+\]/g, " ")
+    .replace(/\[[^\]]+\]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 160);
+}
+
+function buildAutonomyBrowserQuery(request: AutonomyWorldObservationRequest): string {
+  return [request.topic, browserAgentConfig.querySuffix]
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .join(" ");
+}
+
+function browserObservationCacheKey(query: string): string {
+  return query.trim().toLowerCase();
+}
+
+function toProactiveWorldObservation(observation: BrowserTopicObservation): ProactiveWorldObservation {
+  return {
+    query: observation.query,
+    summary: observation.summary,
+    urls: observation.pages
+      .map((page) => page.url)
+      .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index),
+  };
+}
+
+function rememberWorldObservation(topic: string, observedAtMs: number, observation: ProactiveWorldObservation): void {
+  worldObservationMemory.push({ observedAtMs, topic, observation });
+  const cutoff = observedAtMs - 24 * 60 * 60 * 1000;
+  worldObservationMemory = worldObservationMemory
+    .filter((item) => item.observedAtMs >= cutoff)
+    .slice(-WORLD_OBSERVATION_MEMORY_LIMIT);
+}
+
+async function loadWorldObservationMemory(): Promise<void> {
+  if (!existsSync(WORLD_OBSERVATION_LOG_PATH)) return;
+  let raw = "";
+  try {
+    raw = await readFile(WORLD_OBSERVATION_LOG_PATH, "utf-8");
+  } catch {
+    return;
+  }
+  const loaded: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const record = JSON.parse(line) as Record<string, unknown>;
+      if (record.ok !== true) continue;
+      const ts = typeof record.ts === "string" ? Date.parse(record.ts) : NaN;
+      const topic = typeof record.topic === "string" ? record.topic : "";
+      const query = typeof record.query === "string" ? record.query : "";
+      const summary = typeof record.summary === "string" ? record.summary : "";
+      const urls = Array.isArray(record.urls)
+        ? record.urls.filter((url): url is string => typeof url === "string")
+        : [];
+      if (!Number.isFinite(ts) || !topic || !query || !summary) continue;
+      loaded.push({ observedAtMs: ts, topic, observation: { query, summary, urls } });
+    } catch {
+      // Ignore corrupt lines; this is an append-only shadow log.
+    }
+  }
+  worldObservationMemory = loaded.slice(-WORLD_OBSERVATION_MEMORY_LIMIT);
+}
+
+function findRelevantWorldObservation(request: ProactiveWorldObservationRequest): ProactiveWorldObservation | null {
+  const now = Date.now();
+  const keyword = request.matchedKeyword.trim().toLowerCase();
+  const compactSummary = compactBrowserQueryText(request.threadSummary).toLowerCase();
+  for (const item of [...worldObservationMemory].reverse()) {
+    if (now - item.observedAtMs > browserAgentConfig.cooldownMs) continue;
+    const haystack = `${item.topic}\n${item.observation.query}\n${item.observation.summary}`.toLowerCase();
+    if (keyword && haystack.includes(keyword)) {
+      return { ...item.observation, cached: true };
+    }
+    if (compactSummary && haystack.includes(compactSummary.slice(0, 40))) {
+      return { ...item.observation, cached: true };
+    }
+  }
+  return null;
+}
+
+function observeWorldForProactive(request: ProactiveWorldObservationRequest): Promise<ProactiveWorldObservation | null> {
+  return Promise.resolve(findRelevantWorldObservation(request));
+}
+
+async function observeWorldForAutonomy(
+  request: AutonomyWorldObservationRequest,
+): Promise<ProactiveWorldObservation | null> {
+  if (!browserAgentConfig.enabled) return null;
+  if (!searchConfig.enabled || !process.env.SERPER_API_KEY) {
+    pushMonitorEntry(
+      "status",
+      "Browser Agent Skipped",
+      `topic=${request.topic}\nsearch disabled or SERPER_API_KEY missing.`,
+    );
+    return null;
+  }
+
+  const query = buildAutonomyBrowserQuery(request);
+  const cacheKey = browserObservationCacheKey(query);
+  const now = Date.now();
+
+  const cached = browserObservationCache.get(cacheKey);
+  if (cached && now - cached.observedAtMs <= browserAgentConfig.cooldownMs) {
+    return {
+      ...cached.observation,
+      cached: true,
+    };
+  }
+
+  const lastAttemptAt = browserObservationAttemptAtMs.get(cacheKey);
+  if (lastAttemptAt !== undefined && now - lastAttemptAt <= autonomyConfig.worldObservationRetryMs) {
+    return null;
+  }
+  browserObservationAttemptAtMs.set(cacheKey, now);
+
+  pushMonitorEntry(
+    "status",
+    "Browser Agent Start",
+    `topic=${request.topic}\nquery=${query}`,
+  );
+
+  const observed = await browseTopicWithBrowserAgent(query, browserAgentConfig);
+  if (!observed) {
+    pushMonitorEntry("status", "Browser Agent Empty", `topic=${request.topic}\nquery=${query}`);
+    return null;
+  }
+
+  const worldObservation = toProactiveWorldObservation(observed);
+  browserObservationCache.set(cacheKey, {
+    observedAtMs: now,
+    observation: worldObservation,
+  });
+  rememberWorldObservation(request.topic, now, worldObservation);
+  if (browserObservationCache.size > 256) {
+    const cutoff = now - browserAgentConfig.cooldownMs;
+    for (const [key, value] of browserObservationCache) {
+      if (value.observedAtMs < cutoff) browserObservationCache.delete(key);
+    }
+  }
+
+  pushMonitorEntry(
+    "status",
+    "Browser Agent Observed",
+    `topic=${request.topic}\nquery=${worldObservation.query}\nsources=${worldObservation.urls.length}`,
+  );
+  return worldObservation;
+}
+
 // Gate B (6A): reuse the exact cached system + global-history prefix a reactive
 // reply uses; the proactive instruction rides only in the current-message slot,
 // so this call hits the 1h prompt cache instead of reprocessing the full context.
@@ -3389,9 +3771,10 @@ function buildProactiveDeps(): ProactiveDeps | null {
     now: () => Date.now(),
     listGroups: () => Array.from(conversationHistoryByGroup.keys()),
     getHistory: (groupKey) => conversationHistoryByGroup.get(groupKey) ?? [],
+    observeWorld: observeWorldForProactive,
     evaluateRevival: evaluateProactiveRevival,
     send: sendGroupMessage,
-    appendAssistantTurn: (groupKey, text) =>
+    appendAssistantTurn: (groupKey, text, messageId) =>
       appendConversationTurn({
         groupId: groupKey,
         role: "assistant",
@@ -3399,6 +3782,7 @@ function buildProactiveDeps(): ProactiveDeps | null {
         userId: null,
         content: text,
         timestamp: new Date().toISOString(),
+        messageId: messageId ?? null,
       }),
     parseGroupId: (groupKey) => {
       const numeric = Number(groupKey);
@@ -3415,36 +3799,96 @@ function buildProactiveDeps(): ProactiveDeps | null {
 
 // Serialize on the model queue so the proactive tick never races a reactive
 // reply or the cache warmer (shared prefix → all-or-nothing cache hits).
-function scheduleProactiveTick(): void {
+function emptyProactiveResult(): ProactiveTickResult {
+  return { actions: [] };
+}
+
+// Only the group-message action enters modelQueue. Browser world observation is
+// driven by autonomyQueue so a slow page load cannot block reactive replies.
+function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
   const deps = buildProactiveDeps();
-  if (!deps || !deps.config.enabled) return;
-  modelQueue = modelQueue
+  if (!deps || !deps.config.enabled) return Promise.resolve(emptyProactiveResult());
+
+  const run = modelQueue
     .catch(() => {
       // Keep the queue alive after a previous failure.
     })
     .then(async () => {
-      await runProactiveTick(deps);
+      try {
+        return await runProactiveTick(deps);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        pushMonitorEntry("error", "Proactive Tick Error", detail);
+        console.error("Proactive tick failed:", error);
+        return emptyProactiveResult();
+      }
+    });
+  modelQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
+function buildAutonomyDeps() {
+  const store = hollyStateStore;
+  if (!store) return null;
+  return {
+    now: () => Date.now(),
+    config: autonomyConfig,
+    getState: () => store.getAutonomyState(),
+    saveState: () => store.save(),
+    observeWorld: observeWorldForAutonomy,
+    runGroupProactiveAction: runGroupProactiveOnModelQueue,
+    log: (kind: "status" | "error", title: string, body: string) => {
+      pushMonitorEntry(kind, title, body);
+    },
+    recordWorldObservation: appendWorldObservationLog,
+  };
+}
+
+function scheduleAutonomyTick(): void {
+  const deps = buildAutonomyDeps();
+  if (!deps || !deps.config.enabled) return;
+  autonomyQueue = autonomyQueue
+    .catch(() => {
+      // Keep the autonomy queue alive after a previous failure.
+    })
+    .then(async () => {
+      await runAutonomyLoop(deps);
     })
     .catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Proactive Tick Error", detail);
-      console.error("Proactive tick failed:", error);
+      pushMonitorEntry("error", "Autonomy Tick Error", detail);
+      console.error("Autonomy tick failed:", error);
     });
 }
 
-function restoreUnreadBatchForModel(messages: PendingModelMessage[]): void {
-  const groupKey = normalizeConversationGroupKey(messages[0]?.context.groupId ?? null);
-  if (!groupKey || messages.length === 0) {
-    return;
+// Idempotency guard for live WS ingestion. Returns true the first time a message
+// id is seen (and records it); returns false on any later sighting within the TTL
+// so the caller can skip a duplicate delivery entirely — no re-store, no re-judge.
+// Messages without an upstream id can't be deduped, so they're always accepted.
+function claimIncomingMessageId(messageId: string | null): boolean {
+  if (!messageId) {
+    return true;
   }
 
-  const pendingMessages = unreadModelMessagesByGroup.get(groupKey) ?? [];
-  unreadModelMessagesByGroup.set(groupKey, [...messages, ...pendingMessages]);
-  pushMonitorEntry(
-    "status",
-    "Unread Batch Restored",
-    `group_id=${groupKey}\nrestored_messages=${messages.length}\nunread_messages=${messages.length + pendingMessages.length}`,
-  );
+  const now = Date.now();
+  const seenAt = ingestedMessageAtMsById.get(messageId);
+  if (seenAt !== undefined && now - seenAt <= INGESTED_MESSAGE_TTL_MS) {
+    return false;
+  }
+
+  ingestedMessageAtMsById.set(messageId, now);
+  if (ingestedMessageAtMsById.size > INGESTED_MESSAGE_SWEEP_THRESHOLD) {
+    const cutoff = now - INGESTED_MESSAGE_TTL_MS;
+    for (const [id, atMs] of ingestedMessageAtMsById) {
+      if (atMs < cutoff) {
+        ingestedMessageAtMsById.delete(id);
+      }
+    }
+  }
+  return true;
 }
 
 function queueUnreadMessageForModel(message: string, context: ModelRequestContext): number | null {
@@ -3471,6 +3915,9 @@ function flushUnreadMessagesToModel(): void {
     return;
   }
 
+  // Drain the whole queue: every group's pending messages are handed to the model
+  // exactly once. Failures are retried in place inside the batch, never re-queued,
+  // so a batch taken here never comes back to be re-judged in a later flush.
   const batches = Array.from(unreadModelMessagesByGroup.entries());
   unreadModelMessagesByGroup.clear();
   for (const [groupId, messages] of batches) {
@@ -3569,6 +4016,21 @@ function connectWebSocketClient(forceReconnect = false): void {
     }
 
     const parsedMessage = parseIncomingMessage(data, isBinary);
+
+    // Suppress duplicate deliveries (e.g. NapCat re-pushing after a reconnect) as
+    // early as possible — before OCR/URL enrichment, the Qdrant write, and the
+    // model queue — so a re-pushed message is neither re-stored nor re-judged.
+    // Check-and-claim is synchronous (no await between), so concurrent duplicates
+    // can't both pass. Messages without an upstream id can't be deduped (accepted).
+    if (!claimIncomingMessageId(parsedMessage.messageId)) {
+      pushMonitorEntry(
+        "status",
+        "Duplicate Message Skipped",
+        `group_id=${parsedMessage.groupId ?? "unknown"}\nmessage_id=${parsedMessage.messageId}\n${parsedMessage.displayText ?? ""}`,
+      );
+      return;
+    }
+
     const ocrMessage = await enrichMessageWithImageOcr(parsedMessage);
     const message = await enrichMessageWithUrlContent(ocrMessage);
     try {
@@ -3599,6 +4061,7 @@ function connectWebSocketClient(forceReconnect = false): void {
       userId: message.userId,
       content: message.displayText,
       timestamp: message.receivedAt,
+      messageId: message.messageId,
     });
 
     const isStale = message.messageLagMs !== null && message.messageLagMs > MESSAGE_REPLY_MAX_AGE_MS;
@@ -3611,6 +4074,7 @@ function connectWebSocketClient(forceReconnect = false): void {
           rawMessage: message.rawMessage,
           receivedAt: message.receivedAt,
           messageLagMs: message.messageLagMs,
+          messageId: message.messageId,
         });
 
     pushMonitorEntry(
@@ -4500,8 +4964,10 @@ async function bootstrap(): Promise<void> {
   await loadTokenStats();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const loadedAutonomyConfig = await loadAutonomyConfig(CONFIG_PATH);
   const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
+  const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
@@ -4513,11 +4979,14 @@ async function bootstrap(): Promise<void> {
   activeLlmClient = client;
   activeLlmLabel = client.displayName;
   contextBudgetConfig = loadedContextBudgetConfig;
+  autonomyConfig = loadedAutonomyConfig;
   proactiveConfig = loadedProactiveConfig;
   searchConfig = loadedSearchConfig;
+  browserAgentConfig = loadedBrowserAgentConfig;
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
+  await loadWorldObservationMemory();
   incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
@@ -4538,14 +5007,24 @@ async function bootstrap(): Promise<void> {
   // Keep the merged global context's 1h prompt cache warm; skips when idle.
   setInterval(scheduleGlobalContextWarm, CONTEXT_WARM_INTERVAL_MS);
 
-  // Proactive Holly (slice 1): on a timer, consider reviving a dropped interest
-  // thread during a lull. Default mode=shadow (logs only, never sends).
+  // Autonomy loop: on a timer, decide whether Holly should observe the world,
+  // write internal memory, speak in a group, or do nothing.
+  pushMonitorEntry(
+    "status",
+    "Autonomy Ready",
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}`,
+  );
   pushMonitorEntry(
     "status",
     "Proactive Ready",
     `mode=${proactiveConfig.mode} enabled=${proactiveConfig.enabled}\nlull_min=${Math.round(proactiveConfig.lullMinMs / 60000)}min cap=${proactiveConfig.perGroupDailyCap}/group global=${proactiveConfig.globalDailyCap}`,
   );
-  setInterval(scheduleProactiveTick, PROACTIVE_TICK_INTERVAL_MS);
+  pushMonitorEntry(
+    "status",
+    "Browser Agent Ready",
+    `enabled=${browserAgentConfig.enabled} max_pages=${browserAgentConfig.maxPages} cooldown=${Math.round(browserAgentConfig.cooldownMs / 60000)}min`,
+  );
+  setInterval(scheduleAutonomyTick, PROACTIVE_TICK_INTERVAL_MS);
 
   // Re-broadcast cached usage + today's token stats every 5 minutes. Keeps
   // late-joining clients in sync and rolls the token panel over to a new day

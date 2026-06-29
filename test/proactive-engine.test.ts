@@ -13,6 +13,7 @@ import {
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
+  type ProactiveWorldObservation,
   type ProactiveTurn,
 } from "../proactive-engine.js";
 
@@ -68,6 +69,8 @@ type Harness = {
   shadows: Record<string, unknown>[];
   appended: Array<{ groupKey: string; text: string }>;
   evalCalls: { n: number };
+  evalSummaries: string[];
+  observeCalls: { n: number };
 };
 
 async function makeHarness(opts: {
@@ -75,6 +78,7 @@ async function makeHarness(opts: {
   getHistory: (groupKey: string, callIdx: number) => ProactiveTurn[];
   config?: Partial<ProactiveConfig>;
   decision?: ProactiveDecision | null;
+  observation?: ProactiveWorldObservation | null;
   store?: HollyStateStore;
 }): Promise<Harness> {
   const store = opts.store ?? (await HollyStateStore.load(tmpPath(), TTL));
@@ -82,6 +86,8 @@ async function makeHarness(opts: {
   const shadows: Harness["shadows"] = [];
   const appended: Harness["appended"] = [];
   const evalCalls = { n: 0 };
+  const observeCalls = { n: 0 };
+  const evalSummaries: string[] = [];
   const callIdx = new Map<string, number>();
 
   const deps: ProactiveDeps = {
@@ -92,12 +98,20 @@ async function makeHarness(opts: {
       callIdx.set(groupKey, idx + 1);
       return opts.getHistory(groupKey, idx);
     },
-    evaluateRevival: async () => {
+    observeWorld: opts.observation === undefined
+      ? undefined
+      : async () => {
+          observeCalls.n += 1;
+          return opts.observation ?? null;
+        },
+    evaluateRevival: async (_groupKey, threadSummary) => {
       evalCalls.n += 1;
+      evalSummaries.push(threadSummary);
       return opts.decision === undefined ? DEFAULT_DECISION : opts.decision;
     },
     send: async (groupId, text) => {
       sends.push({ groupId, text });
+      return null;
     },
     appendAssistantTurn: (groupKey, text) => {
       appended.push({ groupKey, text });
@@ -113,7 +127,7 @@ async function makeHarness(opts: {
     config: baseConfig(opts.config),
     state: store,
   };
-  return { deps, store, sends, shadows, appended, evalCalls };
+  return { deps, store, sends, shadows, appended, evalCalls, evalSummaries, observeCalls };
 }
 
 // ── validateProactiveLine ────────────────────────────────────────────────────
@@ -232,6 +246,27 @@ test("tick: valid candidate in shadow → logs, never sends, records state", asy
   assert.equal(h.sends.length, 0); // shadow never sends
   assert.equal(h.store.getGroup("111").dailyCount, 1);
   assert.ok(h.store.getGroup("111").pendingObservation);
+});
+
+test("tick: browser observation is injected before model decision", async () => {
+  const h = await makeHarness({
+    groups: ["111"],
+    getHistory: () => [userTurn("ai news", NOW - 20 * MIN)],
+    observation: {
+      query: "ai latest",
+      summary: "Browser found one relevant update.",
+      urls: ["https://example.com/ai"],
+    },
+  });
+  await runProactiveTick(h.deps);
+  assert.equal(h.observeCalls.n, 1);
+  assert.equal(h.evalCalls.n, 1);
+  assert.match(h.evalSummaries[0], /Browser found one relevant update/);
+  assert.deepEqual(h.shadows[0].worldObservation, {
+    query: "ai latest",
+    urls: ["https://example.com/ai"],
+    cached: false,
+  });
 });
 
 test("tick: model says no → no shadow, no state mutation", async () => {
