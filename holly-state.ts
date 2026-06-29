@@ -24,6 +24,10 @@ export type HollyAutonomyState = {
   worldObservationDailyDate: string;
   worldObservationDailyCount: number;
   nextWorldTopicIndex: number;
+  lastMemoryReflectionAt: number;
+  lastMemoryReflectionAttemptAt: number;
+  memoryReflectionDailyDate: string;
+  memoryReflectionDailyCount: number;
 };
 
 export type HollyGroupState = {
@@ -69,6 +73,10 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     worldObservationDailyDate: dateKey,
     worldObservationDailyCount: 0,
     nextWorldTopicIndex: 0,
+    lastMemoryReflectionAt: 0,
+    lastMemoryReflectionAttemptAt: 0,
+    memoryReflectionDailyDate: dateKey,
+    memoryReflectionDailyCount: 0,
   };
 }
 
@@ -94,6 +102,15 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
       : 0,
     nextWorldTopicIndex: isFiniteNumber(v.nextWorldTopicIndex)
       ? Math.max(0, Math.floor(v.nextWorldTopicIndex))
+      : 0,
+    lastMemoryReflectionAt: isFiniteNumber(v.lastMemoryReflectionAt) ? v.lastMemoryReflectionAt : 0,
+    lastMemoryReflectionAttemptAt: isFiniteNumber(v.lastMemoryReflectionAttemptAt)
+      ? v.lastMemoryReflectionAttemptAt
+      : 0,
+    memoryReflectionDailyDate:
+      typeof v.memoryReflectionDailyDate === "string" ? v.memoryReflectionDailyDate : dateKey,
+    memoryReflectionDailyCount: isFiniteNumber(v.memoryReflectionDailyCount)
+      ? Math.max(0, Math.floor(v.memoryReflectionDailyCount))
       : 0,
   };
 }
@@ -190,6 +207,10 @@ export class HollyStateStore {
     if (this.data.autonomy.worldObservationDailyDate !== today) {
       this.data.autonomy.worldObservationDailyDate = today;
       this.data.autonomy.worldObservationDailyCount = 0;
+    }
+    if (this.data.autonomy.memoryReflectionDailyDate !== today) {
+      this.data.autonomy.memoryReflectionDailyDate = today;
+      this.data.autonomy.memoryReflectionDailyCount = 0;
     }
     for (const g of Object.values(this.data.groups)) {
       if (g.dailyDate !== today) {

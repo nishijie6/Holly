@@ -20,6 +20,7 @@ import {
 } from "./llm-client.js";
 import {
   createIncomingMessageStore,
+  type InternalMemoryRecord,
   type IncomingMessageRecord,
   type IncomingMessageStore,
   type StoredMemoryRecord,
@@ -38,6 +39,8 @@ import {
 import {
   runAutonomyLoop,
   type AutonomyConfig,
+  type AutonomyMemoryReflectionRequest,
+  type AutonomyMemoryWriteRequest,
   type AutonomyWorldObservationRequest,
 } from "./autonomy-engine.js";
 import { searchWeb, type SearchResult } from "./web-search.js";
@@ -259,6 +262,7 @@ const URL_FETCH_TIMEOUT_MS = 10_000;
 const URL_FETCH_MAX_PER_MESSAGE = 2;
 const URL_CONTENT_MAX_CHARS = 3000;
 const MEMORY_LOOKBACK_LIMIT = 8;
+const INTERNAL_MEMORY_LOOKBACK_LIMIT = 5;
 const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
@@ -376,6 +380,10 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldObservationRetryMs: 15 * 60 * 1000,
   maxWorldObservationsPerDay: 6,
   worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
+  memoryReflectionEnabled: false,
+  memoryReflectionIntervalMs: 60 * 60 * 1000,
+  memoryReflectionRetryMs: 15 * 60 * 1000,
+  maxMemoryReflectionsPerDay: 8,
 };
 
 let sessionLogPath: string | null = null;
@@ -575,6 +583,22 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       base.maxWorldObservationsPerDay,
     ),
     worldTopics: readProactiveStringArray(a.world_topics, base.worldTopics),
+    memoryReflectionEnabled:
+      typeof a.memory_reflection_enabled === "boolean"
+        ? a.memory_reflection_enabled
+        : base.memoryReflectionEnabled,
+    memoryReflectionIntervalMs: readProactiveMinutesMs(
+      a.memory_reflection_interval_minutes,
+      base.memoryReflectionIntervalMs,
+    ),
+    memoryReflectionRetryMs: readProactiveMinutesMs(
+      a.memory_reflection_retry_minutes,
+      base.memoryReflectionRetryMs,
+    ),
+    maxMemoryReflectionsPerDay: readProactiveCount(
+      a.max_memory_reflections_per_day,
+      base.maxMemoryReflectionsPerDay,
+    ),
   };
 }
 
@@ -2100,6 +2124,27 @@ async function persistIncomingMessage(record: ParsedIncomingMessage): Promise<vo
   await run;
 }
 
+async function persistInternalMemory(record: InternalMemoryRecord): Promise<void> {
+  const store = incomingMessageStore;
+  if (!store) {
+    return;
+  }
+
+  const run = incomingMessageStoreQueue
+    .catch(() => {
+      // Keep the storage queue alive after a previous failure.
+    })
+    .then(async () => {
+      await store.saveInternalMemory(record);
+    });
+
+  incomingMessageStoreQueue = run.catch(() => {
+    // Keep the storage queue alive after a previous failure.
+  });
+
+  await run;
+}
+
 function writeMonitorEvent(res: ServerResponse, payload: MonitorSnapshot | MonitorEvent, eventName = "message"): void {
   res.write(`event: ${eventName}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -2595,6 +2640,11 @@ function formatUnreadMessagesForModel(messages: readonly PendingModelMessage[]):
 
 function formatMemoryLine(record: StoredMemoryRecord): string | null {
   const receivedAt = record.receivedAt ?? "unknown_time";
+  if (record.source === "holly_internal") {
+    const content = record.displayText?.trim() || record.rawMessage?.trim() || "";
+    return content ? `[${receivedAt}] Holly internal memory: ${compactSameGroupConversationContent(content)}` : null;
+  }
+
   const senderName = record.senderName ?? "unknown_user";
   const userId = record.userId ?? "unknown_user_id";
   const contentSource = record.displayText?.trim() || record.rawMessage?.trim();
@@ -2861,6 +2911,10 @@ async function buildMemoryPrompt(
     groupId: contextGroupId,
     limit: THREAD_CANDIDATE_LIMIT + 1,
   });
+  const internalMemories = await store.listRecentMemories({
+    messageType: "internal_memory",
+    limit: INTERNAL_MEMORY_LOOKBACK_LIMIT,
+  });
 
   const excludedMessageSet = new Set(excludedMessages.map((message) => message.trim()));
   const scoredMemories = memories
@@ -2888,7 +2942,11 @@ async function buildMemoryPrompt(
     })
     .filter((line): line is string => Boolean(line));
 
-  if (lines.length === 0) {
+  const internalLines = internalMemories
+    .map((record) => formatMemoryLine(record))
+    .filter((line): line is string => Boolean(line));
+
+  if (lines.length === 0 && internalLines.length === 0) {
     return "";
   }
 
@@ -2897,7 +2955,14 @@ async function buildMemoryPrompt(
     `- Retrieval scope: group_id=${contextGroupId}, recent_group_messages=${THREAD_CANDIDATE_LIMIT}`,
     `- Thread rule: time proximity + directed-to-Holly + participant link + text similarity`,
     `- Returned memories: ${lines.length}`,
-    lines.join("\n"),
+    ...(lines.length > 0 ? [lines.join("\n")] : ["(none)"]),
+    ...(internalLines.length > 0
+      ? [
+          "",
+          "Holly's own recent internal memories:",
+          internalLines.join("\n"),
+        ]
+      : []),
     "Use these memories only as conversation context. Prioritize the current incoming message if there is any conflict.",
   ].join("\n");
 }
@@ -3543,7 +3608,23 @@ function appendProactiveShadowLog(record: Record<string, unknown>): void {
 }
 
 const WORLD_OBSERVATION_LOG_PATH = join(LOG_DIR, "world-observations.jsonl");
+const HOLLY_MEMORY_LOG_PATH = join(LOG_DIR, "holly-memories.jsonl");
 const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
+const MEMORY_REFLECTION_WORLD_LIMIT = 6;
+const MEMORY_REFLECTION_INTERNAL_LIMIT = 6;
+const MEMORY_REFLECTION_TURN_LIMIT = 16;
+
+const MEMORY_REFLECTION_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["should_write", "topic", "memory", "reason"],
+  properties: {
+    should_write: { type: "boolean" },
+    topic: { type: "string" },
+    memory: { type: "string" },
+    reason: { type: "string" },
+  },
+};
 
 function appendWorldObservationLog(record: Record<string, unknown>): void {
   proactiveShadowQueue = proactiveShadowQueue
@@ -3553,6 +3634,17 @@ function appendWorldObservationLog(record: Record<string, unknown>): void {
     })
     .catch((error) => {
       console.error("Failed to write world observation log:", error);
+    });
+}
+
+function appendHollyMemoryLog(record: Record<string, unknown>): void {
+  proactiveShadowQueue = proactiveShadowQueue
+    .then(async () => {
+      await mkdir(LOG_DIR, { recursive: true });
+      await appendFile(HOLLY_MEMORY_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to write Holly memory log:", error);
     });
 }
 
@@ -3709,6 +3801,171 @@ async function observeWorldForAutonomy(
   return worldObservation;
 }
 
+function compactReflectionText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
+}
+
+function formatWorldObservationsForReflection(nowMs: number): string[] {
+  return [...worldObservationMemory]
+    .filter((item) => nowMs - item.observedAtMs <= 24 * 60 * 60 * 1000)
+    .slice(-MEMORY_REFLECTION_WORLD_LIMIT)
+    .map((item, index) => [
+      `World observation ${index + 1}:`,
+      `- observed_at: ${new Date(item.observedAtMs).toISOString()}`,
+      `- topic: ${item.topic}`,
+      `- query: ${item.observation.query}`,
+      `- urls: ${item.observation.urls.slice(0, 3).join(" ") || "(none)"}`,
+      `- summary: ${compactReflectionText(item.observation.summary, 900)}`,
+    ].join("\n"));
+}
+
+async function formatInternalMemoriesForReflection(): Promise<string[]> {
+  const store = incomingMessageStore;
+  if (!store) return [];
+  const memories = await store.listRecentMemories({
+    messageType: "internal_memory",
+    limit: MEMORY_REFLECTION_INTERNAL_LIMIT,
+  });
+  return memories
+    .map((record, index) => {
+      const content = record.displayText?.trim() || record.rawMessage?.trim() || "";
+      if (!content) return null;
+      return [
+        `Internal memory ${index + 1}:`,
+        `- written_at: ${record.receivedAt ?? "unknown"}`,
+        `- content: ${compactReflectionText(content, 600)}`,
+      ].join("\n");
+    })
+    .filter((line): line is string => Boolean(line));
+}
+
+function formatRecentTurnsForReflection(): string[] {
+  const turns = Array.from(conversationHistoryByGroup.entries())
+    .flatMap(([groupKey, turnsForGroup]) =>
+      turnsForGroup.map((turn) => ({
+        groupKey,
+        turn,
+        ms: Date.parse(turn.timestamp),
+      })),
+    )
+    .filter((item) => Number.isFinite(item.ms))
+    .sort((left, right) => right.ms - left.ms)
+    .slice(0, MEMORY_REFLECTION_TURN_LIMIT)
+    .reverse();
+
+  if (turns.length === 0) return [];
+  return [
+    [
+      "Recent conversation:",
+      ...turns.map((item) => {
+        const speaker = item.turn.role === "assistant"
+          ? "Holly"
+          : `${item.turn.senderName ?? "someone"}(${item.turn.userId ?? "unknown"})`;
+        return `- [${item.turn.timestamp}] group=${item.groupKey} ${speaker}: ${compactReflectionText(item.turn.content, 240)}`;
+      }),
+    ].join("\n"),
+  ];
+}
+
+function parseMemoryReflection(raw: string): { topic: string; content: string; reason: string } | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(unwrapJsonBlock(raw)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  if (parsed.should_write !== true) return null;
+  const topic = typeof parsed.topic === "string" ? parsed.topic.trim() : "";
+  const content = typeof parsed.memory === "string" ? parsed.memory.trim() : "";
+  const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : "";
+  if (!topic || !content) return null;
+  return {
+    topic: compactReflectionText(topic, 120),
+    content: compactReflectionText(content, 1600),
+    reason: compactReflectionText(reason || "scheduled memory reflection", 240),
+  };
+}
+
+async function reflectMemoryForAutonomy(
+  request: AutonomyMemoryReflectionRequest,
+): Promise<AutonomyMemoryWriteRequest | null> {
+  const client = activeLlmClient;
+  if (!client) return null;
+
+  const nowMs = Date.parse(request.nowIso);
+  const worldBlocks = formatWorldObservationsForReflection(Number.isFinite(nowMs) ? nowMs : Date.now());
+  const internalBlocks = await formatInternalMemoriesForReflection();
+  const conversationBlocks = formatRecentTurnsForReflection();
+  const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
+  if (material.length === 0) return null;
+
+  const prompt = [
+    "You are Holly's private memory and reflection loop.",
+    "Decide whether there is one useful internal memory to write for Holly.",
+    "Good memories are compact, reusable, and about Holly's interests, observations, preferences, unfinished thoughts, or patterns in recent interactions.",
+    "Do not write a memory if the material is trivial, duplicate, or only a transient implementation detail.",
+    "Return JSON only with this shape:",
+    '{"should_write": true, "topic": "short topic", "memory": "one compact internal memory in Chinese or natural mixed Chinese/English", "reason": "short reason"}',
+    "If nothing is worth remembering, set should_write=false and leave topic/memory empty.",
+    "",
+    `now=${request.nowIso}`,
+    `reason=${request.reason}`,
+    "",
+    material.join("\n\n"),
+  ].join("\n");
+
+  let reply: string;
+  try {
+    reply = await client.generateText({
+      systemPrompt: "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.",
+      messages: [{ role: "user", content: prompt }],
+      jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
+    });
+  } catch (error) {
+    pushMonitorEntry("error", "Autonomy Reflection Model Error", error instanceof Error ? error.message : String(error));
+    return null;
+  }
+
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+
+  const reflected = parseMemoryReflection(reply);
+  if (!reflected) return null;
+  return {
+    topic: reflected.topic,
+    reason: reflected.reason,
+    content: reflected.content,
+  };
+}
+
+async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Promise<void> {
+  const now = new Date().toISOString();
+  const record = {
+    ts: now,
+    action: "write_memory",
+    topic: request.topic,
+    reason: request.reason,
+    content: request.content,
+    query: request.observation?.query ?? "",
+    urls: request.observation?.urls ?? [],
+  };
+  appendHollyMemoryLog(record);
+  await persistInternalMemory({
+    receivedAt: now,
+    content: request.content,
+    topic: request.topic,
+    reason: request.reason,
+    urls: request.observation?.urls ?? [],
+  });
+}
+
 // Gate B (6A): reuse the exact cached system + global-history prefix a reactive
 // reply uses; the proactive instruction rides only in the current-message slot,
 // so this call hits the 1h prompt cache instead of reprocessing the full context.
@@ -3839,6 +4096,8 @@ function buildAutonomyDeps() {
     getState: () => store.getAutonomyState(),
     saveState: () => store.save(),
     observeWorld: observeWorldForAutonomy,
+    reflectMemory: reflectMemoryForAutonomy,
+    writeMemory: writeMemoryForAutonomy,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
     log: (kind: "status" | "error", title: string, body: string) => {
       pushMonitorEntry(kind, title, body);
@@ -5012,7 +5271,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}`,
   );
   pushMonitorEntry(
     "status",

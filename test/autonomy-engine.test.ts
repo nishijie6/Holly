@@ -19,6 +19,10 @@ function baseConfig(overrides: Partial<AutonomyConfig> = {}): AutonomyConfig {
     worldObservationRetryMs: 10 * MIN,
     maxWorldObservationsPerDay: 3,
     worldTopics: ["AI latest", "astronomy latest"],
+    memoryReflectionEnabled: true,
+    memoryReflectionIntervalMs: 30 * MIN,
+    memoryReflectionRetryMs: 10 * MIN,
+    maxMemoryReflectionsPerDay: 3,
     ...overrides,
   };
 }
@@ -30,6 +34,10 @@ function baseState(overrides: Partial<AutonomyLoopState> = {}): AutonomyLoopStat
     worldObservationDailyDate: "2026-01-01",
     worldObservationDailyCount: 0,
     nextWorldTopicIndex: 0,
+    lastMemoryReflectionAt: 0,
+    lastMemoryReflectionAttemptAt: 0,
+    memoryReflectionDailyDate: "2026-01-01",
+    memoryReflectionDailyCount: 0,
     ...overrides,
   };
 }
@@ -42,9 +50,11 @@ const OBSERVATION: ProactiveWorldObservation = {
 
 const EMPTY_PROACTIVE: ProactiveTickResult = { actions: [] };
 
-test("autonomy loop observes the world before group proactive work when due", async () => {
+test("autonomy loop observes the world without writing memory immediately", async () => {
   const state = baseState();
   let observeCalls = 0;
+  let memoryCalls = 0;
+  let reflectionCalls = 0;
   let groupCalls = 0;
   const records: Record<string, unknown>[] = [];
 
@@ -58,6 +68,15 @@ test("autonomy loop observes the world before group proactive work when due", as
       assert.equal(request.topic, "AI latest");
       return OBSERVATION;
     },
+    reflectMemory: async () => {
+      reflectionCalls += 1;
+      return null;
+    },
+    writeMemory: async (request) => {
+      memoryCalls += 1;
+      assert.equal(request.topic, "AI latest");
+      assert.match(request.content, /World observation about AI latest/);
+    },
     runGroupProactiveAction: async () => {
       groupCalls += 1;
       return EMPTY_PROACTIVE;
@@ -68,12 +87,61 @@ test("autonomy loop observes the world before group proactive work when due", as
 
   assert.equal(result.action.type, "observe_world");
   assert.equal(observeCalls, 1);
+  assert.equal(reflectionCalls, 0);
+  assert.equal(memoryCalls, 0);
   assert.equal(groupCalls, 0);
   assert.equal(state.worldObservationDailyCount, 1);
   assert.equal(state.lastWorldObservationAt, NOW);
   assert.equal(state.nextWorldTopicIndex, 1);
   assert.equal(records.length, 1);
   assert.equal(records[0].ok, true);
+});
+
+test("autonomy loop writes memory from the independent reflection loop", async () => {
+  const state = baseState({ lastWorldObservationAt: NOW - 5 * MIN });
+  let observeCalls = 0;
+  let reflectionCalls = 0;
+  let memoryCalls = 0;
+  let groupCalls = 0;
+
+  const result = await runAutonomyLoop({
+    now: () => NOW,
+    config: baseConfig(),
+    getState: () => state,
+    saveState: async () => {},
+    observeWorld: async () => {
+      observeCalls += 1;
+      return OBSERVATION;
+    },
+    reflectMemory: async (request) => {
+      reflectionCalls += 1;
+      assert.equal(request.reason, "scheduled memory reflection");
+      return {
+        topic: "AI interest",
+        reason: "scheduled memory reflection",
+        content: "Holly wants to keep tracking small AI research updates.",
+      };
+    },
+    writeMemory: async (request) => {
+      memoryCalls += 1;
+      assert.equal(request.topic, "AI interest");
+      assert.match(request.content, /tracking/);
+    },
+    runGroupProactiveAction: async () => {
+      groupCalls += 1;
+      return EMPTY_PROACTIVE;
+    },
+    log: () => {},
+    recordWorldObservation: () => {},
+  });
+
+  assert.equal(result.action.type, "write_memory");
+  assert.equal(observeCalls, 0);
+  assert.equal(reflectionCalls, 1);
+  assert.equal(memoryCalls, 1);
+  assert.equal(groupCalls, 0);
+  assert.equal(state.memoryReflectionDailyCount, 1);
+  assert.equal(state.lastMemoryReflectionAt, NOW);
 });
 
 test("autonomy loop falls back to group proactive action when world observation is not due", async () => {
@@ -101,6 +169,8 @@ test("autonomy loop falls back to group proactive action when world observation 
       observeCalls += 1;
       return OBSERVATION;
     },
+    reflectMemory: async () => null,
+    writeMemory: async () => {},
     runGroupProactiveAction: async () => {
       groupCalls += 1;
       return groupResult;

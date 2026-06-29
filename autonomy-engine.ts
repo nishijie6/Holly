@@ -16,6 +16,10 @@ export type AutonomyConfig = {
   worldObservationRetryMs: number;
   maxWorldObservationsPerDay: number;
   worldTopics: string[];
+  memoryReflectionEnabled: boolean;
+  memoryReflectionIntervalMs: number;
+  memoryReflectionRetryMs: number;
+  maxMemoryReflectionsPerDay: number;
 };
 
 export type AutonomyLoopState = {
@@ -24,6 +28,10 @@ export type AutonomyLoopState = {
   worldObservationDailyDate: string;
   worldObservationDailyCount: number;
   nextWorldTopicIndex: number;
+  lastMemoryReflectionAt: number;
+  lastMemoryReflectionAttemptAt: number;
+  memoryReflectionDailyDate: string;
+  memoryReflectionDailyCount: number;
 };
 
 export type AutonomyWorldObservationRequest = {
@@ -35,7 +43,12 @@ export type AutonomyMemoryWriteRequest = {
   topic: string;
   reason: string;
   content: string;
-  observation: ProactiveWorldObservation;
+  observation?: ProactiveWorldObservation | null;
+};
+
+export type AutonomyMemoryReflectionRequest = {
+  reason: string;
+  nowIso: string;
 };
 
 export type AutonomyDeps = {
@@ -44,6 +57,7 @@ export type AutonomyDeps = {
   getState: () => AutonomyLoopState;
   saveState: () => Promise<void>;
   observeWorld: (request: AutonomyWorldObservationRequest) => Promise<ProactiveWorldObservation | null>;
+  reflectMemory: (request: AutonomyMemoryReflectionRequest) => Promise<AutonomyMemoryWriteRequest | null>;
   writeMemory: (request: AutonomyMemoryWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
   log: (kind: "status" | "error", title: string, body: string) => void;
@@ -66,6 +80,10 @@ function rollAutonomyDaily(state: AutonomyLoopState, now: number): void {
   if (state.worldObservationDailyDate !== today) {
     state.worldObservationDailyDate = today;
     state.worldObservationDailyCount = 0;
+  }
+  if (state.memoryReflectionDailyDate !== today) {
+    state.memoryReflectionDailyDate = today;
+    state.memoryReflectionDailyCount = 0;
   }
 }
 
@@ -92,20 +110,19 @@ function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now:
   return true;
 }
 
-function compactMemoryText(text: string, maxChars: number): string {
-  const normalized = text.replace(/\s+/g, " ").trim();
-  if (normalized.length <= maxChars) return normalized;
-  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trim()}...`;
-}
-
-function buildWorldObservationMemory(topic: string, observation: ProactiveWorldObservation): string {
-  const sources = observation.urls.length > 0
-    ? ` Sources: ${observation.urls.slice(0, 3).join(" ")}`
-    : "";
-  return compactMemoryText(
-    `World observation about ${topic}. Query: ${observation.query}. ${observation.summary}${sources}`,
-    1600,
-  );
+function memoryReflectionDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
+  if (!cfg.memoryReflectionEnabled) return false;
+  if (state.memoryReflectionDailyCount >= cfg.maxMemoryReflectionsPerDay) return false;
+  if (state.lastMemoryReflectionAt > 0 && now - state.lastMemoryReflectionAt < cfg.memoryReflectionIntervalMs) {
+    return false;
+  }
+  if (
+    state.lastMemoryReflectionAttemptAt > 0 &&
+    now - state.lastMemoryReflectionAttemptAt < cfg.memoryReflectionRetryMs
+  ) {
+    return false;
+  }
+  return true;
 }
 
 export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopResult> {
@@ -149,28 +166,6 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         observation ? "Autonomy observe_world" : "Autonomy observe_world empty",
         `topic=${topic}\nquery=${observation?.query ?? ""}\nsources=${observation?.urls.length ?? 0}`,
       );
-      if (observation) {
-        const memoryContent = buildWorldObservationMemory(topic, observation);
-        try {
-          await deps.writeMemory({
-            topic,
-            reason: "memorize successful world observation",
-            content: memoryContent,
-            observation,
-          });
-          deps.log("status", "Autonomy write_memory", `topic=${topic}\nchars=${memoryContent.length}`);
-          return {
-            action: {
-              type: "write_memory",
-              topic,
-              reason: "memorize successful world observation",
-              content: memoryContent,
-            },
-          };
-        } catch (error) {
-          deps.log("error", "Autonomy write_memory failed", error instanceof Error ? error.message : String(error));
-        }
-      }
       return {
         action: {
           type: "observe_world",
@@ -180,6 +175,39 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         },
       };
     }
+  }
+
+  if (memoryReflectionDue(cfg, state, now)) {
+    const reason = "scheduled memory reflection";
+    state.lastMemoryReflectionAttemptAt = now;
+    state.memoryReflectionDailyCount += 1;
+    let memory: AutonomyMemoryWriteRequest | null = null;
+    try {
+      memory = await deps.reflectMemory({ reason, nowIso: new Date(now).toISOString() });
+    } catch (error) {
+      deps.log("error", "Autonomy memory reflection failed", error instanceof Error ? error.message : String(error));
+    }
+
+    if (memory) {
+      try {
+        await deps.writeMemory(memory);
+        state.lastMemoryReflectionAt = now;
+        await deps.saveState();
+        deps.log("status", "Autonomy write_memory", `topic=${memory.topic}\nchars=${memory.content.length}`);
+        return {
+          action: {
+            type: "write_memory",
+            topic: memory.topic,
+            reason: memory.reason,
+            content: memory.content,
+          },
+        };
+      } catch (error) {
+        deps.log("error", "Autonomy write_memory failed", error instanceof Error ? error.message : String(error));
+      }
+    }
+
+    await deps.saveState();
   }
 
   const groupResult = await deps.runGroupProactiveAction();
