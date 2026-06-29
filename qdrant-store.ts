@@ -40,12 +40,21 @@ export type IncomingMessageStore = {
   collectionName: string;
   description: string;
   saveMessage(record: IncomingMessageRecord): Promise<void>;
+  saveInternalMemory(record: InternalMemoryRecord): Promise<void>;
   listRecentMemories(input: {
     groupId?: string | null;
     userId?: string | null;
     messageType?: string | null;
     limit: number;
   }): Promise<StoredMemoryRecord[]>;
+};
+
+export type InternalMemoryRecord = {
+  receivedAt: string;
+  content: string;
+  topic?: string | null;
+  reason?: string | null;
+  urls?: string[];
 };
 
 export type StoredMemoryRecord = {
@@ -288,6 +297,40 @@ export async function createIncomingMessageStore(
               user_id: record.userId,
               sender_name: record.senderName,
               raw_message: record.rawMessage,
+            },
+          },
+        ],
+      }));
+    },
+    async saveInternalMemory(record): Promise<void> {
+      await withQdrantRetry(() => client.upsert(config.collectionName, {
+        wait: true,
+        points: [
+          {
+            id: randomUUID(),
+            vector: STORAGE_VECTOR,
+            payload: {
+              schema_version: 1,
+              session_id: sessionId,
+              session_started_at: sessionStartedAt,
+              ws_target_url: options.wsTargetUrl ?? null,
+              source: "holly_internal",
+              sequence: null,
+              received_at: record.receivedAt,
+              is_binary: false,
+              raw_encoding: "utf8",
+              raw_content: record.content,
+              binary_size: null,
+              display_text: record.content,
+              message_type: "internal_memory",
+              group_id: null,
+              group_name: null,
+              user_id: "holly",
+              sender_name: "Holly",
+              raw_message: record.content,
+              memory_topic: record.topic ?? null,
+              memory_reason: record.reason ?? null,
+              memory_urls: record.urls ?? [],
             },
           },
         ],

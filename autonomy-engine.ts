@@ -7,7 +7,7 @@ export type AutonomyAction =
   | { type: "do_nothing"; reason: string }
   | { type: "observe_world"; topic: string; reason: string; observed: boolean }
   | { type: "send_group_message"; reason: string; actions: ProactiveTickResult["actions"] }
-  | { type: "write_memory"; reason: string; content: string };
+  | { type: "write_memory"; topic: string; reason: string; content: string };
 
 export type AutonomyConfig = {
   enabled: boolean;
@@ -31,12 +31,20 @@ export type AutonomyWorldObservationRequest = {
   reason: string;
 };
 
+export type AutonomyMemoryWriteRequest = {
+  topic: string;
+  reason: string;
+  content: string;
+  observation: ProactiveWorldObservation;
+};
+
 export type AutonomyDeps = {
   now: () => number;
   config: AutonomyConfig;
   getState: () => AutonomyLoopState;
   saveState: () => Promise<void>;
   observeWorld: (request: AutonomyWorldObservationRequest) => Promise<ProactiveWorldObservation | null>;
+  writeMemory: (request: AutonomyMemoryWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
   log: (kind: "status" | "error", title: string, body: string) => void;
   recordWorldObservation: (record: Record<string, unknown>) => void;
@@ -84,6 +92,22 @@ function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now:
   return true;
 }
 
+function compactMemoryText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 1)).trim()}...`;
+}
+
+function buildWorldObservationMemory(topic: string, observation: ProactiveWorldObservation): string {
+  const sources = observation.urls.length > 0
+    ? ` Sources: ${observation.urls.slice(0, 3).join(" ")}`
+    : "";
+  return compactMemoryText(
+    `World observation about ${topic}. Query: ${observation.query}. ${observation.summary}${sources}`,
+    1600,
+  );
+}
+
 export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopResult> {
   const cfg = deps.config;
   if (!cfg.enabled) {
@@ -125,6 +149,28 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         observation ? "Autonomy observe_world" : "Autonomy observe_world empty",
         `topic=${topic}\nquery=${observation?.query ?? ""}\nsources=${observation?.urls.length ?? 0}`,
       );
+      if (observation) {
+        const memoryContent = buildWorldObservationMemory(topic, observation);
+        try {
+          await deps.writeMemory({
+            topic,
+            reason: "memorize successful world observation",
+            content: memoryContent,
+            observation,
+          });
+          deps.log("status", "Autonomy write_memory", `topic=${topic}\nchars=${memoryContent.length}`);
+          return {
+            action: {
+              type: "write_memory",
+              topic,
+              reason: "memorize successful world observation",
+              content: memoryContent,
+            },
+          };
+        } catch (error) {
+          deps.log("error", "Autonomy write_memory failed", error instanceof Error ? error.message : String(error));
+        }
+      }
       return {
         action: {
           type: "observe_world",
