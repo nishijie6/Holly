@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 import { WebSocket, type RawData } from "ws";
 import YAML from "yaml";
 import {
+  observeUrlWithBrowserAgent,
+  type BrowserAgentConfig,
+} from "./browser-agent.js";
+import {
   createLlmClient,
   consumeLatestCallTokenUsage,
   getLatestClaudeUsage,
@@ -52,6 +56,33 @@ type MonitorConversationPreview = {
   compressed: boolean;
   contextLimitTokens: number;
   compressThresholdTokens: number;
+};
+
+type ReflectTodayRecord = {
+  id: string;
+  createdAt: string;
+  date: string;
+  topic: string;
+  reason: string;
+  content: string;
+  source: "manual";
+  model: string | null;
+};
+
+type ReflectTodaySnapshot = {
+  date: string;
+  count: number;
+  lastRunAt: string | null;
+  running: boolean;
+  records: ReflectTodayRecord[];
+};
+
+type ReflectRunResult = {
+  ok: boolean;
+  written: boolean;
+  message: string;
+  record: ReflectTodayRecord | null;
+  reflectToday: ReflectTodaySnapshot;
 };
 
 type ParsedIncomingMessage = Omit<IncomingMessageRecord, "sequence"> & {
@@ -134,6 +165,7 @@ type RuntimeLlmConfig = {
 type AppConfig = {
   llm?: RuntimeLlmConfig;
   fetch?: { proxy_url?: string };
+  browser_agent?: Record<string, unknown>;
 };
 
 type ContextBudgetConfig = {
@@ -154,6 +186,7 @@ type MonitorSnapshot = {
   status: MonitorStatus;
   history: MonitorEntry[];
   conversationPreview: MonitorConversationPreview | null;
+  reflectToday: ReflectTodaySnapshot;
   claudeUsage: ClaudeUsage | null;
   tokenStats: DailyTokenStats;
 };
@@ -183,6 +216,10 @@ type MonitorEvent =
   | {
       type: "tokens";
       tokenStats: DailyTokenStats;
+    }
+  | {
+      type: "reflect";
+      reflectToday: ReflectTodaySnapshot;
     };
 
 type ModelTokenStat = {
@@ -230,6 +267,7 @@ const WS_ACTION_TIMEOUT_MS = 10_000;
 const URL_FETCH_TIMEOUT_MS = 10_000;
 const URL_FETCH_MAX_PER_MESSAGE = 2;
 const URL_CONTENT_MAX_CHARS = 3000;
+const URL_BROWSER_FALLBACK_MIN_CHARS = 240;
 const MEMORY_LOOKBACK_LIMIT = 8;
 const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
@@ -290,6 +328,18 @@ const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
   additionalProperties: false,
 };
 
+const REFLECT_TODAY_JSON_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  properties: {
+    should_write: { type: "boolean" },
+    topic: { type: "string" },
+    reason: { type: "string" },
+    memory: { type: "string" },
+  },
+  required: ["should_write", "topic", "reason", "memory"],
+  additionalProperties: false,
+};
+
 let sessionLogPath: string | null = null;
 let monitorEntryId = 0;
 let wsClient: WebSocket | null = null;
@@ -304,6 +354,17 @@ let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
 let modelQueue: Promise<void> = Promise.resolve();
 let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
+let reflectTodayRecords: ReflectTodayRecord[] = [];
+let reflectRunInFlight = false;
+let browserAgentConfig: BrowserAgentConfig = {
+  enabled: true,
+  executablePath: null,
+  headless: true,
+  timeoutMs: 15_000,
+  settleMs: 1_200,
+  maxTextChars: URL_CONTENT_MAX_CHARS,
+  proxyServer: null,
+};
 // Set whenever the merged global context grows; the warmer only fires when true
 // so quiet periods don't burn rate-limit budget re-warming an unchanged context.
 let globalContextDirty = true;
@@ -383,6 +444,32 @@ async function applyProxyConfig(configPath: string): Promise<void> {
     process.env.https_proxy = proxyUrl;
     process.env.http_proxy = proxyUrl;
   }
+}
+
+function readBoolean(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+async function loadBrowserAgentConfig(configPath: string): Promise<BrowserAgentConfig> {
+  const base = browserAgentConfig;
+  if (!existsSync(configPath)) return base;
+  const raw = await readFile(configPath, "utf-8");
+  const config = (YAML.parse(raw) as AppConfig | null) ?? {};
+  const b = config.browser_agent ?? {};
+  const fetchProxy = config.fetch?.proxy_url?.trim() || null;
+  return {
+    enabled: readBoolean(b.enabled, base.enabled),
+    executablePath: typeof b.executable_path === "string" && b.executable_path.trim()
+      ? b.executable_path.trim()
+      : null,
+    headless: readBoolean(b.headless, base.headless),
+    timeoutMs: normalizePositiveInteger(b.timeout_ms) ?? base.timeoutMs,
+    settleMs: normalizePositiveInteger(b.settle_ms) ?? base.settleMs,
+    maxTextChars: normalizePositiveInteger(b.max_text_chars) ?? base.maxTextChars,
+    proxyServer: typeof b.proxy_server === "string" && b.proxy_server.trim()
+      ? b.proxy_server.trim()
+      : fetchProxy,
+  };
 }
 
 function estimateTextTokens(text: string): number {
@@ -816,17 +903,20 @@ async function switchActiveProfile(profileName: string): Promise<LlmClient> {
 }
 
 async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
+  await applyProxyConfig(CONFIG_PATH);
   const envProfile = process.env.LLM_PROFILE?.trim();
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
   const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
+  browserAgentConfig = nextBrowserAgentConfig;
   pushMonitorEntry(
     "status",
     "Config Reloaded",
-    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens})`,
+    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens})\nBrowser agent: enabled=${browserAgentConfig.enabled}`,
   );
 }
 
@@ -907,6 +997,7 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 }
 
 const TOKEN_STATS_PATH = join(LOG_DIR, "token-usage.json");
+const REFLECT_TODAY_LOG_PATH = join(LOG_DIR, "reflect-today.jsonl");
 
 type ModelTokenCounts = { inputTokens: number; outputTokens: number };
 
@@ -1014,6 +1105,85 @@ function getTokenStatsHistory(limit = 60): { days: DailyTokenStats[]; grandTotal
   const days = limited.map((date) => buildDailyTokenStats(date, tokenStatsByDate.get(date)));
   const grandTotal = days.reduce((sum, day) => sum + day.totalTokens, 0);
   return { days, grandTotal };
+}
+
+function compactReflectText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
+}
+
+function parseReflectTodayRecord(value: unknown): ReflectTodayRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const id = typeof record.id === "string" && record.id.trim() ? record.id : randomUUID();
+  const createdAt = typeof record.createdAt === "string" ? record.createdAt : "";
+  const createdDate = new Date(createdAt);
+  if (!createdAt || Number.isNaN(createdDate.getTime())) return null;
+  const topic = typeof record.topic === "string" ? record.topic.trim() : "";
+  const reason = typeof record.reason === "string" ? record.reason.trim() : "";
+  const content = typeof record.content === "string" ? record.content.trim() : "";
+  if (!content) return null;
+  return {
+    id,
+    createdAt,
+    date: typeof record.date === "string" && record.date.trim() ? record.date : localDateKey(createdDate),
+    topic: topic || "daily reflection",
+    reason,
+    content,
+    source: "manual",
+    model: typeof record.model === "string" ? record.model : null,
+  };
+}
+
+async function loadReflectTodayRecords(): Promise<void> {
+  if (!existsSync(REFLECT_TODAY_LOG_PATH)) return;
+  let raw = "";
+  try {
+    raw = await readFile(REFLECT_TODAY_LOG_PATH, "utf-8");
+  } catch {
+    return;
+  }
+
+  const loaded: ReflectTodayRecord[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const record = parseReflectTodayRecord(JSON.parse(line));
+      if (record) loaded.push(record);
+    } catch {
+      // Ignore corrupt lines in the append-only reflect log.
+    }
+  }
+  reflectTodayRecords = loaded.slice(-200);
+}
+
+async function appendReflectTodayRecord(record: ReflectTodayRecord): Promise<void> {
+  reflectTodayRecords = [...reflectTodayRecords, record].slice(-200);
+  await mkdir(LOG_DIR, { recursive: true });
+  await appendFile(REFLECT_TODAY_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+}
+
+function getReflectTodaySnapshot(): ReflectTodaySnapshot {
+  const date = localDateKey();
+  const records = reflectTodayRecords
+    .filter((record) => record.date === date)
+    .slice()
+    .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt));
+  return {
+    date,
+    count: records.length,
+    lastRunAt: records[0]?.createdAt ?? null,
+    running: reflectRunInFlight,
+    records,
+  };
+}
+
+function broadcastReflectToday(): void {
+  broadcastMonitorEvent({
+    type: "reflect",
+    reflectToday: getReflectTodaySnapshot(),
+  });
 }
 
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
@@ -1465,6 +1635,23 @@ async function fetchUrlContentWithFallback(url: string): Promise<{ url: string; 
   return { url: fallbackUrl, content: fallbackContent };
 }
 
+async function observeUrlWithBrowserFallback(url: string): Promise<{ url: string; content: string } | null> {
+  if (!browserAgentConfig.enabled) return null;
+  pushMonitorEntry("status", "Browser URL Open Start", url);
+  const observed = await observeUrlWithBrowserAgent(url, browserAgentConfig);
+  if (!observed?.text) {
+    pushMonitorEntry("status", "Browser URL Open Empty", url);
+    return null;
+  }
+  const title = observed.title ? `title=${observed.title}\n` : "";
+  const finalUrl = observed.finalUrl && observed.finalUrl !== url ? `final_url=${observed.finalUrl}\n` : "";
+  pushMonitorEntry("status", "Browser URL Open OK", `chars=${observed.text.length} url=${url}`);
+  return {
+    url: observed.finalUrl || url,
+    content: `${title}${finalUrl}${observed.text}`.trim(),
+  };
+}
+
 async function enrichMessageWithUrlContent(message: ParsedIncomingMessage): Promise<ParsedIncomingMessage> {
   if (message.isBinary || message.messageType !== "group" || !message.displayText) {
     return message;
@@ -1482,14 +1669,22 @@ async function enrichMessageWithUrlContent(message: ParsedIncomingMessage): Prom
   for (const url of urls) {
     try {
       const fetched = await fetchUrlContentWithFallback(url);
-      const content = fetched.content;
+      let content = fetched.content;
+      let sourceLabel = "网页内容";
+      if (content.length < URL_BROWSER_FALLBACK_MIN_CHARS) {
+        const observed = await observeUrlWithBrowserFallback(fetched.url || url);
+        if (observed?.content && observed.content.length > content.length) {
+          content = observed.content;
+          sourceLabel = "浏览器观察";
+        }
+      }
       if (content) {
-        fetchedBlocks.push(`[网页内容 ${url}]\n${content}`);
+        fetchedBlocks.push(`[${sourceLabel} ${url}]\n${content}`);
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "URL Fetch Error", `url=${url}\n${detail}`);
-      console.error(`Failed to fetch URL ${url}:`, error);
+      pushMonitorEntry("error", "URL Open Error", `url=${url}\n${detail}`);
+      console.error(`Failed to open URL ${url}:`, error);
     }
   }
 
@@ -1821,6 +2016,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     status: monitorStatus,
     history: monitorHistory,
     conversationPreview: latestConversationPreview,
+    reflectToday: getReflectTodaySnapshot(),
     claudeUsage: getLatestClaudeUsage(),
     tokenStats: getTodayTokenStats(),
   };
@@ -2783,6 +2979,188 @@ async function sendGroupMessage(groupId: number, message: string): Promise<void>
   });
 }
 
+function formatTurnsForReflectToday(): string[] {
+  const today = localDateKey();
+  const turns = Array.from(conversationHistoryByGroup.entries())
+    .flatMap(([groupId, groupTurns]) =>
+      groupTurns.map((turn) => ({
+        groupId,
+        turn,
+        ms: Date.parse(turn.timestamp),
+      })),
+    )
+    .filter((item) => Number.isFinite(item.ms) && localDateKey(new Date(item.ms)) === today)
+    .sort((a, b) => a.ms - b.ms)
+    .slice(-80);
+
+  return turns.map((item) => {
+    const speaker = item.turn.role === "assistant" ? "Holly" : item.turn.senderName || item.turn.userId || "user";
+    return `[${item.turn.timestamp}] group=${item.groupId} ${speaker}: ${compactReflectText(item.turn.content, 240)}`;
+  });
+}
+
+function parseReflectTodayDecision(raw: string): {
+  shouldWrite: boolean;
+  topic: string;
+  reason: string;
+  content: string;
+} {
+  const normalized = unwrapJsonBlock(raw);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(normalized);
+  } catch {
+    throw new Error(`Reflect response is not valid JSON: ${raw}`);
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error(`Reflect response must be a JSON object: ${raw}`);
+  }
+
+  const payload = parsed as Record<string, unknown>;
+  const shouldWrite =
+    payload.should_write === true ||
+    payload.shouldWrite === true ||
+    payload.should_write === "true" ||
+    payload.shouldWrite === "true";
+  return {
+    shouldWrite,
+    topic: readDecisionText(payload.topic || "daily reflection").slice(0, 120),
+    reason: readDecisionText(payload.reason || "manual reflect").slice(0, 240),
+    content: readDecisionText(payload.memory ?? payload.content).slice(0, 1600),
+  };
+}
+
+function makeReflectRunResult(
+  ok: boolean,
+  written: boolean,
+  message: string,
+  record: ReflectTodayRecord | null,
+): ReflectRunResult {
+  return {
+    ok,
+    written,
+    message,
+    record,
+    reflectToday: getReflectTodaySnapshot(),
+  };
+}
+
+async function runReflectTodayOnce(): Promise<ReflectRunResult> {
+  const client = getActiveLlmClient();
+  const turnLines = formatTurnsForReflectToday();
+  if (turnLines.length === 0) {
+    return makeReflectRunResult(true, false, "No same-day conversation context is available.", null);
+  }
+
+  const prior = getReflectTodaySnapshot().records
+    .slice(0, 6)
+    .map((record, index) => [
+      `Memory ${index + 1}:`,
+      `- at: ${record.createdAt}`,
+      `- topic: ${record.topic}`,
+      `- content: ${compactReflectText(record.content, 500)}`,
+    ].join("\n"));
+  const prompt = [
+    `Today is ${localDateKey()}.`,
+    "Decide whether Holly should write one useful private internal memory from today's group chat context.",
+    "Write only durable, useful context: user preferences, recurring topics, important facts, or lessons that should help future replies.",
+    "Do not write trivial chat summaries, duplicate prior memories, transient implementation details, or anything that would make Holly sound less natural.",
+    "",
+    "Recent existing memories today:",
+    prior.length ? prior.join("\n\n") : "(none)",
+    "",
+    "Today's recent conversation turns:",
+    turnLines.join("\n"),
+    "",
+    'Return JSON only: {"should_write": true, "topic": "short topic", "reason": "short reason", "memory": "compact private memory"}',
+    'If nothing is worth remembering, return {"should_write": false, "topic": "", "reason": "not useful", "memory": ""}.',
+  ].join("\n");
+
+  const startedAt = Date.now();
+  const reply = await client.generateText({
+    systemPrompt: "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.",
+    messages: [{ role: "user", content: prompt }],
+    jsonSchema: REFLECT_TODAY_JSON_SCHEMA,
+  });
+
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+
+  const decision = parseReflectTodayDecision(reply);
+  if (!decision.shouldWrite || !decision.content) {
+    pushMonitorEntry(
+      "status",
+      `Reflect Today Skipped - ${formatElapsedDuration(startedAt, Date.now())}`,
+      decision.reason || "Model decided there is nothing useful to remember.",
+      client.model,
+    );
+    return makeReflectRunResult(true, false, decision.reason || "Nothing useful to remember.", null);
+  }
+
+  const now = new Date();
+  const record: ReflectTodayRecord = {
+    id: randomUUID(),
+    createdAt: now.toISOString(),
+    date: localDateKey(now),
+    topic: decision.topic || "daily reflection",
+    reason: decision.reason || "manual reflect",
+    content: decision.content,
+    source: "manual",
+    model: client.model,
+  };
+  await appendReflectTodayRecord(record);
+  pushMonitorEntry(
+    "status",
+    `Reflect Today Written - ${formatElapsedDuration(startedAt, Date.now())}`,
+    `topic=${record.topic}\n${record.content}`,
+    client.model,
+  );
+  return makeReflectRunResult(true, true, "Reflection memory written.", record);
+}
+
+function scheduleReflectTodayRun(): Promise<ReflectRunResult> {
+  if (reflectRunInFlight) {
+    return Promise.resolve(makeReflectRunResult(false, false, "Reflect is already running.", null));
+  }
+
+  reflectRunInFlight = true;
+  broadcastReflectToday();
+  const run = modelQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      try {
+        return await runReflectTodayOnce();
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        pushMonitorEntry("error", "Reflect Today Error", detail);
+        console.error("Reflect today failed:", error);
+        return makeReflectRunResult(false, false, detail, null);
+      }
+    })
+    .then((result) => {
+      reflectRunInFlight = false;
+      const finalResult = {
+        ...result,
+        reflectToday: getReflectTodaySnapshot(),
+      };
+      broadcastReflectToday();
+      return finalResult;
+    });
+
+  modelQueue = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  return run;
+}
+
 async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
   const messages = pendingMessages
     .map((item) => ({
@@ -3334,6 +3712,18 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .usage-table td { text-align: right; padding: 4px 6px; font-variant-numeric: tabular-nums; color: var(--ink); border-bottom: 1px solid rgba(226,232,240,0.5); }
     .usage-table td:first-child { text-align: left; font-family: Consolas,monospace; color: var(--muted); word-break: break-all; }
     .usage-table tr:last-child td { border-bottom: 0; }
+    .reflect-total-row { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 10px; margin-bottom: 14px; }
+    .reflect-stat { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(248,250,252,0.9); }
+    .reflect-stat span { display: block; margin-bottom: 4px; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .reflect-stat b { display: block; font-size: 22px; font-variant-numeric: tabular-nums; color: var(--ink); }
+    .reflect-stat small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; word-break: break-word; }
+    .reflect-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: rgba(255,255,255,0.76); }
+    .reflect-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    .reflect-topic { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; color: var(--ink); }
+    .reflect-time { flex-shrink: 0; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .reflect-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+    .reflect-meta span { border-radius: 999px; padding: 3px 8px; background: #eef2f7; }
+    .reflect-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.55; color: var(--ink); }
     .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
     input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
@@ -3376,6 +3766,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
     @media (max-width: 900px) {
       .g2, .g2l { grid-template-columns: 1fr; }
+      .reflect-total-row { grid-template-columns: 1fr; }
       .fgrid { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 640px) {
@@ -3417,6 +3808,15 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <path stroke-linecap="round" stroke-linejoin="round" d="M3 8a2 2 0 012-2h10a2 2 0 012 2v5a2 2 0 01-2 2H8l-3 3V8z"/>
         </svg>
         <span class="nav-label">Group Talk</span>
+      </li>
+      <li class="nav-item" :class="{active: tab === 'reflect'}" @click="tab = 'reflect'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v6h6"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M20 20v-6h-6"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5.5 9A7 7 0 0117 5.6L20 8.5"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M18.5 15A7 7 0 017 18.4L4 15.5"/>
+        </svg>
+        <span class="nav-label">Reflect</span>
       </li>
       <li class="nav-item" :class="{active: tab === 'usage'}" @click="tab = 'usage'">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -3657,6 +4057,59 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Reflect -->
+    <div v-else-if="tab === 'reflect'">
+      <div class="ph">
+        <div class="ph-eye">Holly</div>
+        <div class="ph-title">Reflect</div>
+        <div class="ph-desc">Build and inspect today's private reflection memories.</div>
+      </div>
+      <div class="panel">
+        <div class="ph2">
+          <span class="ph2-title">Reflect Today</span>
+          <div style="display:flex;gap:8px;align-items:center;">
+            <button class="sec sm" @click="loadReflectToday">Refresh</button>
+            <button class="sm" @click="runReflectToday" :disabled="reflectRunning">{{ reflectRunning ? 'Reflecting...' : 'Try Reflect' }}</button>
+          </div>
+        </div>
+        <div class="pb">
+          <div class="reflect-total-row">
+            <div class="reflect-stat">
+              <span>Date</span>
+              <b>{{ reflectToday.date || '-' }}</b>
+              <small>local day</small>
+            </div>
+            <div class="reflect-stat">
+              <span>Written</span>
+              <b>{{ reflectToday.count || 0 }}</b>
+              <small>memories today</small>
+            </div>
+            <div class="reflect-stat">
+              <span>Last run</span>
+              <b>{{ reflectToday.lastRunAt ? fmtTime(reflectToday.lastRunAt) : '-' }}</b>
+              <small>{{ reflectMsg || 'idle' }}</small>
+            </div>
+          </div>
+
+          <div v-if="reflectErr" class="empty" style="margin-bottom:12px;">{{ reflectErr }}</div>
+          <div v-if="!reflectToday.records || !reflectToday.records.length" class="empty">No reflection memories written today.</div>
+          <template v-else>
+            <article v-for="r in reflectToday.records" :key="r.id" class="reflect-card">
+              <div class="reflect-card-head">
+                <span class="reflect-topic">{{ r.topic || 'daily reflection' }}</span>
+                <span class="reflect-time">{{ fmtTime(r.createdAt) }}</span>
+              </div>
+              <div class="reflect-meta">
+                <span>{{ r.reason || 'manual reflect' }}</span>
+                <span>{{ r.model || '-' }}</span>
+              </div>
+              <div class="reflect-body">{{ r.content }}</div>
+            </article>
+          </template>
+        </div>
+      </div>
+    </div>
+
     <!-- Usage -->
     <div v-else-if="tab === 'usage'">
       <div class="ph">
@@ -3734,6 +4187,10 @@ createApp({
     var tokenStats = ref(null);
     var usageHistory = ref([]);
     var usageGrandTotal = ref(0);
+    var reflectToday = ref({ date: '', count: 0, lastRunAt: null, running: false, records: [] });
+    var reflectRunning = ref(false);
+    var reflectErr = ref('');
+    var reflectMsg = ref('');
     var groupEntries = computed(function() {
       return entries.value.filter(function(e) {
         return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
@@ -3852,6 +4309,10 @@ createApp({
       renderedIds.clear();
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
+      if (payload.reflectToday) {
+        reflectToday.value = payload.reflectToday;
+        reflectRunning.value = !!payload.reflectToday.running;
+      }
       if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
       if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
@@ -3865,6 +4326,11 @@ createApp({
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
       if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); } return; }
+      if (payload.type === 'reflect') {
+        reflectToday.value = payload.reflectToday;
+        reflectRunning.value = !!(payload.reflectToday && payload.reflectToday.running);
+        return;
+      }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -4001,9 +4467,43 @@ createApp({
       }
     }
 
+    function loadReflectToday() {
+      reflectErr.value = '';
+      fetch('/api/reflect/today').then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load reflect data');
+          reflectToday.value = d;
+          reflectRunning.value = !!d.running;
+          reflectMsg.value = 'loaded';
+        });
+      }).catch(function(e) {
+        reflectErr.value = e.message;
+      });
+    }
+
+    function runReflectToday() {
+      reflectErr.value = '';
+      reflectMsg.value = 'queued';
+      reflectRunning.value = true;
+      fetch('/api/reflect/run', { method: 'POST' }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.message || d.error || 'Reflect failed');
+          if (d.reflectToday) { reflectToday.value = d.reflectToday; }
+          reflectRunning.value = !!(d.reflectToday && d.reflectToday.running);
+          reflectMsg.value = d.message || (d.written ? 'written' : 'skipped');
+        });
+      }).catch(function(e) {
+        reflectErr.value = e.message;
+        reflectMsg.value = 'failed';
+      }).finally(function() {
+        if (!reflectToday.value.running) reflectRunning.value = false;
+      });
+    }
+
     watch(tab, function(t) {
       if (t === 'memory') { loadMemories(); loadGroups(); }
       if (t === 'group') { loadGroups(); }
+      if (t === 'reflect') { loadReflectToday(); }
       if (t === 'usage') { loadUsageHistory(); }
     });
 
@@ -4042,13 +4542,14 @@ createApp({
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
       entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
       usageHistory, usageGrandTotal,
+      reflectToday, reflectRunning, reflectErr, reflectMsg,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
       fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
-      loadUsageHistory
+      loadReflectToday, runReflectToday, loadUsageHistory
     };
   }
 }).mount('#app');
@@ -4060,8 +4561,10 @@ createApp({
 async function bootstrap(): Promise<void> {
   await applyProxyConfig(CONFIG_PATH);
   await loadTokenStats();
+  await loadReflectTodayRecords();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
+  const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -4072,6 +4575,7 @@ async function bootstrap(): Promise<void> {
   activeLlmClient = client;
   activeLlmLabel = client.displayName;
   contextBudgetConfig = loadedContextBudgetConfig;
+  browserAgentConfig = loadedBrowserAgentConfig;
   incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
@@ -4081,6 +4585,11 @@ async function bootstrap(): Promise<void> {
     "status",
     "Context Budget Ready",
     `limit=${contextBudgetConfig.limitTokens} tokens\ncompress_at=${contextBudgetConfig.compressThresholdTokens} tokens`,
+  );
+  pushMonitorEntry(
+    "status",
+    "Browser Agent Ready",
+    `enabled=${browserAgentConfig.enabled} headless=${browserAgentConfig.headless} timeout=${browserAgentConfig.timeoutMs}ms`,
   );
 
   connectWebSocketClient();
@@ -4193,6 +4702,17 @@ async function bootstrap(): Promise<void> {
       if (req.method === "POST" && url.pathname === "/api/ws/reconnect") {
         connectWebSocketClient(true);
         sendJson(res, 200, { message: `Reconnecting to ${WS_TARGET_URL}` });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/reflect/today") {
+        sendJson(res, 200, getReflectTodaySnapshot());
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/reflect/run") {
+        const result = await scheduleReflectTodayRun();
+        sendJson(res, result.ok ? 200 : 409, result);
         return;
       }
 
