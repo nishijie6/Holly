@@ -281,11 +281,16 @@ export async function createIncomingMessageStore(
     collectionName: config.collectionName,
     description,
     async saveMessage(record): Promise<void> {
+      // Generate the point id once, OUTSIDE the retry closure: if withQdrantRetry
+      // fires because the first attempt's response was lost after Qdrant already
+      // applied the write, reusing the same id makes the retry an idempotent
+      // overwrite instead of inserting a duplicate point under a fresh id.
+      const pointId = randomUUID();
       await withQdrantRetry(() => client.upsert(config.collectionName, {
         wait: true,
         points: [
           {
-            id: randomUUID(),
+            id: pointId,
             vector: STORAGE_VECTOR,
             payload: {
               schema_version: 1,
@@ -312,11 +317,14 @@ export async function createIncomingMessageStore(
       }));
     },
     async saveInternalMemory(record): Promise<void> {
+      // Same idempotency guard as saveMessage: fix the id before the retry closure
+      // so a retried write overwrites rather than duplicating.
+      const pointId = randomUUID();
       await withQdrantRetry(() => client.upsert(config.collectionName, {
         wait: true,
         points: [
           {
-            id: randomUUID(),
+            id: pointId,
             vector: STORAGE_VECTOR,
             payload: {
               schema_version: 1,
