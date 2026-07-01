@@ -70,6 +70,9 @@ export type StoredMemoryRecord = {
   userId: string | null;
   senderName: string | null;
   rawMessage: string | null;
+  memoryTopic: string | null;
+  memoryReason: string | null;
+  memoryUrls: string[];
 };
 
 type ResolvedQdrantConfig = {
@@ -152,6 +155,9 @@ function asOptionalNumber(value: unknown): number | null {
 }
 
 function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemoryRecord {
+  const memoryUrls = Array.isArray(payload.memory_urls)
+    ? payload.memory_urls.filter((item): item is string => typeof item === "string")
+    : [];
   return {
     sessionId: asOptionalString(payload.session_id),
     sessionStartedAt: asOptionalString(payload.session_started_at),
@@ -165,6 +171,9 @@ function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemory
     userId: asOptionalString(payload.user_id),
     senderName: asOptionalString(payload.sender_name),
     rawMessage: asOptionalString(payload.raw_message),
+    memoryTopic: asOptionalString(payload.memory_topic),
+    memoryReason: asOptionalString(payload.memory_reason),
+    memoryUrls,
   };
 }
 

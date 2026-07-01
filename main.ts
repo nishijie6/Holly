@@ -185,6 +185,7 @@ type MonitorSnapshot = {
   status: MonitorStatus;
   history: MonitorEntry[];
   conversationPreview: MonitorConversationPreview | null;
+  autonomySidebar: AutonomySidebarSnapshot;
   claudeUsage: ClaudeUsage | null;
   tokenStats: DailyTokenStats;
 };
@@ -214,7 +215,43 @@ type MonitorEvent =
   | {
       type: "tokens";
       tokenStats: DailyTokenStats;
+    }
+  | {
+      type: "autonomy";
+      autonomySidebar: AutonomySidebarSnapshot;
     };
+
+type AutonomySidebarMemory = {
+  ts: string;
+  topic: string;
+  reason: string;
+  content: string;
+  urls: string[];
+};
+
+type AutonomySidebarObservation = {
+  observedAt: string;
+  topic: string;
+  query: string;
+  summary: string;
+  urls: string[];
+};
+
+type AutonomySidebarSnapshot = {
+  enabled: boolean;
+  worldObservationEnabled: boolean;
+  memoryReflectionEnabled: boolean;
+  worldObservationDailyCount: number;
+  maxWorldObservationsPerDay: number;
+  memoryReflectionDailyCount: number;
+  maxMemoryReflectionsPerDay: number;
+  lastWorldObservationAtIso: string | null;
+  lastMemoryReflectionAtIso: string | null;
+  latestMemory: AutonomySidebarMemory | null;
+  latestWorldObservation: AutonomySidebarObservation | null;
+  recentMemories: AutonomySidebarMemory[];
+  recentWorldObservations: AutonomySidebarObservation[];
+};
 
 type ModelTokenStat = {
   model: string;
@@ -414,6 +451,7 @@ let browserAgentConfig: BrowserAgentRuntimeConfig = DEFAULT_BROWSER_AGENT_CONFIG
 let browserObservationCache = new Map<string, { observedAtMs: number; observation: ProactiveWorldObservation }>();
 let browserObservationAttemptAtMs = new Map<string, number>();
 let worldObservationMemory: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
+let hollyMemorySidebarRecords: AutonomySidebarMemory[] = [];
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
 let aiToneShadowQueue: Promise<void> = Promise.resolve();
@@ -2195,9 +2233,17 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     status: monitorStatus,
     history: monitorHistory,
     conversationPreview: latestConversationPreview,
+    autonomySidebar: buildAutonomySidebarSnapshot(),
     claudeUsage: getLatestClaudeUsage(),
     tokenStats: getTodayTokenStats(),
   };
+}
+
+function broadcastAutonomySidebar(): void {
+  broadcastMonitorEvent({
+    type: "autonomy",
+    autonomySidebar: buildAutonomySidebarSnapshot(),
+  });
 }
 
 function updateConversationPreview(preview: MonitorConversationPreview | null): void {
@@ -3626,6 +3672,43 @@ const MEMORY_REFLECTION_JSON_SCHEMA = {
   },
 };
 
+function isoFromMs(ms: number): string | null {
+  return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null;
+}
+
+function toSidebarWorldObservation(
+  item: { observedAtMs: number; topic: string; observation: ProactiveWorldObservation },
+): AutonomySidebarObservation {
+  return {
+    observedAt: new Date(item.observedAtMs).toISOString(),
+    topic: item.topic,
+    query: item.observation.query,
+    summary: compactReflectionText(item.observation.summary, 900),
+    urls: item.observation.urls.slice(0, 5),
+  };
+}
+
+function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
+  const state = hollyStateStore?.getAutonomyState() ?? null;
+  const recentMemories = hollyMemorySidebarRecords.slice(-12);
+  const recentWorldObservations = worldObservationMemory.slice(-12).map(toSidebarWorldObservation);
+  return {
+    enabled: autonomyConfig.enabled,
+    worldObservationEnabled: autonomyConfig.worldObservationEnabled,
+    memoryReflectionEnabled: autonomyConfig.memoryReflectionEnabled,
+    worldObservationDailyCount: state?.worldObservationDailyCount ?? 0,
+    maxWorldObservationsPerDay: autonomyConfig.maxWorldObservationsPerDay,
+    memoryReflectionDailyCount: state?.memoryReflectionDailyCount ?? 0,
+    maxMemoryReflectionsPerDay: autonomyConfig.maxMemoryReflectionsPerDay,
+    lastWorldObservationAtIso: isoFromMs(state?.lastWorldObservationAt ?? 0),
+    lastMemoryReflectionAtIso: isoFromMs(state?.lastMemoryReflectionAt ?? 0),
+    latestMemory: recentMemories.at(-1) ?? null,
+    latestWorldObservation: recentWorldObservations.at(-1) ?? null,
+    recentMemories,
+    recentWorldObservations,
+  };
+}
+
 function appendWorldObservationLog(record: Record<string, unknown>): void {
   proactiveShadowQueue = proactiveShadowQueue
     .then(async () => {
@@ -3646,6 +3729,52 @@ function appendHollyMemoryLog(record: Record<string, unknown>): void {
     .catch((error) => {
       console.error("Failed to write Holly memory log:", error);
     });
+}
+
+function toSidebarMemoryRecord(record: Record<string, unknown>): AutonomySidebarMemory | null {
+  const ts = typeof record.ts === "string" ? record.ts : "";
+  const topic = typeof record.topic === "string" ? record.topic : "internal memory";
+  const reason = typeof record.reason === "string" ? record.reason : "";
+  const content = typeof record.content === "string" ? record.content : "";
+  const urls = Array.isArray(record.urls)
+    ? record.urls.filter((item): item is string => typeof item === "string").slice(0, 3)
+    : [];
+  if (!ts || !content) return null;
+  return {
+    ts,
+    topic,
+    reason,
+    content: compactReflectionText(content, 900),
+    urls,
+  };
+}
+
+function rememberHollyMemoryForSidebar(record: Record<string, unknown>): void {
+  const memory = toSidebarMemoryRecord(record);
+  if (!memory) return;
+  hollyMemorySidebarRecords.push(memory);
+  hollyMemorySidebarRecords = hollyMemorySidebarRecords.slice(-12);
+}
+
+async function loadHollyMemorySidebarRecords(): Promise<void> {
+  if (!existsSync(HOLLY_MEMORY_LOG_PATH)) return;
+  let raw = "";
+  try {
+    raw = await readFile(HOLLY_MEMORY_LOG_PATH, "utf-8");
+  } catch {
+    return;
+  }
+  const loaded: AutonomySidebarMemory[] = [];
+  for (const line of raw.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const memory = toSidebarMemoryRecord(JSON.parse(line) as Record<string, unknown>);
+      if (memory) loaded.push(memory);
+    } catch {
+      // Ignore corrupt lines in the append-only memory log.
+    }
+  }
+  hollyMemorySidebarRecords = loaded.slice(-12);
 }
 
 function compactBrowserQueryText(text: string): string {
@@ -3786,6 +3915,7 @@ async function observeWorldForAutonomy(
     observation: worldObservation,
   });
   rememberWorldObservation(request.topic, now, worldObservation);
+  broadcastAutonomySidebar();
   if (browserObservationCache.size > 256) {
     const cutoff = now - browserAgentConfig.cooldownMs;
     for (const [key, value] of browserObservationCache) {
@@ -3957,6 +4087,8 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
     urls: request.observation?.urls ?? [],
   };
   appendHollyMemoryLog(record);
+  rememberHollyMemoryForSidebar(record);
+  broadcastAutonomySidebar();
   await persistInternalMemory({
     receivedAt: now,
     content: request.content,
@@ -4114,7 +4246,10 @@ function scheduleAutonomyTick(): void {
       // Keep the autonomy queue alive after a previous failure.
     })
     .then(async () => {
-      await runAutonomyLoop(deps);
+      const result = await runAutonomyLoop(deps);
+      if (result.action.type === "observe_world" || result.action.type === "write_memory") {
+        broadcastAutonomySidebar();
+      }
     })
     .catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
@@ -4495,6 +4630,25 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .usage-table td { text-align: right; padding: 4px 6px; font-variant-numeric: tabular-nums; color: var(--ink); border-bottom: 1px solid rgba(226,232,240,0.5); }
     .usage-table td:first-child { text-align: left; font-family: Consolas,monospace; color: var(--muted); word-break: break-all; }
     .usage-table tr:last-child td { border-bottom: 0; }
+    .reflect-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
+    .reflect-stat { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(255,255,255,0.72); }
+    .reflect-stat-label { display: block; margin-bottom: 5px; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
+    .reflect-stat b { display: block; font-size: 20px; line-height: 1.2; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .reflect-stat small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.35; word-break: break-word; }
+    .reflect-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+    .reflect-list { display: flex; flex-direction: column; gap: 10px; }
+    .reflect-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(255,255,255,0.78); }
+    .reflect-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
+    .reflect-topic { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; color: var(--ink); }
+    .reflect-time { flex-shrink: 0; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+    .reflect-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
+    .reflect-meta span { border-radius: 999px; padding: 3px 8px; background: #eef2f7; }
+    .reflect-body { white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.55; }
+    .reflect-links { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
+    .reflect-links a { color: var(--accent); font-size: 11px; word-break: break-all; text-decoration: none; }
+    .reflect-links a:hover { text-decoration: underline; }
+    .reflect-pill { border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; background: #e2e8f0; color: #334155; }
+    .reflect-pill.on { background: #ccfbf1; color: #0f766e; }
     .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
     input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
@@ -4536,13 +4690,15 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .msg-body { font-size: 16px; line-height: 1.6; word-break: break-word; white-space: pre-wrap; color: var(--ink); }
     .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
     @media (max-width: 900px) {
-      .g2, .g2l { grid-template-columns: 1fr; }
+      .g2, .g2l, .reflect-split { grid-template-columns: 1fr; }
+      .reflect-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .fgrid { grid-template-columns: 1fr 1fr; }
     }
     @media (max-width: 640px) {
       :root { --sidebar-w: 58px; }
       .brand-name, .brand-sub, .nav-label, .ws-status span:last-child { display: none; }
       .nav-item { justify-content: center; }
+      .reflect-grid { grid-template-columns: 1fr; }
       .fgrid { grid-template-columns: 1fr; }
     }
   </style>
@@ -4578,6 +4734,15 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <path stroke-linecap="round" stroke-linejoin="round" d="M3 8a2 2 0 012-2h10a2 2 0 012 2v5a2 2 0 01-2 2H8l-3 3V8z"/>
         </svg>
         <span class="nav-label">Group Talk</span>
+      </li>
+      <li class="nav-item" :class="{active: tab === 'reflect'}" @click="tab = 'reflect'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 4v6h6"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M20 20v-6h-6"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5.5 9A7 7 0 0117 5.6L20 8.5"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M18.5 15A7 7 0 017 18.4L4 15.5"/>
+        </svg>
+        <span class="nav-label">Reflect</span>
       </li>
       <li class="nav-item" :class="{active: tab === 'usage'}" @click="tab = 'usage'">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -4818,6 +4983,92 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- Reflect -->
+    <div v-else-if="tab === 'reflect'">
+      <div class="ph">
+        <div class="ph-eye">Holly</div>
+        <div class="ph-title">Reflect</div>
+        <div class="ph-desc">Autonomy reflection state, recent internal memories, and world observations.</div>
+      </div>
+      <div v-if="!autonomySidebar" class="empty">Waiting for autonomy snapshot...</div>
+      <template v-else>
+        <div class="reflect-grid">
+          <div class="reflect-stat">
+            <span class="reflect-stat-label">Autonomy</span>
+            <b>{{ autonomySidebar.enabled ? 'On' : 'Off' }}</b>
+            <small>world {{ autonomySidebar.worldObservationEnabled ? 'on' : 'off' }} &middot; reflect {{ autonomySidebar.memoryReflectionEnabled ? 'on' : 'off' }}</small>
+          </div>
+          <div class="reflect-stat">
+            <span class="reflect-stat-label">Reflect today</span>
+            <b>{{ autonomySidebar.memoryReflectionDailyCount }}/{{ autonomySidebar.maxMemoryReflectionsPerDay }}</b>
+            <small>last {{ autonomySidebar.lastMemoryReflectionAtIso ? fmtTime(autonomySidebar.lastMemoryReflectionAtIso) : '-' }}</small>
+          </div>
+          <div class="reflect-stat">
+            <span class="reflect-stat-label">World today</span>
+            <b>{{ autonomySidebar.worldObservationDailyCount }}/{{ autonomySidebar.maxWorldObservationsPerDay }}</b>
+            <small>last {{ autonomySidebar.lastWorldObservationAtIso ? fmtTime(autonomySidebar.lastWorldObservationAtIso) : '-' }}</small>
+          </div>
+          <div class="reflect-stat">
+            <span class="reflect-stat-label">Stored here</span>
+            <b>{{ reflectMemories.length + reflectWorldObservations.length }}</b>
+            <small>{{ reflectMemories.length }} memories &middot; {{ reflectWorldObservations.length }} observations</small>
+          </div>
+        </div>
+
+        <div class="reflect-split">
+          <div class="panel">
+            <div class="ph2">
+              <span class="ph2-title">Memory Reflection</span>
+              <span class="reflect-pill" :class="{on: autonomySidebar.memoryReflectionEnabled}">{{ autonomySidebar.memoryReflectionEnabled ? 'Enabled' : 'Disabled' }}</span>
+            </div>
+            <div class="pb">
+              <div v-if="!reflectMemories.length" class="empty">No internal memories yet.</div>
+              <div v-else class="reflect-list">
+                <article v-for="m in reflectMemories" :key="m.ts + m.topic" class="reflect-card">
+                  <div class="reflect-card-head">
+                    <span class="reflect-topic">{{ m.topic || 'internal memory' }}</span>
+                    <span class="reflect-time">{{ fmtTime(m.ts) }}</span>
+                  </div>
+                  <div class="reflect-meta" v-if="m.reason">
+                    <span>{{ m.reason }}</span>
+                  </div>
+                  <div class="reflect-body">{{ m.content }}</div>
+                  <div class="reflect-links" v-if="m.urls && m.urls.length">
+                    <a v-for="u in m.urls" :key="u" :href="u" target="_blank" rel="noreferrer">{{ u }}</a>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </div>
+
+          <div class="panel">
+            <div class="ph2">
+              <span class="ph2-title">World Observations</span>
+              <span class="reflect-pill" :class="{on: autonomySidebar.worldObservationEnabled}">{{ autonomySidebar.worldObservationEnabled ? 'Enabled' : 'Disabled' }}</span>
+            </div>
+            <div class="pb">
+              <div v-if="!reflectWorldObservations.length" class="empty">No world observations yet.</div>
+              <div v-else class="reflect-list">
+                <article v-for="o in reflectWorldObservations" :key="o.observedAt + o.topic" class="reflect-card">
+                  <div class="reflect-card-head">
+                    <span class="reflect-topic">{{ o.topic || 'world observation' }}</span>
+                    <span class="reflect-time">{{ fmtTime(o.observedAt) }}</span>
+                  </div>
+                  <div class="reflect-meta">
+                    <span>{{ o.query || 'no query' }}</span>
+                  </div>
+                  <div class="reflect-body">{{ o.summary }}</div>
+                  <div class="reflect-links" v-if="o.urls && o.urls.length">
+                    <a v-for="u in o.urls" :key="u" :href="u" target="_blank" rel="noreferrer">{{ u }}</a>
+                  </div>
+                </article>
+              </div>
+            </div>
+          </div>
+        </div>
+      </template>
+    </div>
+
     <!-- Usage -->
     <div v-else-if="tab === 'usage'">
       <div class="ph">
@@ -4925,6 +5176,17 @@ createApp({
     var memMsg = ref('');
     var memPath = ref('/api/memories');
 
+    // Reflect state
+    var autonomySidebar = ref(null);
+    var reflectMemories = computed(function() {
+      var items = autonomySidebar.value && autonomySidebar.value.recentMemories;
+      return Array.isArray(items) ? items.slice().reverse() : [];
+    });
+    var reflectWorldObservations = computed(function() {
+      var items = autonomySidebar.value && autonomySidebar.value.recentWorldObservations;
+      return Array.isArray(items) ? items.slice().reverse() : [];
+    });
+
     // Group Talk state
     var groups = ref([]);
     var selGroupId = ref(null);
@@ -5013,6 +5275,7 @@ createApp({
       renderedIds.clear();
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
+      autonomySidebar.value = payload.autonomySidebar || null;
       if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
       if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
@@ -5026,6 +5289,7 @@ createApp({
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
       if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); } return; }
+      if (payload.type === 'autonomy') { autonomySidebar.value = payload.autonomySidebar || null; return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -5205,6 +5469,7 @@ createApp({
       usageHistory, usageGrandTotal,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
+      autonomySidebar, reflectMemories, reflectWorldObservations,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
       fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
@@ -5246,6 +5511,7 @@ async function bootstrap(): Promise<void> {
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   await loadWorldObservationMemory();
+  await loadHollyMemorySidebarRecords();
   incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
