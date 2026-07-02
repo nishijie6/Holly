@@ -47,6 +47,28 @@ type OpenedTarget = {
 const DEFAULT_PAGE_LOAD_SETTLE_MS = 800;
 type BrowserProcess = ChildProcessByStdio<null, Readable, Readable>;
 
+// A normal desktop-Chrome UA. Headless Chrome's default UA carries
+// "HeadlessChrome/…", which Reddit and other sites use to serve block pages;
+// override it on every navigation. Kept in sync with fetchUrlContent in main.ts.
+const BROWSER_USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+// Injected into every new document before page scripts run. CDP-driven browsers
+// set navigator.webdriver = true, which bot detectors (Reddit included) key on.
+const STEALTH_SCRIPT = [
+  "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
+  "Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });",
+].join("\n");
+
+// Diagnostic emitted per page so callers can surface why a read produced no
+// usable text (hard error vs. empty body) instead of a silent overall null.
+export type BrowserPageDiagnostic = {
+  url: string;
+  status: "empty" | "error";
+  detail: string;
+};
+export type BrowserAgentLogger = (diagnostic: BrowserPageDiagnostic) => void;
+
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -55,6 +77,22 @@ function trimText(text: string, maxChars: number): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, Math.max(0, maxChars - 1)).trim()}…`;
+}
+
+// old.reddit.com is plain server-rendered HTML with far weaker bot detection
+// than the www React SPA, so headless reads land actual post text. Media hosts
+// (i.redd.it, v.redd.it) don't match reddit.com and are left untouched.
+function rewriteForReadability(rawUrl: string): string {
+  try {
+    const url = new URL(rawUrl);
+    if (/(^|\.)reddit\.com$/i.test(url.hostname) && url.hostname !== "old.reddit.com") {
+      url.hostname = "old.reddit.com";
+      return url.toString();
+    }
+  } catch {
+    // Not a parseable URL; navigate as-is.
+  }
+  return rawUrl;
 }
 
 function findBrowserExecutable(configured: string | null): string | null {
@@ -310,11 +348,23 @@ async function readPageWithBrowser(
 ): Promise<BrowserPageObservation> {
   const target = await openTarget(httpOrigin);
   const page = await CdpPage.connect(target.webSocketDebuggerUrl, config.timeoutMs);
+  const navUrl = rewriteForReadability(url);
   try {
     await page.send("Page.enable", {}, config.timeoutMs);
     await page.send("Runtime.enable", {}, config.timeoutMs);
+    // Look like a normal browser: override the HeadlessChrome UA and hide the
+    // webdriver flag before any page script runs. Best-effort — older CDP
+    // builds may not support one of these, so don't fail the whole read.
+    await page.send("Emulation.setUserAgentOverride", {
+      userAgent: BROWSER_USER_AGENT,
+      acceptLanguage: "zh-CN,zh;q=0.9,en;q=0.8",
+      platform: "Win32",
+    }, config.timeoutMs).catch(() => undefined);
+    await page.send("Page.addScriptToEvaluateOnNewDocument", {
+      source: STEALTH_SCRIPT,
+    }, config.timeoutMs).catch(() => undefined);
     const loaded = page.waitForEvent("Page.loadEventFired", config.timeoutMs).catch(() => undefined);
-    await page.send("Page.navigate", { url }, config.timeoutMs);
+    await page.send("Page.navigate", { url: navUrl }, config.timeoutMs);
     await loaded;
     await delay(DEFAULT_PAGE_LOAD_SETTLE_MS);
     const evaluated = await page.send("Runtime.evaluate", {
@@ -325,7 +375,7 @@ async function readPageWithBrowser(
     const raw = readEvalStringValue(evaluated);
     const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : {};
     const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
-    const finalUrl = typeof parsed.url === "string" ? parsed.url.trim() : url;
+    const finalUrl = typeof parsed.url === "string" ? parsed.url.trim() : navUrl;
     const text = typeof parsed.text === "string" ? parsed.text : "";
     return {
       title,
@@ -363,6 +413,7 @@ function formatObservationSummary(query: string, pages: BrowserPageObservation[]
 export async function browseTopicWithBrowserAgent(
   query: string,
   config: BrowserAgentConfig,
+  logger?: BrowserAgentLogger,
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   if (!config.enabled || !cleanQuery) return null;
@@ -377,13 +428,14 @@ export async function browseTopicWithBrowserAgent(
     .slice(0, config.maxPages);
   if (urls.length === 0) return null;
 
-  return browseUrlsWithBrowserAgent(cleanQuery, urls, config);
+  return browseUrlsWithBrowserAgent(cleanQuery, urls, config, logger);
 }
 
 export async function browseUrlsWithBrowserAgent(
   query: string,
   urls: readonly string[],
   config: BrowserAgentConfig,
+  logger?: BrowserAgentLogger,
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   const targetUrls = urls
@@ -397,7 +449,15 @@ export async function browseUrlsWithBrowserAgent(
     launched = await launchBrowser(config);
     const pages: BrowserPageObservation[] = [];
     for (const url of targetUrls) {
-      pages.push(await readPageWithBrowser(launched.httpOrigin, url, config));
+      const page = await readPageWithBrowser(launched.httpOrigin, url, config);
+      pages.push(page);
+      if (logger) {
+        if (page.error) {
+          logger({ url, status: "error", detail: page.error });
+        } else if (!page.excerpt) {
+          logger({ url, status: "empty", detail: `title=${page.title || "(none)"} final=${page.url}` });
+        }
+      }
     }
     const summary = formatObservationSummary(cleanQuery, pages);
     return summary ? { query: cleanQuery, pages, summary } : null;

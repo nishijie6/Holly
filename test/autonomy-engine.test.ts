@@ -17,12 +17,13 @@ function baseConfig(overrides: Partial<AutonomyConfig> = {}): AutonomyConfig {
     worldObservationEnabled: true,
     worldObservationIntervalMs: 60 * MIN,
     worldObservationRetryMs: 10 * MIN,
-    maxWorldObservationsPerDay: 3,
+    worldObservationBroadcastGroupId: null,
     worldTopics: ["AI latest", "astronomy latest"],
     memoryReflectionEnabled: true,
     memoryReflectionIntervalMs: 30 * MIN,
     memoryReflectionRetryMs: 10 * MIN,
-    maxMemoryReflectionsPerDay: 3,
+    memoryReflectionBroadcastGroupId: null,
+    memoryReflectionBroadcastLullMs: 180 * MIN,
     ...overrides,
   };
 }
@@ -95,6 +96,61 @@ test("autonomy loop observes the world without writing memory immediately", asyn
   assert.equal(state.nextWorldTopicIndex, 1);
   assert.equal(records.length, 1);
   assert.equal(records[0].ok, true);
+});
+
+test("autonomy loop does not record an empty world observation", async () => {
+  const state = baseState();
+  const records: Record<string, unknown>[] = [];
+
+  const result = await runAutonomyLoop({
+    now: () => NOW,
+    config: baseConfig(),
+    getState: () => state,
+    saveState: async () => {},
+    observeWorld: async () => null,
+    reflectMemory: async () => null,
+    writeMemory: async () => {},
+    runGroupProactiveAction: async () => EMPTY_PROACTIVE,
+    log: () => {},
+    recordWorldObservation: (record) => records.push(record),
+  });
+
+  assert.equal(result.action.type, "observe_world");
+  assert.equal(result.action.observed, false);
+  assert.equal(state.lastWorldObservationAt, 0);
+  assert.equal(state.lastWorldObservationAttemptAt, NOW);
+  assert.equal(records.length, 0);
+});
+
+test("autonomy loop does not record a failed world observation", async () => {
+  const state = baseState();
+  const records: Record<string, unknown>[] = [];
+  const errors: string[] = [];
+
+  const result = await runAutonomyLoop({
+    now: () => NOW,
+    config: baseConfig(),
+    getState: () => state,
+    saveState: async () => {},
+    observeWorld: async () => {
+      throw new Error("network unavailable");
+    },
+    reflectMemory: async () => null,
+    writeMemory: async () => {},
+    runGroupProactiveAction: async () => EMPTY_PROACTIVE,
+    log: (kind, title, body) => {
+      if (kind === "error") errors.push(`${title}\n${body}`);
+    },
+    recordWorldObservation: (record) => records.push(record),
+  });
+
+  assert.equal(result.action.type, "observe_world");
+  assert.equal(result.action.observed, false);
+  assert.equal(state.lastWorldObservationAt, 0);
+  assert.equal(state.lastWorldObservationAttemptAt, NOW);
+  assert.equal(records.length, 0);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0], /network unavailable/);
 });
 
 test("autonomy loop writes memory from the independent reflection loop", async () => {

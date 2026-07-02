@@ -14,12 +14,13 @@ export type AutonomyConfig = {
   worldObservationEnabled: boolean;
   worldObservationIntervalMs: number;
   worldObservationRetryMs: number;
-  maxWorldObservationsPerDay: number;
+  worldObservationBroadcastGroupId: string | null;
   worldTopics: string[];
   memoryReflectionEnabled: boolean;
   memoryReflectionIntervalMs: number;
   memoryReflectionRetryMs: number;
-  maxMemoryReflectionsPerDay: number;
+  memoryReflectionBroadcastGroupId: string | null;
+  memoryReflectionBroadcastLullMs: number;
 };
 
 export type AutonomyLoopState = {
@@ -97,7 +98,6 @@ function pickWorldTopic(state: AutonomyLoopState, topics: readonly string[]): st
 function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
   if (!cfg.worldObservationEnabled) return false;
   if (cfg.worldTopics.length === 0) return false;
-  if (state.worldObservationDailyCount >= cfg.maxWorldObservationsPerDay) return false;
   if (state.lastWorldObservationAt > 0 && now - state.lastWorldObservationAt < cfg.worldObservationIntervalMs) {
     return false;
   }
@@ -112,7 +112,6 @@ function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now:
 
 function memoryReflectionDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
   if (!cfg.memoryReflectionEnabled) return false;
-  if (state.memoryReflectionDailyCount >= cfg.maxMemoryReflectionsPerDay) return false;
   if (state.lastMemoryReflectionAt > 0 && now - state.lastMemoryReflectionAt < cfg.memoryReflectionIntervalMs) {
     return false;
   }
@@ -152,15 +151,17 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       }
       await deps.saveState();
 
-      deps.recordWorldObservation({
-        ts: new Date(now).toISOString(),
-        action: "observe_world",
-        topic,
-        ok: observation !== null,
-        query: observation?.query ?? "",
-        urls: observation?.urls ?? [],
-        summary: observation?.summary ?? "",
-      });
+      if (observation) {
+        deps.recordWorldObservation({
+          ts: new Date(now).toISOString(),
+          action: "observe_world",
+          topic,
+          ok: true,
+          query: observation.query,
+          urls: observation.urls,
+          summary: observation.summary,
+        });
+      }
       deps.log(
         "status",
         observation ? "Autonomy observe_world" : "Autonomy observe_world empty",

@@ -24,6 +24,7 @@ import {
   type IncomingMessageRecord,
   type IncomingMessageStore,
   type StoredMemoryRecord,
+  type WorldObservationMemoryRecord,
 } from "./qdrant-store.js";
 import { HollyStateStore } from "./holly-state.js";
 import {
@@ -49,7 +50,7 @@ import {
   type BrowserAgentConfig,
   type BrowserTopicObservation,
 } from "./browser-agent.js";
-import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt } from "./decision-prompt.js";
+import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt, detectIncompleteFinalAnswer } from "./decision-prompt.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
@@ -242,9 +243,7 @@ type AutonomySidebarSnapshot = {
   worldObservationEnabled: boolean;
   memoryReflectionEnabled: boolean;
   worldObservationDailyCount: number;
-  maxWorldObservationsPerDay: number;
   memoryReflectionDailyCount: number;
-  maxMemoryReflectionsPerDay: number;
   lastWorldObservationAtIso: string | null;
   lastMemoryReflectionAtIso: string | null;
   latestMemory: AutonomySidebarMemory | null;
@@ -415,12 +414,13 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldObservationEnabled: false,
   worldObservationIntervalMs: 3 * 60 * 60 * 1000,
   worldObservationRetryMs: 15 * 60 * 1000,
-  maxWorldObservationsPerDay: 6,
+  worldObservationBroadcastGroupId: null,
   worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
   memoryReflectionEnabled: false,
   memoryReflectionIntervalMs: 60 * 60 * 1000,
   memoryReflectionRetryMs: 15 * 60 * 1000,
-  maxMemoryReflectionsPerDay: 8,
+  memoryReflectionBroadcastGroupId: null,
+  memoryReflectionBroadcastLullMs: 3 * 60 * 60 * 1000,
 };
 
 let sessionLogPath: string | null = null;
@@ -542,6 +542,14 @@ function readProactiveStringArray(value: unknown, defaultValue: string[]): strin
     .filter(Boolean);
 }
 
+function readOptionalGroupId(value: unknown, defaultValue: string | null): string | null {
+  if (value === null || value === undefined) return defaultValue;
+  const normalized = String(value).trim();
+  if (!normalized) return null;
+  const numeric = Number(normalized);
+  return Number.isSafeInteger(numeric) && numeric > 0 ? normalized : defaultValue;
+}
+
 // Read the optional `proactive:` config section; any missing/invalid field falls
 // back to DEFAULT_PROACTIVE_CONFIG. Durations are authored in minutes for
 // readability and converted to ms here. Hot-reloaded by the config watcher (P4).
@@ -616,9 +624,9 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       a.world_observation_retry_minutes,
       base.worldObservationRetryMs,
     ),
-    maxWorldObservationsPerDay: readProactiveCount(
-      a.max_world_observations_per_day,
-      base.maxWorldObservationsPerDay,
+    worldObservationBroadcastGroupId: readOptionalGroupId(
+      a.world_observation_broadcast_group_id,
+      base.worldObservationBroadcastGroupId,
     ),
     worldTopics: readProactiveStringArray(a.world_topics, base.worldTopics),
     memoryReflectionEnabled:
@@ -633,9 +641,13 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       a.memory_reflection_retry_minutes,
       base.memoryReflectionRetryMs,
     ),
-    maxMemoryReflectionsPerDay: readProactiveCount(
-      a.max_memory_reflections_per_day,
-      base.maxMemoryReflectionsPerDay,
+    memoryReflectionBroadcastGroupId: readOptionalGroupId(
+      a.memory_reflection_broadcast_group_id,
+      base.memoryReflectionBroadcastGroupId,
+    ),
+    memoryReflectionBroadcastLullMs: readProactiveMinutesMs(
+      a.memory_reflection_broadcast_lull_minutes,
+      base.memoryReflectionBroadcastLullMs,
     ),
   };
 }
@@ -2183,6 +2195,27 @@ async function persistInternalMemory(record: InternalMemoryRecord): Promise<void
   await run;
 }
 
+async function persistWorldObservation(record: WorldObservationMemoryRecord): Promise<void> {
+  const store = incomingMessageStore;
+  if (!store) {
+    return;
+  }
+
+  const run = incomingMessageStoreQueue
+    .catch(() => {
+      // Keep the storage queue alive after a previous failure.
+    })
+    .then(async () => {
+      await store.saveWorldObservation(record);
+    });
+
+  incomingMessageStoreQueue = run.catch(() => {
+    // Keep the storage queue alive after a previous failure.
+  });
+
+  await run;
+}
+
 function writeMonitorEvent(res: ServerResponse, payload: MonitorSnapshot | MonitorEvent, eventName = "message"): void {
   res.write(`event: ${eventName}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
@@ -3408,12 +3441,26 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
   // messages remain in history, so the next incoming message still lets the model
   // weigh in on them.
   let decision: ModelDecision | null = null;
+  let rejectedIncompleteFinalAnswer: string | null = null;
   for (let attempt = 1; attempt <= MODEL_DECISION_MAX_ATTEMPTS && decision === null; attempt += 1) {
     let reply: string;
+    const messagesForAttempt: LlmMessage[] = rejectedIncompleteFinalAnswer
+      ? [
+          ...preparedRequest.messages,
+          {
+            role: "user",
+            content: [
+              "Your previous JSON final_answer ended mid-sentence and was rejected locally.",
+              `Rejected final_answer: ${rejectedIncompleteFinalAnswer}`,
+              "Return JSON only for the same unread batch. If replying, final_answer must be a complete sendable message. Keep it short, but do not end with dangling words like 是、因为、但是、不过、然后、比如、例如、问题是.",
+            ].join("\n"),
+          },
+        ]
+      : preparedRequest.messages;
     try {
       reply = await client.generateText({
         systemPrompt: preparedRequest.systemPrompt,
-        messages: preparedRequest.messages,
+        messages: messagesForAttempt,
         jsonSchema: MODEL_DECISION_JSON_SCHEMA,
       });
     } catch (error) {
@@ -3456,6 +3503,30 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       console.error("Model reply invalid; dropping unread batch:", error);
       return;
     }
+
+    const incompleteReason = decision.shouldReply && decision.finalAnswer
+      ? detectIncompleteFinalAnswer(decision.finalAnswer)
+      : null;
+    if (incompleteReason) {
+      if (attempt < MODEL_DECISION_MAX_ATTEMPTS) {
+        rejectedIncompleteFinalAnswer = decision.finalAnswer;
+        pushMonitorEntry(
+          "status",
+          "Model Request Retry",
+          `attempt=${attempt}/${MODEL_DECISION_MAX_ATTEMPTS} (incomplete final_answer: ${incompleteReason})\n${decision.finalAnswer}`,
+        );
+        decision = null;
+        continue;
+      }
+      pushMonitorEntry(
+        "error",
+        "Unread Batch Dropped",
+        `Model final_answer looked incomplete after ${attempt} attempts; dropped (kept in context).\nreason=${incompleteReason}\n${decision.finalAnswer}`,
+      );
+      return;
+    }
+
+    rejectedIncompleteFinalAnswer = null;
   }
 
   if (decision === null) {
@@ -3697,9 +3768,7 @@ function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
     worldObservationEnabled: autonomyConfig.worldObservationEnabled,
     memoryReflectionEnabled: autonomyConfig.memoryReflectionEnabled,
     worldObservationDailyCount: state?.worldObservationDailyCount ?? 0,
-    maxWorldObservationsPerDay: autonomyConfig.maxWorldObservationsPerDay,
     memoryReflectionDailyCount: state?.memoryReflectionDailyCount ?? 0,
-    maxMemoryReflectionsPerDay: autonomyConfig.maxMemoryReflectionsPerDay,
     lastWorldObservationAtIso: isoFromMs(state?.lastWorldObservationAt ?? 0),
     lastMemoryReflectionAtIso: isoFromMs(state?.lastMemoryReflectionAt ?? 0),
     latestMemory: recentMemories.at(-1) ?? null,
@@ -3756,7 +3825,40 @@ function rememberHollyMemoryForSidebar(record: Record<string, unknown>): void {
   hollyMemorySidebarRecords = hollyMemorySidebarRecords.slice(-12);
 }
 
+function toSidebarMemoryFromStoredRecord(record: StoredMemoryRecord): AutonomySidebarMemory | null {
+  return toSidebarMemoryRecord({
+    ts: record.receivedAt ?? "",
+    topic: record.memoryTopic ?? "internal memory",
+    reason: record.memoryReason ?? "",
+    content: record.displayText ?? record.rawMessage ?? "",
+    urls: record.memoryUrls,
+  });
+}
+
+async function loadHollyMemorySidebarRecordsFromQdrant(): Promise<boolean> {
+  const store = incomingMessageStore;
+  if (!store) return false;
+
+  try {
+    const records = await store.listRecentMemories({
+      messageType: "internal_memory",
+      limit: 12,
+    });
+    const loaded = records
+      .map(toSidebarMemoryFromStoredRecord)
+      .filter((record): record is AutonomySidebarMemory => record !== null)
+      .sort((left, right) => Date.parse(left.ts) - Date.parse(right.ts));
+    if (loaded.length === 0) return false;
+    hollyMemorySidebarRecords = loaded.slice(-12);
+    return true;
+  } catch (error) {
+    console.error("Failed to restore Holly memories from Qdrant:", error);
+    return false;
+  }
+}
+
 async function loadHollyMemorySidebarRecords(): Promise<void> {
+  if (await loadHollyMemorySidebarRecordsFromQdrant()) return;
   if (!existsSync(HOLLY_MEMORY_LOG_PATH)) return;
   let raw = "";
   try {
@@ -3815,7 +3917,65 @@ function rememberWorldObservation(topic: string, observedAtMs: number, observati
     .slice(-WORLD_OBSERVATION_MEMORY_LIMIT);
 }
 
+function toWorldObservationMemoryFromStoredRecord(
+  record: StoredMemoryRecord,
+): { observedAtMs: number; topic: string; observation: ProactiveWorldObservation } | null {
+  const observedAtMs = record.receivedAt ? Date.parse(record.receivedAt) : NaN;
+  const topic = record.memoryTopic?.trim() || "world observation";
+  const query = record.memoryQuery?.trim() || topic;
+  const summary = (record.displayText ?? record.rawMessage ?? "").trim();
+  if (!Number.isFinite(observedAtMs) || !summary) return null;
+  return {
+    observedAtMs,
+    topic,
+    observation: {
+      query,
+      summary,
+      urls: record.memoryUrls,
+    },
+  };
+}
+
+function restoreBrowserObservationCacheFromWorldMemory(): void {
+  for (const item of worldObservationMemory) {
+    const query = item.observation.query.trim();
+    if (!query) continue;
+    const cacheKey = browserObservationCacheKey(query);
+    const existing = browserObservationCache.get(cacheKey);
+    if (!existing || existing.observedAtMs < item.observedAtMs) {
+      browserObservationCache.set(cacheKey, {
+        observedAtMs: item.observedAtMs,
+        observation: item.observation,
+      });
+    }
+  }
+}
+
+async function loadWorldObservationMemoryFromQdrant(): Promise<boolean> {
+  const store = incomingMessageStore;
+  if (!store) return false;
+
+  try {
+    const records = await store.listRecentMemories({
+      messageType: "world_observation",
+      limit: WORLD_OBSERVATION_MEMORY_LIMIT,
+    });
+    const loaded = records
+      .map(toWorldObservationMemoryFromStoredRecord)
+      .filter((item): item is { observedAtMs: number; topic: string; observation: ProactiveWorldObservation } => item !== null)
+      .sort((left, right) => left.observedAtMs - right.observedAtMs);
+    if (loaded.length === 0) return false;
+    worldObservationMemory = loaded.slice(-WORLD_OBSERVATION_MEMORY_LIMIT);
+    restoreBrowserObservationCacheFromWorldMemory();
+    return true;
+  } catch (error) {
+    console.error("Failed to restore world observations from Qdrant:", error);
+    return false;
+  }
+}
+
 async function loadWorldObservationMemory(): Promise<void> {
+  if (await loadWorldObservationMemoryFromQdrant()) return;
   if (!existsSync(WORLD_OBSERVATION_LOG_PATH)) return;
   let raw = "";
   try {
@@ -3843,6 +4003,7 @@ async function loadWorldObservationMemory(): Promise<void> {
     }
   }
   worldObservationMemory = loaded.slice(-WORLD_OBSERVATION_MEMORY_LIMIT);
+  restoreBrowserObservationCacheFromWorldMemory();
 }
 
 function findRelevantWorldObservation(request: ProactiveWorldObservationRequest): ProactiveWorldObservation | null {
@@ -3903,7 +4064,13 @@ async function observeWorldForAutonomy(
     `topic=${request.topic}\nquery=${query}`,
   );
 
-  const observed = await browseTopicWithBrowserAgent(query, browserAgentConfig);
+  const observed = await browseTopicWithBrowserAgent(query, browserAgentConfig, (diagnostic) => {
+    pushMonitorEntry(
+      diagnostic.status === "error" ? "error" : "status",
+      "Browser Agent Page Skipped",
+      `topic=${request.topic}\nurl=${diagnostic.url}\n${diagnostic.status}: ${diagnostic.detail}`,
+    );
+  });
   if (!observed) {
     pushMonitorEntry("status", "Browser Agent Empty", `topic=${request.topic}\nquery=${query}`);
     return null;
@@ -3916,6 +4083,29 @@ async function observeWorldForAutonomy(
   });
   rememberWorldObservation(request.topic, now, worldObservation);
   broadcastAutonomySidebar();
+  const observedAtIso = new Date(now).toISOString();
+  try {
+    await persistWorldObservation({
+      observedAt: observedAtIso,
+      topic: request.topic,
+      reason: request.reason,
+      query: worldObservation.query,
+      summary: worldObservation.summary,
+      urls: worldObservation.urls,
+      cached: worldObservation.cached === true,
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Qdrant World Observation Store Error", detail);
+    console.error("Failed to store world observation:", error);
+  }
+  try {
+    await maybeBroadcastWorldObservation(request.topic, worldObservation, observedAtIso);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "World Observation Broadcast Failed", detail);
+    console.error("Failed to broadcast world observation:", error);
+  }
   if (browserObservationCache.size > 256) {
     const cutoff = now - browserAgentConfig.cooldownMs;
     for (const [key, value] of browserObservationCache) {
@@ -3935,6 +4125,267 @@ function compactReflectionText(text: string, maxChars: number): string {
   const normalized = text.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxChars) return normalized;
   return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
+}
+
+function broadcastLatestLlmUsage(): void {
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (callTokens) {
+    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  }
+}
+
+function normalizeBroadcastMessage(text: string, maxChars: number): string {
+  return compactReflectionText(
+    text
+      .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-zA-Z0-9_-]*|```/g, " "))
+      .replace(/\r?\n+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+    maxChars,
+  );
+}
+
+function containsChineseText(text: string): boolean {
+  return /[\u3400-\u9fff]/.test(text);
+}
+
+function buildWorldObservationBroadcastPrompt(topic: string, observation: ProactiveWorldObservation): string {
+  return [
+    "Translate and condense this browser world observation into Simplified Chinese for a QQ group.",
+    "Keep the factual content. Do not mention that it was translated.",
+    "Use 2-4 short conversational sentences, no markdown bullets, no @ mentions, and stay under 500 Chinese characters.",
+    "If the source text is noisy, keep only the most useful concrete points.",
+    "",
+    `topic: ${topic}`,
+    `query: ${observation.query}`,
+    `urls: ${observation.urls.slice(0, 3).join(" ") || "(none)"}`,
+    "",
+    "world observation:",
+    observation.summary,
+  ].join("\n");
+}
+
+async function translateWorldObservationForBroadcast(
+  topic: string,
+  observation: ProactiveWorldObservation,
+): Promise<string | null> {
+  const client = activeLlmClient;
+  if (!client) {
+    pushMonitorEntry("status", "World Observation Broadcast Skipped", "LLM client is not initialized.");
+    return null;
+  }
+
+  let reply: string;
+  try {
+    reply = await client.generateText({
+      systemPrompt: "You turn browser observations into concise Simplified Chinese QQ group updates.",
+      messages: [{
+        role: "user",
+        content: buildWorldObservationBroadcastPrompt(topic, observation),
+      }],
+    });
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "World Observation Translate Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  }
+
+  broadcastLatestLlmUsage();
+
+  const message = normalizeBroadcastMessage(reply, 500);
+  if (!message) return null;
+  if (!containsChineseText(message)) {
+    pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message did not contain Chinese text.\n${message}`);
+    return null;
+  }
+  if (/\[CQ:at|@\d{5,}|@everyone|@all/i.test(message)) {
+    pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message contains an @ mention.\n${message}`);
+    return null;
+  }
+  return message;
+}
+
+async function maybeBroadcastWorldObservation(
+  topic: string,
+  observation: ProactiveWorldObservation,
+  observedAtIso: string,
+): Promise<void> {
+  const targetGroupId = autonomyConfig.worldObservationBroadcastGroupId;
+  if (!targetGroupId) return;
+
+  const groupKey = normalizeConversationGroupKey(targetGroupId);
+  const numericGroupId = Number(groupKey);
+  if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
+    pushMonitorEntry("error", "World Observation Broadcast Skipped", `Invalid group_id=${targetGroupId}`);
+    return;
+  }
+
+  const message = await translateWorldObservationForBroadcast(topic, observation);
+  if (!message) {
+    pushMonitorEntry("status", "World Observation Broadcast Skipped", `group_id=${groupKey}\ntopic=${topic}\nNo translated message.`);
+    return;
+  }
+
+  recordOutgoingAiTone(message, groupKey);
+  const sentMessageId = await sendGroupMessage(numericGroupId, message);
+  appendConversationTurn({
+    groupId: groupKey,
+    role: "assistant",
+    senderName: null,
+    userId: null,
+    content: message,
+    timestamp: new Date().toISOString(),
+    messageId: sentMessageId,
+  });
+  pushMonitorEntry(
+    "outgoing",
+    "World Observation Broadcast Sent",
+    `group_id=${groupKey}\nobserved_at=${observedAtIso}\ntopic=${topic}\n${message}`,
+  );
+}
+
+type KnownGroupActivity = {
+  role: "user" | "assistant";
+  timestampMs: number;
+  timestamp: string;
+  source: "qdrant" | "memory";
+};
+
+function isHollySenderName(senderName: string | null): boolean {
+  return (senderName ?? "").trim().toLowerCase() === "holly";
+}
+
+function newerKnownActivity(
+  left: KnownGroupActivity | null,
+  right: KnownGroupActivity | null,
+): KnownGroupActivity | null {
+  if (!left) return right;
+  if (!right) return left;
+  return right.timestampMs > left.timestampMs ? right : left;
+}
+
+function latestKnownGroupActivityFromMemory(groupKey: string): KnownGroupActivity | null {
+  const turns = conversationHistoryByGroup.get(groupKey) ?? [];
+  let latest: KnownGroupActivity | null = null;
+  for (const turn of turns) {
+    const timestampMs = Date.parse(turn.timestamp);
+    if (!Number.isFinite(timestampMs)) continue;
+    latest = newerKnownActivity(latest, {
+      role: turn.role === "assistant" ? "assistant" : "user",
+      timestampMs,
+      timestamp: turn.timestamp,
+      source: "memory",
+    });
+  }
+  return latest;
+}
+
+async function latestKnownGroupActivityFromQdrant(groupKey: string): Promise<KnownGroupActivity | null> {
+  const store = incomingMessageStore;
+  if (!store) return null;
+
+  const records = await store.listRecentMemories({
+    groupId: groupKey,
+    limit: 25,
+  });
+
+  let latest: KnownGroupActivity | null = null;
+  for (const record of records) {
+    if (!record.receivedAt) continue;
+    const timestampMs = Date.parse(record.receivedAt);
+    if (!Number.isFinite(timestampMs)) continue;
+    latest = newerKnownActivity(latest, {
+      role: isHollySenderName(record.senderName) ? "assistant" : "user",
+      timestampMs,
+      timestamp: record.receivedAt,
+      source: "qdrant",
+    });
+  }
+  return latest;
+}
+
+async function latestKnownGroupActivity(groupKey: string): Promise<KnownGroupActivity | null> {
+  let latest = latestKnownGroupActivityFromMemory(groupKey);
+  try {
+    latest = newerKnownActivity(latest, await latestKnownGroupActivityFromQdrant(groupKey));
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Memory Reflection Broadcast Activity Check Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  return latest;
+}
+
+function formatMemoryReflectionBroadcastMessage(request: AutonomyMemoryWriteRequest): string {
+  return compactReflectionText(`想到一个可以接着聊的点：${request.content}`, 500);
+}
+
+async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteRequest, nowIso: string): Promise<void> {
+  const targetGroupId = autonomyConfig.memoryReflectionBroadcastGroupId;
+  if (!targetGroupId) return;
+
+  const groupKey = normalizeConversationGroupKey(targetGroupId);
+  const numericGroupId = Number(groupKey);
+  if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
+    pushMonitorEntry("error", "Memory Reflection Broadcast Skipped", `Invalid group_id=${targetGroupId}`);
+    return;
+  }
+
+  const latestActivity = await latestKnownGroupActivity(groupKey);
+  if (!latestActivity) {
+    pushMonitorEntry(
+      "status",
+      "Memory Reflection Broadcast Skipped",
+      `group_id=${groupKey}\nNo known group activity to verify the 3h lull.`,
+    );
+    return;
+  }
+
+  if (latestActivity.role === "assistant") {
+    pushMonitorEntry(
+      "status",
+      "Memory Reflection Broadcast Skipped",
+      `group_id=${groupKey}\nLatest known message is already Holly at ${latestActivity.timestamp}.`,
+    );
+    return;
+  }
+
+  const nowMs = Date.parse(nowIso);
+  const idleMs = (Number.isFinite(nowMs) ? nowMs : Date.now()) - latestActivity.timestampMs;
+  if (idleMs < autonomyConfig.memoryReflectionBroadcastLullMs) {
+    pushMonitorEntry(
+      "status",
+      "Memory Reflection Broadcast Skipped",
+      `group_id=${groupKey}\nidle_minutes=${Math.floor(idleMs / 60000)} < ${Math.ceil(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}`,
+    );
+    return;
+  }
+
+  const message = formatMemoryReflectionBroadcastMessage(request);
+  if (!message) return;
+
+  const sentMessageId = await sendGroupMessage(numericGroupId, message);
+  appendConversationTurn({
+    groupId: groupKey,
+    role: "assistant",
+    senderName: null,
+    userId: null,
+    content: message,
+    timestamp: new Date().toISOString(),
+    messageId: sentMessageId,
+  });
+  pushMonitorEntry(
+    "outgoing",
+    "Memory Reflection Broadcast Sent",
+    `group_id=${groupKey}\nidle_minutes=${Math.floor(idleMs / 60000)}\n${message}`,
+  );
 }
 
 function formatWorldObservationsForReflection(nowMs: number): string[] {
@@ -4096,6 +4547,13 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
     reason: request.reason,
     urls: request.observation?.urls ?? [],
   });
+  try {
+    await maybeBroadcastMemoryReflection(request, now);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Memory Reflection Broadcast Failed", detail);
+    console.error("Failed to broadcast memory reflection:", error);
+  }
 }
 
 // Gate B (6A): reuse the exact cached system + global-history prefix a reactive
@@ -4874,7 +5332,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         <div class="ph2"><span class="ph2-title">Filters</span></div>
         <div class="pb">
           <form class="fgrid" @submit.prevent="loadMemories">
-            <label>Group ID <input v-model="mf.groupId" placeholder="20000001" /></label>
+            <label>Group ID <input v-model="mf.groupId" placeholder="20000002" /></label>
             <label>User ID <input v-model="mf.userId" placeholder="10000003" /></label>
             <label>Type
               <select v-model="mf.messageType">
@@ -5000,12 +5458,12 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           </div>
           <div class="reflect-stat">
             <span class="reflect-stat-label">Reflect today</span>
-            <b>{{ autonomySidebar.memoryReflectionDailyCount }}/{{ autonomySidebar.maxMemoryReflectionsPerDay }}</b>
+            <b>{{ autonomySidebar.memoryReflectionDailyCount }}</b>
             <small>last {{ autonomySidebar.lastMemoryReflectionAtIso ? fmtTime(autonomySidebar.lastMemoryReflectionAtIso) : '-' }}</small>
           </div>
           <div class="reflect-stat">
             <span class="reflect-stat-label">World today</span>
-            <b>{{ autonomySidebar.worldObservationDailyCount }}/{{ autonomySidebar.maxWorldObservationsPerDay }}</b>
+            <b>{{ autonomySidebar.worldObservationDailyCount }}</b>
             <small>last {{ autonomySidebar.lastWorldObservationAtIso ? fmtTime(autonomySidebar.lastWorldObservationAtIso) : '-' }}</small>
           </div>
           <div class="reflect-stat">
@@ -5510,13 +5968,18 @@ async function bootstrap(): Promise<void> {
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
+  incomingMessageStore = store;
   await loadWorldObservationMemory();
   await loadHollyMemorySidebarRecords();
-  incomingMessageStore = store;
   startConfigWatcher();
   if (store) {
     pushMonitorEntry("status", "Qdrant Ready", store.description);
   }
+  pushMonitorEntry(
+    "status",
+    "Autonomy Memory Restored",
+    `memories=${hollyMemorySidebarRecords.length}\nworld_observations=${worldObservationMemory.length}`,
+  );
   pushMonitorEntry(
     "status",
     "Context Budget Ready",
@@ -5537,7 +6000,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} reflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",

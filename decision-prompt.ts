@@ -24,6 +24,7 @@ export const MODEL_DECISION_PROMPT = [
   "- thinking_process must be written in Chinese (简体中文), as a short decision summary for logging, not a detailed chain-of-thought.",
   "- Do not return any extra fields beyond should_reply, final_answer, thinking_process, need_search, and search_query.",
   "- final_answer must contain only the exact message Holly would send, with no helper prefixes or status markers.",
+  "- final_answer must be a complete sendable message even when short; do not end mid-sentence or with dangling words like 是、因为、但是、不过、然后、比如、例如、问题是.",
   "- need_search/search_query:当『要不要回复』或『怎么回复』取决于一个你不确定的外部事实或最新信息(具体新闻、数据、某物现状、近况)时,把 need_search 设为 true,search_query 写一个简短中文搜索词;此时 should_reply 和 final_answer 先随意填(会被忽略,系统会带着搜索结果再问你一次)。",
   "- 只有真正需要外部事实才 need_search=true;闲聊、玩梗、你已经知道或能合理推断的事一律 need_search=false 且 search_query 留空字符串。",
 ].join("\n");
@@ -46,4 +47,54 @@ export const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
 
 export function buildModelSystemPrompt(basePrompt: string): string {
   return `${basePrompt}\n\n${MODEL_DECISION_PROMPT}`;
+}
+
+export function detectIncompleteFinalAnswer(text: string): string | null {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+
+  const stripped = normalized
+    .replace(/[\s"'“”‘’）)\]}】》」』]+$/u, "")
+    .trim();
+  if (!stripped) return null;
+
+  if (/[，,、：:；;—-]$/u.test(stripped)) {
+    return "ends with dangling punctuation";
+  }
+
+  const danglingEndings = [
+    "因为",
+    "所以",
+    "但是",
+    "不过",
+    "然后",
+    "而且",
+    "如果",
+    "虽然",
+    "比如",
+    "例如",
+    "换句话说",
+    "也就是说",
+    "问题是",
+    "关键是",
+    "区别是",
+    "原因是",
+    "而是",
+    "不是",
+    "属于",
+    "等于",
+    "在于",
+    "是",
+  ];
+  for (const ending of danglingEndings) {
+    if (stripped.endsWith(ending)) {
+      return `ends with dangling phrase: ${ending}`;
+    }
+  }
+
+  if (/\b(?:because|but|and|or|the|of|to|is|are|with|that|which)$/i.test(stripped)) {
+    return "ends with dangling English word";
+  }
+
+  return null;
 }

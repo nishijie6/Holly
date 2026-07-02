@@ -41,6 +41,7 @@ export type IncomingMessageStore = {
   description: string;
   saveMessage(record: IncomingMessageRecord): Promise<void>;
   saveInternalMemory(record: InternalMemoryRecord): Promise<void>;
+  saveWorldObservation(record: WorldObservationMemoryRecord): Promise<void>;
   listRecentMemories(input: {
     groupId?: string | null;
     userId?: string | null;
@@ -55,6 +56,16 @@ export type InternalMemoryRecord = {
   topic?: string | null;
   reason?: string | null;
   urls?: string[];
+};
+
+export type WorldObservationMemoryRecord = {
+  observedAt: string;
+  topic: string;
+  query: string;
+  summary: string;
+  reason?: string | null;
+  urls?: string[];
+  cached?: boolean;
 };
 
 export type StoredMemoryRecord = {
@@ -72,6 +83,7 @@ export type StoredMemoryRecord = {
   rawMessage: string | null;
   memoryTopic: string | null;
   memoryReason: string | null;
+  memoryQuery: string | null;
   memoryUrls: string[];
 };
 
@@ -173,6 +185,7 @@ function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemory
     rawMessage: asOptionalString(payload.raw_message),
     memoryTopic: asOptionalString(payload.memory_topic),
     memoryReason: asOptionalString(payload.memory_reason),
+    memoryQuery: asOptionalString(payload.memory_query),
     memoryUrls,
   };
 }
@@ -229,11 +242,25 @@ function isTransientConnectionError(error: unknown, depth = 0): boolean {
   return isTransientConnectionError(e.cause, depth + 1);
 }
 
+// A slow Qdrant write can exceed the client timeout even against a local
+// instance: a background flush briefly holding a lock, a disk/mmap hiccup, or
+// the process stalling for a moment. The per-request AbortController then fires
+// and the client throws `QdrantClientTimeoutError` ("This operation was
+// aborted"). That stall window is short, so one retry ~150ms later usually
+// lands after it has passed. Unlike the connection-reset case this error
+// carries no `code`/`cause` (see @qdrant/js-client-rest errors.js CustomError),
+// so match it by name; the raw AbortError name is covered too as a safety net.
+function isTransientTimeoutError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const name = (error as { name?: unknown }).name;
+  return name === "QdrantClientTimeoutError" || name === "AbortError";
+}
+
 async function withQdrantRetry<T>(operation: () => Promise<T>): Promise<T> {
   try {
     return await operation();
   } catch (error) {
-    if (!isTransientConnectionError(error)) throw error;
+    if (!isTransientConnectionError(error) && !isTransientTimeoutError(error)) throw error;
     await new Promise((resolve) => setTimeout(resolve, 150));
     return operation();
   }
@@ -348,6 +375,43 @@ export async function createIncomingMessageStore(
               memory_topic: record.topic ?? null,
               memory_reason: record.reason ?? null,
               memory_urls: record.urls ?? [],
+            },
+          },
+        ],
+      }));
+    },
+    async saveWorldObservation(record): Promise<void> {
+      const pointId = randomUUID();
+      await withQdrantRetry(() => client.upsert(config.collectionName, {
+        wait: true,
+        points: [
+          {
+            id: pointId,
+            vector: STORAGE_VECTOR,
+            payload: {
+              schema_version: 1,
+              session_id: sessionId,
+              session_started_at: sessionStartedAt,
+              ws_target_url: options.wsTargetUrl ?? null,
+              source: "holly_world_observation",
+              sequence: null,
+              received_at: record.observedAt,
+              is_binary: false,
+              raw_encoding: "utf8",
+              raw_content: record.summary,
+              binary_size: null,
+              display_text: record.summary,
+              message_type: "world_observation",
+              group_id: null,
+              group_name: null,
+              user_id: "holly",
+              sender_name: "Holly",
+              raw_message: record.summary,
+              memory_topic: record.topic,
+              memory_reason: record.reason ?? null,
+              memory_query: record.query,
+              memory_urls: record.urls ?? [],
+              world_observation_cached: record.cached ?? false,
             },
           },
         ],
