@@ -131,9 +131,14 @@ function claudeMaxOutputTokens(model: string): number {
 type ClaudeRequestOptions = {
   jsonSchema?: Record<string, unknown>;
   maxTokens?: number;
-  // Place a 1h cache_control breakpoint on the last message so the conversation
-  // prefix is cached and reused across turns (and refreshed by warmContext).
+  // Place a 1h cache_control breakpoint at the end of the STABLE conversation
+  // prefix so it is cached and reused across turns (and refreshed by warmContext).
   cacheMessageTail?: boolean;
+  // How many trailing LlmMessages are per-request volatile (batch instructions,
+  // timestamps, retry nudges). The cache breakpoint is placed on the last block
+  // BEFORE these, so the cached prefix stays byte-identical across requests and
+  // the volatile tail never writes useless cache entries.
+  volatileTailMessages?: number;
 };
 
 function isFetchFailedError(error: unknown): boolean {
@@ -649,21 +654,30 @@ function buildClaudeHeaders(accessToken: string): Record<string, string> {
   };
 }
 
-function buildClaudeMessages(messages: LlmMessage[]): Array<{ role: "user" | "assistant"; content: string }> {
-  const merged: Array<{ role: "user" | "assistant"; content: string }> = [];
+type ClaudeMessageBlock = { text: string; volatile: boolean };
+type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: ClaudeMessageBlock[] };
 
-  for (const message of messages) {
+// One text block per source LlmMessage (conversation turn). Consecutive
+// same-role turns merge into one API message but keep their block boundaries,
+// so a cache breakpoint can sit exactly at the end of the stable prefix and
+// that boundary recurs byte-identically in later requests as history grows.
+function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): ClaudeMergedMessage[] {
+  const volatileFrom = messages.length - Math.max(0, volatileTailMessages);
+  const merged: ClaudeMergedMessage[] = [];
+
+  for (const [index, message] of messages.entries()) {
     const content = message.content.trim();
     if (!content) {
       continue;
     }
 
     const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
+    const block: ClaudeMessageBlock = { text: content, volatile: index >= volatileFrom };
     const last = merged[merged.length - 1];
     if (last && last.role === role) {
-      last.content = `${last.content}\n${content}`;
+      last.blocks.push(block);
     } else {
-      merged.push({ role, content });
+      merged.push({ role, blocks: [block] });
     }
   }
 
@@ -687,22 +701,32 @@ function buildClaudeMessages(messages: LlmMessage[]): Array<{ role: "user" | "as
 function buildClaudeMessagesWithCacheTail(
   messages: LlmMessage[],
   cacheTail: boolean,
+  volatileTailMessages = 0,
 ): Array<Record<string, unknown>> {
-  const merged = buildClaudeMessages(messages).map((message): Record<string, unknown> => ({
+  const merged = buildClaudeMessages(messages, volatileTailMessages);
+  const apiMessages = merged.map((message): Record<string, unknown> => ({
     role: message.role,
-    content: message.content,
+    content: message.blocks.map((block): Record<string, unknown> => ({ type: "text", text: block.text })),
   }));
 
-  if (cacheTail && merged.length > 0) {
-    const last = merged[merged.length - 1];
-    // Promote the last turn's content to a block array so the cache breakpoint
-    // sits on the conversation tail; the stable prefix before it is reused.
-    last.content = [
-      { type: "text", text: last.content as string, cache_control: { type: "ephemeral", ttl: "1h" } },
-    ];
+  if (cacheTail) {
+    // Breakpoint on the last STABLE block ("shared prefix, varying suffix"
+    // pattern): the volatile tail after it changes every request, so caching
+    // it would write entries that are never read. The stable prefix before the
+    // breakpoint is byte-identical across requests and accrues cache hits.
+    outer: for (let i = merged.length - 1; i >= 0; i -= 1) {
+      const blocks = merged[i].blocks;
+      for (let j = blocks.length - 1; j >= 0; j -= 1) {
+        if (!blocks[j].volatile) {
+          const content = apiMessages[i].content as Array<Record<string, unknown>>;
+          content[j].cache_control = { type: "ephemeral", ttl: "1h" };
+          break outer;
+        }
+      }
+    }
   }
 
-  return merged;
+  return apiMessages;
 }
 
 function buildClaudeRequestBody(
@@ -726,7 +750,11 @@ function buildClaudeRequestBody(
     model,
     max_tokens: options.maxTokens ?? claudeMaxOutputTokens(model),
     system,
-    messages: buildClaudeMessagesWithCacheTail(messages, options.cacheMessageTail ?? false),
+    messages: buildClaudeMessagesWithCacheTail(
+      messages,
+      options.cacheMessageTail ?? false,
+      options.volatileTailMessages ?? 0,
+    ),
   };
 
   if (options.jsonSchema) {
@@ -1103,6 +1131,10 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
         return requestClaudeText(profile.model, systemPrompt, contents, {
           jsonSchema: input.jsonSchema,
           cacheMessageTail: true,
+          // Convention: the last message is the per-request volatile input
+          // (batch instructions / current prompt); the breakpoint goes on the
+          // stable history right before it.
+          volatileTailMessages: 1,
         });
       }
 
@@ -1123,9 +1155,12 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
 
       // max_tokens=1: the reply is discarded; the request exists only to write
       // the 1h prompt cache so the next real reply reads the warmed prefix.
+      // volatileTailMessages=0: the warm request is history-only, so its last
+      // block IS the stable prefix end a real request will hit.
       await requestClaudeText(profile.model, systemPrompt, contents, {
         maxTokens: 1,
         cacheMessageTail: true,
+        volatileTailMessages: 0,
       });
     },
   };

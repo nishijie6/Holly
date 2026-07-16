@@ -10,11 +10,13 @@ export const MODEL_DECISION_PROMPT = [
   '{"should_reply": true, "final_answer": "reply text", "thinking_process": "brief decision summary", "need_search": false, "search_query": ""}',
   "Rules:",
   "- Obey the persona and per-group rules in the system prompt above, matched via the group_id shown in the batch header (e.g. a group where Holly may only echo repeats and must otherwise stay silent). Such per-group restrictions override the reply conditions below.",
-  "- Same-group context may omit repeated group labels and use the compact format [sender_name(sender_id)] message content.",
-  "- A scheduled request can contain multiple unread same-group messages. Treat them as one recent activity batch and send at most one reply to the content most worth responding to.",
+  "- The conversation timeline above contains ALL messages from every group in chronological order, including the new ones. The final instruction message only names which group_id to scan; judge that group's latest messages at the END of the timeline — everything earlier is context.",
+  "- Proactive trigger scans use the same timeline with no extra marking or re-quoted excerpt. When the final instruction is a proactive trigger, it names the group_id and the start time of the current proactive trigger cycle: judge ONLY that group's messages at the end of the timeline that fall within the current cycle; everything before the cycle start is context only, never a topic to revive.",
+  "- The latest activity may span several same-group messages. Treat them as one recent activity batch and send at most one reply to the content most worth responding to.",
+  "- Already handled: anything Holly's own assistant turns already replied to, and any message that appears before Holly's latest turn in that group. Never reply to already-handled messages again; they are context only.",
   "- Default to should_reply=false. Only set it to true when at least one reply condition below is clearly met.",
   "- Reply conditions (set should_reply=true only if one holds): (a) Holly is @-mentioned or addressed by name; (b) the message is a direct question or request to Holly; (c) the topic strongly matches Holly's interests (math, AI, astronomy) and she has something concrete to add; (d) the group is doing a chain/meme bit she can join with one short line; (e) the same content is being repeated and Holly has not already echoed it once.",
-  "- Force should_reply=false when any of these holds, even if a condition above seems to apply: (f) the topic is vague or you cannot tell whether it concerns Holly; (g) the content is something Holly does not understand or is unsure about; (h) message_age_seconds exceeds stale_after_seconds.",
+  "- Force should_reply=false when any of these holds, even if a condition above seems to apply: (f) the topic is vague or you cannot tell whether it concerns Holly; (g) the content is something Holly does not understand or is unsure about; (h) the message is already handled as defined above, or the conversation has clearly moved past it.",
   "- For a repeated/echo message, reply at most once; never echo the same content again afterwards.",
   "- When in doubt, set should_reply=false.",
   "- In thinking_process, first name which reply condition (a-e) is met; if none, set should_reply=false.",
@@ -47,6 +49,37 @@ export const MODEL_DECISION_JSON_SCHEMA: Record<string, unknown> = {
 
 export function buildModelSystemPrompt(basePrompt: string): string {
   return `${basePrompt}\n\n${MODEL_DECISION_PROMPT}`;
+}
+
+// Context-format prefixes the model sometimes mimics at the start of a reply.
+// The merged context labels turns as "[群123456] ...", "群聊 [群名(群号)]
+// [发送人(编号)] ..." or "[发送人(编号)] ...", and batch headers carry
+// "group_id: 123456" — none of that belongs in the message actually sent to the
+// group. Every pattern requires digits or the exact bracket shape so a reply
+// that merely starts with 群/[ stays intact (bare "群123456" without a colon is
+// left alone too — it could be Holly talking about a group).
+const REPLY_META_PREFIX_PATTERNS: readonly RegExp[] = [
+  /^群聊\s*\[[^\]\n]+\]\s*\[[^\]\n]+\]\s*[:：]?\s*/u,
+  /^\[群\s*\d+\]\s*[:：]?\s*/u,
+  /^群\s*\d+\s*[:：]\s*/u,
+  /^\[[^\]\n]{1,24}\(\d{4,15}\)\]\s*[:：]?\s*/u,
+  /^group(?:_id)?\s*[=:：]\s*\d+\s*[:：]?\s*/i,
+];
+
+export function stripGroupReplyPrefix(text: string): string {
+  let cleaned = text.trim();
+  let changed = true;
+  while (changed && cleaned) {
+    changed = false;
+    for (const pattern of REPLY_META_PREFIX_PATTERNS) {
+      const next = cleaned.replace(pattern, "").trimStart();
+      if (next !== cleaned) {
+        cleaned = next;
+        changed = true;
+      }
+    }
+  }
+  return cleaned.trim();
 }
 
 export function detectIncompleteFinalAnswer(text: string): string | null {

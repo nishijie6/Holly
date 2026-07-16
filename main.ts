@@ -27,18 +27,23 @@ import {
   type WorldObservationMemoryRecord,
 } from "./qdrant-store.js";
 import { HollyStateStore } from "./holly-state.js";
+import { ConversationContextStore } from "./context-store.js";
 import {
   runProactiveTick,
   buildProactiveRevivePrompt,
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
+  type ProactiveRevivalRequest,
   type ProactiveTickResult,
   type ProactiveWorldObservation,
   type ProactiveWorldObservationRequest,
 } from "./proactive-engine.js";
 import {
   runAutonomyLoop,
+  type ArchiveWorkKind,
+  type AutonomyArchiveComposeRequest,
+  type AutonomyArchiveWriteRequest,
   type AutonomyConfig,
   type AutonomyMemoryReflectionRequest,
   type AutonomyMemoryWriteRequest,
@@ -50,7 +55,12 @@ import {
   type BrowserAgentConfig,
   type BrowserTopicObservation,
 } from "./browser-agent.js";
-import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt, detectIncompleteFinalAnswer } from "./decision-prompt.js";
+import {
+  MODEL_DECISION_JSON_SCHEMA,
+  buildModelSystemPrompt,
+  detectIncompleteFinalAnswer,
+  stripGroupReplyPrefix,
+} from "./decision-prompt.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
@@ -159,6 +169,7 @@ type PendingWsAction = {
 type RuntimeLlmConfig = {
   context_limit_tokens?: unknown;
   context_compress_threshold_tokens?: unknown;
+  context_compress_target_tokens?: unknown;
 };
 
 type AppConfig = {
@@ -171,6 +182,10 @@ type AppConfig = {
 type ContextBudgetConfig = {
   limitTokens: number;
   compressThresholdTokens: number;
+  // Soft-compression target: when a request crosses compressThresholdTokens the
+  // variable context is squeezed down to this budget (not just back under the
+  // threshold), leaving headroom to grow before the next compression.
+  compressTargetTokens: number;
 };
 
 type PreparedModelRequest = {
@@ -189,6 +204,7 @@ type MonitorSnapshot = {
   autonomySidebar: AutonomySidebarSnapshot;
   claudeUsage: ClaudeUsage | null;
   tokenStats: DailyTokenStats;
+  readOnly: boolean;
 };
 
 type MonitorEvent =
@@ -220,6 +236,14 @@ type MonitorEvent =
   | {
       type: "autonomy";
       autonomySidebar: AutonomySidebarSnapshot;
+    }
+  | {
+      type: "archive";
+      work: ArchiveWorkRecord;
+    }
+  | {
+      type: "mode";
+      readOnly: boolean;
     };
 
 type AutonomySidebarMemory = {
@@ -236,6 +260,7 @@ type AutonomySidebarObservation = {
   query: string;
   summary: string;
   urls: string[];
+  pageErrors: string[];
 };
 
 type AutonomySidebarSnapshot = {
@@ -265,6 +290,16 @@ type DailyTokenStats = {
   totalTokens: number;
 };
 
+type ArchiveWorkRecord = {
+  id: string;
+  ts: string;
+  kind: ArchiveWorkKind;
+  title: string;
+  content: string;
+  reason: string;
+  file: string;
+};
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const APP_ROOT = existsSync(join(process.cwd(), "package.json")) ? process.cwd() : __dirname;
@@ -272,6 +307,9 @@ const APP_ROOT = existsSync(join(process.cwd(), "package.json")) ? process.cwd()
 const CONFIG_PATH = join(APP_ROOT, "config.yaml");
 const LOG_DIR = join(APP_ROOT, "logs");
 const VENDOR_DIR = join(APP_ROOT, "vendor");
+// Holly's creative works (articles/poems). Each work is one JSONL record plus a
+// standalone local HTML page so the archive survives independently of the bot.
+const ARCHIVE_DIR = join(APP_ROOT, "archive");
 
 // Serve the Vue runtime from disk so the monitor page never depends on an
 // external CDN (the bot typically runs behind a proxy where unpkg is unreachable
@@ -322,6 +360,12 @@ const MODEL_DECISION_RETRY_DELAY_MS = 2000;
 // Re-send the merged global context with max_tokens=1 on this cadence to keep the
 // 1h prompt cache warm. 20min < the 1h cache TTL, so the cache never goes cold.
 const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
+// How often the merged timeline is snapshotted to disk (when dirty). Hourly:
+// a clean shutdown flushes on SIGINT/SIGTERM regardless, and a crash loses at
+// most this window — today's group messages inside it come back through the
+// day-history bootstrap anyway, so only sub-day assistant-turn metadata is at
+// risk.
+const CONVERSATION_CONTEXT_PERSIST_INTERVAL_MS = 60 * 60 * 1000;
 // Memory-safety ceiling on retained per-group turns. The context_limit_tokens
 // budget (190K) binds well before this many short group turns, so in practice
 // history is "keep everything that fits in the window", not capped by count.
@@ -336,7 +380,6 @@ const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
 const MIN_CONTEXT_LIMIT_TOKENS = 128;
 // Headroom left below the model's input window for estimation drift + output.
 const CONTEXT_MODEL_WINDOW_MARGIN_TOKENS = 16_000;
-const CONTEXT_RECENT_MESSAGES_TO_KEEP = 2;
 const CONTEXT_MIN_SECTION_BUDGET = 48;
 // MODEL_DECISION_PROMPT / MODEL_DECISION_JSON_SCHEMA / buildModelSystemPrompt now
 // live in decision-prompt.ts (imported above) so smokes/tests can exercise the
@@ -372,7 +415,7 @@ const DEFAULT_BROWSER_AGENT_CONFIG: BrowserAgentRuntimeConfig = {
   timeoutMs: 15_000,
   launchTimeoutMs: 10_000,
   contentMaxChars: 1800,
-  cooldownMs: 3 * 60 * 60 * 1000,
+  cooldownMs: 60 * 60 * 1000,
   querySuffix: "latest updates",
 };
 
@@ -412,15 +455,20 @@ const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
 const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   enabled: true,
   worldObservationEnabled: false,
-  worldObservationIntervalMs: 3 * 60 * 60 * 1000,
+  worldObservationIntervalMs: 60 * 60 * 1000,
   worldObservationRetryMs: 15 * 60 * 1000,
   worldObservationBroadcastGroupId: null,
+  worldObservationFailureGroupId: null,
+  worldObservationBroadcastLullMs: 30 * 60 * 1000,
   worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
   memoryReflectionEnabled: false,
   memoryReflectionIntervalMs: 60 * 60 * 1000,
   memoryReflectionRetryMs: 15 * 60 * 1000,
   memoryReflectionBroadcastGroupId: null,
   memoryReflectionBroadcastLullMs: 3 * 60 * 60 * 1000,
+  archiveWritingEnabled: false,
+  archiveWritingIntervalMs: 4 * 60 * 60 * 1000,
+  archiveWritingRetryMs: 60 * 60 * 1000,
 };
 
 let sessionLogPath: string | null = null;
@@ -442,6 +490,8 @@ let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 // second time even though we already handled it. Bounded by TTL + a size sweep.
 let ingestedMessageAtMsById = new Map<string, number>();
 let hollyStateStore: HollyStateStore | null = null;
+let conversationContextStore: ConversationContextStore | null = null;
+let conversationHistoryPersistDirty = false;
 let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
 let autonomyQueue: Promise<void> = Promise.resolve();
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
@@ -452,6 +502,15 @@ let browserObservationCache = new Map<string, { observedAtMs: number; observatio
 let browserObservationAttemptAtMs = new Map<string, number>();
 let worldObservationMemory: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
 let hollyMemorySidebarRecords: AutonomySidebarMemory[] = [];
+let archiveWorks: ArchiveWorkRecord[] = [];
+let archiveWriteQueue: Promise<void> = Promise.resolve();
+// Read-only mode: Holly ingests everything (context, Qdrant, OCR/URL enrichment)
+// and keeps her internal loops (world observation, memory reflection, archive
+// writing), but never sends a group message — no replies, no proactive sends,
+// no broadcasts. Toggled from the monitor UI, persisted as `read_only` in
+// config.yaml so a restart or hand-edit keeps the chosen mode.
+let readOnlyMode = false;
+let readOnlyPersistQueue: Promise<void> = Promise.resolve();
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
 let aiToneShadowQueue: Promise<void> = Promise.resolve();
@@ -468,6 +527,7 @@ let configReloadTimer: NodeJS.Timeout | null = null;
 let contextBudgetConfig: ContextBudgetConfig = {
   limitTokens: DEFAULT_CONTEXT_LIMIT_TOKENS,
   compressThresholdTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
+  compressTargetTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
 };
 let monitorStatus: MonitorStatus = {
   state: "closed",
@@ -500,6 +560,7 @@ async function loadContextBudgetConfig(configPath: string): Promise<ContextBudge
     return {
       limitTokens: DEFAULT_CONTEXT_LIMIT_TOKENS,
       compressThresholdTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
+      compressTargetTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
     };
   }
 
@@ -517,10 +578,20 @@ async function loadContextBudgetConfig(configPath: string): Promise<ContextBudge
       normalizePositiveInteger(llm.context_compress_threshold_tokens) ?? DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
     ),
   );
+  // Defaults to the threshold, which preserves the old "compress back to the
+  // threshold" behavior when the key is absent.
+  const compressTargetTokens = Math.max(
+    1,
+    Math.min(
+      compressThresholdTokens,
+      normalizePositiveInteger(llm.context_compress_target_tokens) ?? compressThresholdTokens,
+    ),
+  );
 
   return {
     limitTokens,
     compressThresholdTokens,
+    compressTargetTokens,
   };
 }
 
@@ -628,6 +699,14 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       a.world_observation_broadcast_group_id,
       base.worldObservationBroadcastGroupId,
     ),
+    worldObservationFailureGroupId: readOptionalGroupId(
+      a.world_observation_failure_group_id,
+      base.worldObservationFailureGroupId,
+    ),
+    worldObservationBroadcastLullMs: readProactiveMinutesMs(
+      a.world_observation_broadcast_lull_minutes,
+      base.worldObservationBroadcastLullMs,
+    ),
     worldTopics: readProactiveStringArray(a.world_topics, base.worldTopics),
     memoryReflectionEnabled:
       typeof a.memory_reflection_enabled === "boolean"
@@ -649,7 +728,58 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       a.memory_reflection_broadcast_lull_minutes,
       base.memoryReflectionBroadcastLullMs,
     ),
+    archiveWritingEnabled:
+      typeof a.archive_writing_enabled === "boolean"
+        ? a.archive_writing_enabled
+        : base.archiveWritingEnabled,
+    archiveWritingIntervalMs: readProactiveMinutesMs(
+      a.archive_writing_interval_minutes,
+      base.archiveWritingIntervalMs,
+    ),
+    archiveWritingRetryMs: readProactiveMinutesMs(
+      a.archive_writing_retry_minutes,
+      base.archiveWritingRetryMs,
+    ),
   };
+}
+
+async function loadReadOnlyConfig(configPath: string): Promise<boolean> {
+  if (!existsSync(configPath)) return false;
+  try {
+    const parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { read_only?: unknown } | null) ?? {};
+    return parsed.read_only === true;
+  } catch {
+    return false;
+  }
+}
+
+// Rewrites only the `read_only` key. parseDocument round-trips the file so the
+// YAML comments survive (unlike the profile switcher's YAML.stringify path).
+function persistReadOnlyMode(enabled: boolean): Promise<void> {
+  readOnlyPersistQueue = readOnlyPersistQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      const raw = existsSync(CONFIG_PATH) ? await readFile(CONFIG_PATH, "utf-8") : "";
+      const doc = YAML.parseDocument(raw);
+      doc.set("read_only", enabled);
+      await writeFile(CONFIG_PATH, String(doc), "utf-8");
+    });
+  return readOnlyPersistQueue;
+}
+
+function applyReadOnlyMode(enabled: boolean, source: string): void {
+  if (readOnlyMode === enabled) return;
+  readOnlyMode = enabled;
+  pushMonitorEntry(
+    "status",
+    enabled ? "Read-Only Mode Enabled" : "Read-Only Mode Disabled",
+    enabled
+      ? `source=${source}\nGroup replies, proactive sends and broadcasts are suppressed; world observation, memory reflection and archive writing keep running.`
+      : `source=${source}\nGroup replies are live again.`,
+  );
+  broadcastMonitorEvent({ type: "mode", readOnly: enabled });
 }
 
 async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig> {
@@ -862,66 +992,150 @@ function sanitizeConversationMessages(messages: readonly LlmMessage[]): LlmMessa
     .filter((message) => Boolean(message.content));
 }
 
-function buildCompressedConversationSummary(messages: readonly LlmMessage[], budgetTokens: number): string {
-  if (messages.length === 0 || budgetTokens <= 0) {
+function formatConversationTurnsForModel(turns: readonly ConversationTurn[]): LlmMessage[] {
+  return sanitizeConversationMessages(turns.map(formatGlobalConversationTurnForModel));
+}
+
+// --- Topic-segmented compression -------------------------------------------
+// When the context outgrows the budget, old turns are folded into per-topic
+// blocks instead of one flat truncated list: a topic = consecutive turns in
+// the same group with no silence longer than TOPIC_SEGMENT_GAP_MS in between.
+const TOPIC_SEGMENT_GAP_MS = 30 * 60 * 1000;
+const TOPIC_SEGMENT_MAX_LINES = 8;
+// Share of the compression budget reserved for keeping the newest turns
+// verbatim; everything older is folded into topic blocks.
+const COMPRESSION_RAW_TAIL_SHARE = 0.6;
+
+type TopicSegment = {
+  groupId: string | null;
+  startTs: number | null;
+  endTs: number | null;
+  turns: ConversationTurn[];
+};
+
+function segmentTurnsIntoTopics(turns: readonly ConversationTurn[]): TopicSegment[] {
+  const segments: TopicSegment[] = [];
+  for (const turn of turns) {
+    const ts = parseIsoTimestamp(turn.timestamp);
+    const groupKey = normalizeConversationGroupKey(turn.groupId);
+    const current = segments[segments.length - 1];
+    const sameGroup = current !== undefined && current.groupId === groupKey;
+    const withinGap =
+      current !== undefined &&
+      (ts === null || current.endTs === null || ts - current.endTs <= TOPIC_SEGMENT_GAP_MS);
+    if (current && sameGroup && withinGap) {
+      current.turns.push(turn);
+      if (ts !== null) {
+        current.endTs = ts;
+      }
+    } else {
+      segments.push({ groupId: groupKey, startTs: ts, endTs: ts, turns: [turn] });
+    }
+  }
+
+  return segments;
+}
+
+function formatTopicTimestamp(ts: number | null): string {
+  if (ts === null) {
+    return "??";
+  }
+
+  const date = new Date(ts);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatTopicLine(turn: ConversationTurn, lineBudget: number): string {
+  const label = turn.role === "assistant"
+    ? "[Holly]"
+    : formatConversationSenderLabel(turn.senderName, turn.userId) ?? "[?]";
+  return `- ${label} ${compactTextToTokenBudget(compactSameGroupConversationContent(turn.content), lineBudget)}`;
+}
+
+function buildTopicSummary(turns: readonly ConversationTurn[], budgetTokens: number): string {
+  if (turns.length === 0 || budgetTokens <= 0) {
     return "";
   }
 
-  const header = "Compressed earlier conversation:";
-  let result = header;
-  const perLineBudget = Math.max(
-    10,
-    Math.min(72, Math.floor(Math.max(1, budgetTokens - estimateTextTokens(header)) / messages.length)),
+  const header = "Compressed earlier conversation, split into topic segments (context only):";
+  const segments = segmentTurnsIntoTopics(turns);
+  const perSegmentBudget = Math.max(
+    24,
+    Math.floor(Math.max(1, budgetTokens - estimateTextTokens(header)) / segments.length),
   );
+  let result = header;
 
-  for (const message of messages) {
-    const roleLabel = message.role === "assistant" ? "Holly" : message.role === "system" ? "system" : "user";
-    const line = `- ${roleLabel}: ${compactTextToTokenBudget(message.content, perLineBudget)}`;
-    const next = `${result}\n${line}`;
+  for (const [index, segment] of segments.entries()) {
+    const label = `【话题${index + 1}|群${segment.groupId ?? "?"}|${formatTopicTimestamp(segment.startTs)}~${formatTopicTimestamp(segment.endTs)}|${segment.turns.length}条】`;
+    // Representative turns: whole segment when short, else head + tail.
+    const sampled = segment.turns.length <= TOPIC_SEGMENT_MAX_LINES
+      ? segment.turns
+      : [...segment.turns.slice(0, 3), ...segment.turns.slice(-(TOPIC_SEGMENT_MAX_LINES - 3))];
+    const lineBudget = Math.max(10, Math.min(48, Math.floor(perSegmentBudget / Math.max(1, sampled.length))));
+
+    let block = label;
+    for (const turn of sampled) {
+      const line = formatTopicLine(turn, lineBudget);
+      if (estimateTextTokens(`${block}\n${line}`) > perSegmentBudget) {
+        break;
+      }
+      block = `${block}\n${line}`;
+    }
+
+    const next = `${result}\n${block}`;
     if (estimateTextTokens(next) > budgetTokens) {
       break;
     }
-
     result = next;
   }
 
-  return result === header ? compactTextToTokenBudget(header, budgetTokens) : result;
+  return result === header ? "" : result;
 }
 
-function compressConversationMessages(messages: readonly LlmMessage[], budgetTokens: number): LlmMessage[] {
-  const cleaned = sanitizeConversationMessages(messages);
-  if (cleaned.length === 0 || budgetTokens <= 0) {
+function compressConversationTurns(turns: readonly ConversationTurn[], budgetTokens: number): LlmMessage[] {
+  const formatted = formatConversationTurnsForModel(turns);
+  if (formatted.length === 0 || budgetTokens <= 0) {
     return [];
   }
 
-  if (estimateMessagesTokens(cleaned) <= budgetTokens) {
-    return cleaned;
+  if (estimateMessagesTokens(formatted) <= budgetTokens) {
+    return formatted;
   }
 
-  for (let keepTail = Math.min(CONTEXT_RECENT_MESSAGES_TO_KEEP, cleaned.length); keepTail >= 0; keepTail -= 1) {
-    const tail = keepTail > 0 ? cleaned.slice(-keepTail) : [];
-    const tailTokens = estimateMessagesTokens(tail);
-    if (tailTokens > budgetTokens) {
-      continue;
+  // Keep the newest turns verbatim up to the raw-tail share of the budget.
+  const rawBudget = Math.floor(budgetTokens * COMPRESSION_RAW_TAIL_SHARE);
+  let tailStart = turns.length;
+  let tailTokens = 0;
+  while (tailStart > 0) {
+    const candidate = formatGlobalConversationTurnForModel(turns[tailStart - 1]);
+    const tokens = estimateMessageTokens({
+      role: candidate.role,
+      content: normalizeMessageContent(candidate.content),
+    });
+    if (tailTokens + tokens > rawBudget) {
+      break;
     }
-
-    const older = cleaned.slice(0, cleaned.length - keepTail);
-    const summaryBudget = Math.max(0, budgetTokens - tailTokens);
-    const summary = buildCompressedConversationSummary(older, summaryBudget);
-    const next: LlmMessage[] = summary ? [{ role: "system", content: summary }, ...tail] : tail;
-    if (estimateMessagesTokens(next) <= budgetTokens) {
-      return next;
-    }
+    tailTokens += tokens;
+    tailStart -= 1;
   }
 
-  const lastMessage = cleaned[cleaned.length - 1];
+  const tailMessages = formatConversationTurnsForModel(turns.slice(tailStart));
+  const summaryBudget = Math.max(0, budgetTokens - estimateMessagesTokens(tailMessages) - 6);
+  const summary = buildTopicSummary(turns.slice(0, tailStart), summaryBudget);
+  // user role (not system): splitSystemPrompt hoists system-role messages into
+  // the system prompt, which would bust the byte-stable system prefix.
+  const next: LlmMessage[] = summary ? [{ role: "user", content: summary }, ...tailMessages] : tailMessages;
+  if (estimateMessagesTokens(next) <= budgetTokens) {
+    return next;
+  }
+
+  const lastMessage = formatted[formatted.length - 1];
   const contentBudget = Math.max(8, budgetTokens - 6);
-  return contentBudget > 0
-    ? [{
-        role: lastMessage.role,
-        content: compactTextToTokenBudget(lastMessage.content, contentBudget),
-      }]
-    : [];
+  return [{
+    role: lastMessage.role,
+    content: compactTextToTokenBudget(lastMessage.content, contentBudget),
+  }];
 }
 
 function compressMemoryPrompt(memoryPrompt: string, budgetTokens: number): string {
@@ -1003,21 +1217,21 @@ function allocateVariableContextBudgets(
 
 function fitVariableContextToBudget(
   memoryPrompt: string,
-  conversationMessages: readonly LlmMessage[],
+  conversationTurns: readonly ConversationTurn[],
   totalBudget: number,
 ): { memoryPrompt: string; conversationMessages: LlmMessage[] } {
   const cleanedMemoryPrompt = memoryPrompt.trim();
-  const cleanedConversationMessages = sanitizeConversationMessages(conversationMessages);
+  const formattedConversation = formatConversationTurnsForModel(conversationTurns);
   if (totalBudget <= 0) {
     return { memoryPrompt: "", conversationMessages: [] };
   }
 
   const memoryTokens = estimateTextTokens(cleanedMemoryPrompt);
-  const conversationTokens = estimateMessagesTokens(cleanedConversationMessages);
+  const conversationTokens = estimateMessagesTokens(formattedConversation);
   if (memoryTokens + conversationTokens <= totalBudget) {
     return {
       memoryPrompt: cleanedMemoryPrompt,
-      conversationMessages: cleanedConversationMessages,
+      conversationMessages: formattedConversation,
     };
   }
 
@@ -1028,7 +1242,7 @@ function fitVariableContextToBudget(
   );
 
   let compactMemoryPrompt = compressMemoryPrompt(cleanedMemoryPrompt, memoryBudget);
-  let compactConversationMessages = compressConversationMessages(cleanedConversationMessages, conversationBudget);
+  let compactConversationMessages = compressConversationTurns(conversationTurns, conversationBudget);
 
   let total = estimateTextTokens(compactMemoryPrompt) + estimateMessagesTokens(compactConversationMessages);
   if (total <= totalBudget) {
@@ -1049,7 +1263,7 @@ function fitVariableContextToBudget(
   }
 
   const conversationOnlyBudget = Math.max(0, totalBudget - estimateTextTokens(compactMemoryPrompt));
-  compactConversationMessages = compressConversationMessages(cleanedConversationMessages, conversationOnlyBudget);
+  compactConversationMessages = compressConversationTurns(conversationTurns, conversationOnlyBudget);
 
   return {
     memoryPrompt: compactMemoryPrompt,
@@ -1065,13 +1279,19 @@ function modelContextWindowTokens(model: string): number {
 function prepareModelRequest(
   baseSystemPrompt: string,
   memoryPrompt: string,
-  conversationMessages: readonly LlmMessage[],
+  conversationTurns: readonly ConversationTurn[],
   currentMessage: string,
 ): PreparedModelRequest {
-  const fixedSystemPrompt = buildModelSystemPrompt(baseSystemPrompt).trim();
-  const currentUserMessage: LlmMessage = {
-    role: "user",
-    content: normalizeMessageContent(currentMessage),
+  // System prompt = persona + decision protocol ONLY. The retrieved memory
+  // block and the per-request batch instruction ride in the volatile tail
+  // message, so the system prefix and the conversation timeline stay
+  // byte-identical across requests (cache-stable prefix; only the tail after
+  // the cache breakpoint changes per request).
+  const systemPrompt = buildModelSystemPrompt(baseSystemPrompt).trim();
+
+  const buildTailMessage = (memory: string, current: string): LlmMessage | null => {
+    const content = [memory.trim(), normalizeMessageContent(current)].filter(Boolean).join("\n\n");
+    return content ? { role: "user", content } : null;
   };
 
   // Clamp the configured budget to the active model's input window so an 800K
@@ -1082,66 +1302,62 @@ function prepareModelRequest(
     Math.max(MIN_CONTEXT_LIMIT_TOKENS, modelWindowTokens - CONTEXT_MODEL_WINDOW_MARGIN_TOKENS),
   );
   const compressThresholdTokens = Math.min(contextBudgetConfig.compressThresholdTokens, limitTokens);
+  const compressTargetTokens = Math.min(contextBudgetConfig.compressTargetTokens, compressThresholdTokens);
 
   let usedCompression = false;
-  let fittedVariableContext = {
-    memoryPrompt: memoryPrompt.trim(),
-    conversationMessages: sanitizeConversationMessages(conversationMessages),
-  };
-
-  let systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
-  let messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
+  let fittedMemoryPrompt = memoryPrompt.trim();
+  let conversationMessages = formatConversationTurnsForModel(conversationTurns);
+  let tailMessage = buildTailMessage(fittedMemoryPrompt, currentMessage);
+  let messages = tailMessage ? [...conversationMessages, tailMessage] : [...conversationMessages];
   let estimatedTokens = estimateRequestTokens(systemPrompt, messages);
 
-  const fixedBudget = estimateSystemPromptTokens(fixedSystemPrompt) + estimateMessageTokens(currentUserMessage);
+  const bareTail = buildTailMessage("", currentMessage);
+  const fixedBudget = estimateSystemPromptTokens(systemPrompt) + (bareTail ? estimateMessageTokens(bareTail) : 0);
+
+  const rebuildWithBudget = (variableBudget: number): void => {
+    const fitted = fitVariableContextToBudget(memoryPrompt, conversationTurns, variableBudget);
+    fittedMemoryPrompt = fitted.memoryPrompt;
+    conversationMessages = fitted.conversationMessages;
+    tailMessage = buildTailMessage(fittedMemoryPrompt, currentMessage);
+    messages = tailMessage ? [...conversationMessages, tailMessage] : [...conversationMessages];
+    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
+    usedCompression = true;
+  };
 
   if (estimatedTokens > compressThresholdTokens) {
-    const softVariableBudget = Math.max(0, compressThresholdTokens - fixedBudget);
-    fittedVariableContext = fitVariableContextToBudget(
-      memoryPrompt,
-      conversationMessages,
-      softVariableBudget,
+    // Soft pass: squeeze down to the compression TARGET (not just back under
+    // the threshold) so the context has headroom to grow before the next
+    // compression.
+    rebuildWithBudget(Math.max(0, compressTargetTokens - fixedBudget));
+  }
+
+  if (estimatedTokens > limitTokens) {
+    rebuildWithBudget(Math.max(0, limitTokens - fixedBudget));
+  }
+
+  if (estimatedTokens > limitTokens) {
+    const systemAndHistoryTokens = estimateSystemPromptTokens(systemPrompt)
+      + estimateMessagesTokens(conversationMessages)
+      + estimateTextTokens(fittedMemoryPrompt);
+    const currentMessageBudget = Math.max(8, limitTokens - systemAndHistoryTokens - 6);
+    tailMessage = buildTailMessage(
+      fittedMemoryPrompt,
+      compactTextToTokenBudget(currentMessage, currentMessageBudget),
     );
-    systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
-    messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
+    messages = tailMessage ? [...conversationMessages, tailMessage] : [...conversationMessages];
     estimatedTokens = estimateRequestTokens(systemPrompt, messages);
     usedCompression = true;
   }
 
   if (estimatedTokens > limitTokens) {
-    const hardVariableBudget = Math.max(0, limitTokens - fixedBudget);
-    fittedVariableContext = fitVariableContextToBudget(
-      memoryPrompt,
-      conversationMessages,
-      hardVariableBudget,
-    );
-    systemPrompt = [fixedSystemPrompt, fittedVariableContext.memoryPrompt].filter(Boolean).join("\n\n");
-    messages = [...fittedVariableContext.conversationMessages, currentUserMessage];
-    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
-    usedCompression = true;
-  }
-
-  if (estimatedTokens > limitTokens) {
-    const systemAndHistoryBudget = estimateSystemPromptTokens(systemPrompt) + estimateMessagesTokens(fittedVariableContext.conversationMessages);
-    const currentMessageBudget = Math.max(8, limitTokens - systemAndHistoryBudget - 6);
-    const compactCurrentUserMessage: LlmMessage = {
-      role: "user",
-      content: compactTextToTokenBudget(currentUserMessage.content, currentMessageBudget),
-    };
-    messages = [...fittedVariableContext.conversationMessages, compactCurrentUserMessage];
-    estimatedTokens = estimateRequestTokens(systemPrompt, messages);
-    usedCompression = true;
-  }
-
-  if (estimatedTokens > limitTokens) {
-    systemPrompt = fixedSystemPrompt;
-    messages = [{
-      role: "user",
-      content: compactTextToTokenBudget(
-        currentUserMessage.content,
+    const fallbackTail = buildTailMessage(
+      "",
+      compactTextToTokenBudget(
+        currentMessage,
         Math.max(8, limitTokens - estimateSystemPromptTokens(systemPrompt) - 6),
       ),
-    }];
+    );
+    messages = fallbackTail ? [fallbackTail] : [];
     estimatedTokens = estimateRequestTokens(systemPrompt, messages);
     usedCompression = true;
   }
@@ -1192,6 +1408,7 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  const nextReadOnly = await loadReadOnlyConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
@@ -1202,10 +1419,11 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   browserObservationAttemptAtMs = new Map();
   aiToneConfig = nextAiToneConfig;
   hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
+  applyReadOnlyMode(nextReadOnly, "config.yaml");
   pushMonitorEntry(
     "status",
     "Config Reloaded",
-    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens})`,
+    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens} to ${contextBudgetConfig.compressTargetTokens})`,
   );
 }
 
@@ -2269,6 +2487,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     autonomySidebar: buildAutonomySidebarSnapshot(),
     claudeUsage: getLatestClaudeUsage(),
     tokenStats: getTodayTokenStats(),
+    readOnly: readOnlyMode,
   };
 }
 
@@ -2399,6 +2618,7 @@ function appendConversationTurn(turn: ConversationTurn): void {
   const next = mergeConversationTurns([...existing, normalizedTurn], turn.timestamp);
   conversationHistoryByGroup.set(groupKey, next);
   globalContextDirty = true;
+  conversationHistoryPersistDirty = true;
   broadcastMonitorEvent({
     type: "turn",
     groupId: groupKey,
@@ -2441,25 +2661,14 @@ function buildConversationMessages(context: ModelRequestContext, currentMessages
   return turns.map(formatConversationTurnForModel);
 }
 
-// Merge every group's history into one chronological context. Used for both the
-// real reply and the cache warmer so they share an identical cacheable prefix.
-function buildGlobalConversationMessages(
-  context: ModelRequestContext,
-  currentMessages: readonly PendingModelMessage[],
-): LlmMessage[] {
-  const groupKey = normalizeConversationGroupKey(context.groupId);
-  const currentTurnKeys = new Set(
-    currentMessages.map((item) => getConversationTurnKey({
-      groupId: groupKey,
-      role: "user",
-      senderName: item.context.senderName,
-      userId: item.context.userId,
-      content: item.message.trim(),
-      timestamp: item.context.receivedAt,
-      messageId: item.context.messageId,
-    })),
-  );
-
+// Merge every group's history into one chronological timeline of turns. The
+// current pending batch is NOT filtered out: incoming messages are appended to
+// history on arrival, so the timeline already contains them in their permanent
+// format — the volatile tail instruction only names the group to scan.
+// That keeps the rendered prefix byte-identical to the one the next request
+// (and the cache warmer, and Gate B) renders, so the prompt cache accrues
+// incrementally instead of re-reading history on every scan.
+function buildGlobalConversationTurns(context: ModelRequestContext): ConversationTurn[] {
   const allTurns: ConversationTurn[] = [];
   for (const turns of conversationHistoryByGroup.values()) {
     for (const turn of turns) {
@@ -2469,9 +2678,7 @@ function buildGlobalConversationMessages(
 
   // mergeConversationTurns dedupes (by group-aware key), sorts by timestamp, and
   // prunes anything newer than the message being processed.
-  return mergeConversationTurns(allTurns, context.receivedAt)
-    .filter((turn) => !currentTurnKeys.has(getConversationTurnKey(turn)))
-    .map(formatGlobalConversationTurnForModel);
+  return mergeConversationTurns(allTurns, context.receivedAt);
 }
 
 function hasConversationContextForGroup(groupId: string | null, referenceTime: string): boolean {
@@ -2488,9 +2695,49 @@ function hasConversationContextForGroup(groupId: string | null, referenceTime: s
     } else {
       conversationHistoryByGroup.delete(groupKey);
     }
+    conversationHistoryPersistDirty = true;
   }
 
   return pruned.length > 0;
+}
+
+// Snapshot the merged timeline to disk (only when it changed since the last
+// snapshot). Restart recovery: restoreConversationContext loads this file
+// before the WS connects, so cross-day history and quiet groups survive a
+// restart — the day-history bootstrap alone only refetches today's messages.
+function persistConversationContext(): void {
+  const store = conversationContextStore;
+  if (!store || !conversationHistoryPersistDirty) {
+    return;
+  }
+
+  conversationHistoryPersistDirty = false;
+  void store.save(conversationHistoryByGroup);
+}
+
+async function restoreConversationContext(store: ConversationContextStore): Promise<void> {
+  const restored = await store.load();
+  if (restored.size === 0) {
+    return;
+  }
+
+  const nowIso = new Date().toISOString();
+  let restoredTurns = 0;
+  for (const [groupKey, turns] of restored) {
+    // mergeConversationTurns re-dedupes and re-sorts, and the same group-aware
+    // keys let the later day-history bootstrap merge on top without duplicates.
+    const merged = mergeConversationTurns(turns, nowIso);
+    if (merged.length > 0) {
+      conversationHistoryByGroup.set(groupKey, merged);
+      restoredTurns += merged.length;
+    }
+  }
+
+  pushMonitorEntry(
+    "status",
+    "Context Restored",
+    `groups=${conversationHistoryByGroup.size}\nturns=${restoredTurns}\nLoaded persisted conversation timeline from disk.`,
+  );
 }
 
 async function bootstrapTodayGroupHistoryContext(groupId: string, referenceTime: string): Promise<void> {
@@ -2569,6 +2816,7 @@ async function bootstrapTodayGroupHistoryContext(groupId: string, referenceTime:
   const existing = conversationHistoryByGroup.get(groupKey) ?? [];
   const next = mergeConversationTurns([...existing, ...loadedTurns], referenceTime);
   conversationHistoryByGroup.set(groupKey, next);
+  conversationHistoryPersistDirty = true;
   pushMonitorEntry(
     "status",
     "Context Bootstrap",
@@ -2690,31 +2938,22 @@ function formatLocalDateTimeForModel(date = new Date()): string {
 }
 
 function formatUnreadMessagesForModel(messages: readonly PendingModelMessage[]): string {
-  // The batch is single-group (queued per group), so any message carries the
-  // current group_id. Surface it so the system prompt's per-group rules (e.g.
-  // "group_id=20000003 只复读") can actually be applied — the compact message
-  // format strips the group prefix, so this is the model's only signal of which
-  // group it is in. Lives in the per-request tail, so it costs no prompt cache.
+  // The full merged timeline (including these messages, in their permanent
+  // format) is already in the cached prefix above. This volatile tail only
+  // carries the per-request metadata (current time, group_id for per-group
+  // rules) and points the model at the group's latest timeline activity. It
+  // deliberately does NOT re-list the pending messages as an "unread" batch:
+  // an explicit unread list made the model judge whatever was listed even when
+  // the timeline showed Holly had already handled it, producing duplicate
+  // replies. It sits after the cache breakpoint, so it costs no prompt cache.
   const groupId = normalizeConversationGroupKey(messages.at(-1)?.context.groupId ?? null);
-  const lines = [
-    "Scheduled unread-message scan for this group:",
+  return [
+    "Scheduled reply scan for this group:",
     `- current_time: ${formatLocalDateTimeForModel()}`,
     ...(groupId ? [`- group_id: ${groupId}`] : []),
-    `- unread_message_count: ${messages.length}`,
-    `- stale_after_seconds: ${Math.floor(MESSAGE_REPLY_MAX_AGE_MS / 1000)}`,
-    "- Decide whether to reply to anything in this unread batch. Send at most one reply.",
-  ];
-
-  for (const [index, item] of messages.entries()) {
-    lines.push(
-      "",
-      `Unread message ${index + 1}:`,
-      `- message_age_seconds: ${formatMessageAgeSeconds(item.context.messageLagMs)}`,
-      formatSameGroupUserContent(item.message, item.context.senderName, item.context.userId),
-    );
-  }
-
-  return lines.join("\n");
+    "- 上方全局时间线已包含全部消息。请只根据该群位于时间线末尾的最新动态决定是否回复,最多发一条。",
+    "- 时间线里 Holly 已经回复过的内容,以及该群中 Holly 最后一条发言之前的消息,都视为已处理:不要再回复,仅作上下文。",
+  ].join("\n");
 }
 
 function formatMemoryLine(record: StoredMemoryRecord): string | null {
@@ -3145,7 +3384,9 @@ function sanitizeFinalAnswer(text: string): string {
     .replace(/^(?:\u6700\u7ec8\u56de\u7b54|\u6700\u7ec8\u56de\u590d|final_answer|final answer)\s*[:\uFF1A]\s*/i, "")
     .trim();
 
-  return cleaned;
+  // The context labels turns with group tags ("[\u7fa4123456]"\u3001"\u7fa4\u804a [..] [..]");
+  // the model occasionally mimics them at the start of a reply. Never send those.
+  return stripGroupReplyPrefix(cleaned);
 }
 
 function sanitizeThinkingProcess(text: string): string {
@@ -3261,6 +3502,11 @@ function handleWsActionResponse(content: string): boolean {
 // assistant turn we record can share its dedup key with the same message if it
 // later re-enters context via the day-history bootstrap. null when unavailable.
 async function sendGroupMessage(groupId: number, message: string): Promise<string | null> {
+  // Defense in depth: every send path checks read-only mode before getting
+  // here, so this firing means a gate was missed — fail loudly, never send.
+  if (readOnlyMode) {
+    throw new Error("Read-only mode is enabled; group message suppressed.");
+  }
   const response = await sendWsAction("send_group_msg", {
       group_id: groupId,
       message,
@@ -3309,7 +3555,7 @@ async function applyLookupIfRequested(
   ctx: {
     client: LlmClient;
     memoryPrompt: string;
-    conversationMessages: readonly LlmMessage[];
+    conversationTurns: readonly ConversationTurn[];
     batchMessage: string;
     startedAt: number;
   },
@@ -3349,7 +3595,7 @@ async function applyLookupIfRequested(
   const prepared = prepareModelRequest(
     ctx.client.systemPrompt,
     ctx.memoryPrompt,
-    ctx.conversationMessages,
+    ctx.conversationTurns,
     augmentedMessage,
   );
 
@@ -3412,11 +3658,11 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     batchMessage,
     messages.map((item) => item.message),
   );
-  const conversationMessages = buildGlobalConversationMessages(effectiveContext, messages);
+  const conversationTurns = buildGlobalConversationTurns(effectiveContext);
   const preparedRequest = prepareModelRequest(
     client.systemPrompt,
     memoryPrompt,
-    conversationMessages,
+    conversationTurns,
     batchMessage,
   );
 
@@ -3452,7 +3698,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
             content: [
               "Your previous JSON final_answer ended mid-sentence and was rejected locally.",
               `Rejected final_answer: ${rejectedIncompleteFinalAnswer}`,
-              "Return JSON only for the same unread batch. If replying, final_answer must be a complete sendable message. Keep it short, but do not end with dangling words like 是、因为、但是、不过、然后、比如、例如、问题是.",
+              "Return JSON only for the same scan. If replying, final_answer must be a complete sendable message. Keep it short, but do not end with dangling words like 是、因为、但是、不过、然后、比如、例如、问题是.",
             ].join("\n"),
           },
         ]
@@ -3486,7 +3732,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     reply = await applyLookupIfRequested(reply, {
       client,
       memoryPrompt,
-      conversationMessages,
+      conversationTurns,
       batchMessage,
       startedAt,
     });
@@ -3560,6 +3806,17 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     return;
   }
 
+  // A batch already on the model queue when read-only was switched on still
+  // reaches here; suppress it cleanly instead of tripping the send guard.
+  if (readOnlyMode) {
+    pushMonitorEntry(
+      "status",
+      "Reply Suppressed",
+      `read_only=true\ngroup_id=${replyGroupId}\n${decision.finalAnswer}`,
+    );
+    return;
+  }
+
   // Shadow: score the reply's AI tone before sending (log-only, never blocks).
   recordOutgoingAiTone(decision.finalAnswer, replyGroupId);
 
@@ -3616,15 +3873,15 @@ async function warmGlobalContext(): Promise<void> {
     messageLagMs: null,
   };
 
-  const conversationMessages = buildGlobalConversationMessages(warmRequestContext, []);
-  if (conversationMessages.length === 0) {
+  const conversationTurns = buildGlobalConversationTurns(warmRequestContext);
+  if (conversationTurns.length === 0) {
     globalContextDirty = false;
     return;
   }
 
   // Build the same system + history prefix a real reply uses (empty current
   // message, no memory) so the warmed cache is the one the next reply reads.
-  const prepared = prepareModelRequest(client.systemPrompt, "", conversationMessages, "");
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, "");
   if (prepared.messages.length === 0) {
     globalContextDirty = false;
     return;
@@ -3653,6 +3910,12 @@ async function warmGlobalContext(): Promise<void> {
 }
 
 function scheduleGlobalContextWarm(): void {
+  // The warm cache only serves group replies; in read-only mode none happen,
+  // so warming would burn tokens for nothing.
+  if (readOnlyMode) {
+    return;
+  }
+
   // Serialize on the model queue so warming never races a real reply; concurrent
   // requests sharing a prefix would all miss the cache.
   modelQueue = modelQueue
@@ -3756,6 +4019,7 @@ function toSidebarWorldObservation(
     query: item.observation.query,
     summary: compactReflectionText(item.observation.summary, 900),
     urls: item.observation.urls.slice(0, 5),
+    pageErrors: (item.observation.pageErrors ?? []).slice(0, 5),
   };
 }
 
@@ -3900,12 +4164,16 @@ function browserObservationCacheKey(query: string): string {
 }
 
 function toProactiveWorldObservation(observation: BrowserTopicObservation): ProactiveWorldObservation {
+  const pageErrors = observation.pages
+    .filter((page) => page.error)
+    .map((page) => `${page.url}: ${page.error}`);
   return {
     query: observation.query,
     summary: observation.summary,
     urls: observation.pages
       .map((page) => page.url)
       .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index),
+    ...(pageErrors.length > 0 ? { pageErrors } : {}),
   };
 }
 
@@ -3932,6 +4200,9 @@ function toWorldObservationMemoryFromStoredRecord(
       query,
       summary,
       urls: record.memoryUrls,
+      ...(record.worldObservationPageErrors.length > 0
+        ? { pageErrors: record.worldObservationPageErrors }
+        : {}),
     },
   };
 }
@@ -3996,8 +4267,20 @@ async function loadWorldObservationMemory(): Promise<void> {
       const urls = Array.isArray(record.urls)
         ? record.urls.filter((url): url is string => typeof url === "string")
         : [];
+      const pageErrors = Array.isArray(record.page_errors)
+        ? record.page_errors.filter((error): error is string => typeof error === "string")
+        : [];
       if (!Number.isFinite(ts) || !topic || !query || !summary) continue;
-      loaded.push({ observedAtMs: ts, topic, observation: { query, summary, urls } });
+      loaded.push({
+        observedAtMs: ts,
+        topic,
+        observation: {
+          query,
+          summary,
+          urls,
+          ...(pageErrors.length > 0 ? { pageErrors } : {}),
+        },
+      });
     } catch {
       // Ignore corrupt lines; this is an append-only shadow log.
     }
@@ -4073,6 +4356,7 @@ async function observeWorldForAutonomy(
   });
   if (!observed) {
     pushMonitorEntry("status", "Browser Agent Empty", `topic=${request.topic}\nquery=${query}`);
+    await notifyWorldObservationFailure(request.topic, `抓取失败或页面内容为空 query=${query}`);
     return null;
   }
 
@@ -4092,6 +4376,7 @@ async function observeWorldForAutonomy(
       query: worldObservation.query,
       summary: worldObservation.summary,
       urls: worldObservation.urls,
+      pageErrors: worldObservation.pageErrors ?? [],
       cached: worldObservation.cached === true,
     });
   } catch (error) {
@@ -4136,15 +4421,25 @@ function broadcastLatestLlmUsage(): void {
   }
 }
 
+// Keeps line breaks (collapsing blank lines) so multi-item broadcasts — one
+// numbered news item per line — survive into the QQ message. On overflow,
+// whole trailing lines are dropped first so every kept item stays complete
+// (prose + link, the prompt puts one item per line); the mid-line char slice
+// is a last resort for a single line that alone exceeds the budget.
 function normalizeBroadcastMessage(text: string, maxChars: number): string {
-  return compactReflectionText(
-    text
-      .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-zA-Z0-9_-]*|```/g, " "))
-      .replace(/\r?\n+/g, " ")
-      .replace(/\s+/g, " ")
-      .trim(),
-    maxChars,
-  );
+  const lines = text
+    .replace(/```[\s\S]*?```/g, (block) => block.replace(/```[a-zA-Z0-9_-]*|```/g, " "))
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  let normalized = lines.join("\n").trim();
+  while (normalized.length > maxChars && lines.length > 1) {
+    lines.pop();
+    normalized = lines.join("\n").trim();
+  }
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
 }
 
 function containsChineseText(text: string): boolean {
@@ -4155,7 +4450,11 @@ function buildWorldObservationBroadcastPrompt(topic: string, observation: Proact
   return [
     "Translate and condense this browser world observation into Simplified Chinese for a QQ group.",
     "Keep the factual content. Do not mention that it was translated.",
-    "Use 2-4 short conversational sentences, no markdown bullets, no @ mentions, and stay under 500 Chinese characters.",
+    "If the observation contains MULTIPLE distinct news items, pick AT MOST 5 of the most informative ones (drop the rest) and put each on its own line numbered like 1. 2. 3. — one short sentence per item; an optional short intro line before the list is fine.",
+    "If there is only ONE item, use 2-4 short conversational sentences instead (no numbering).",
+    "Append a link at the end of each item (same line). Prefer the item's own detail-page link: pick the entry under 'Detail links' (below the matching source) whose text matches that item. Fall back to the page-level Source URL only when no detail link matches — never use a site homepage when a matching detail link exists.",
+    "Copy URLs EXACTLY from the observation below — never invent, shorten or rewrite URLs. Skip the link only if nothing matches the item.",
+    "No markdown bullets or headings (plain URLs, not [text](url)), no @ mentions, and stay under 500 Chinese characters of prose (URLs not counted).",
     "If the source text is noisy, keep only the most useful concrete points.",
     "",
     `topic: ${topic}`,
@@ -4197,7 +4496,9 @@ async function translateWorldObservationForBroadcast(
 
   broadcastLatestLlmUsage();
 
-  const message = normalizeBroadcastMessage(reply, 500);
+  // 800 instead of 500: source URLs ride along and are long; the prose itself
+  // is still prompted to stay under 500 Chinese characters.
+  let message = normalizeBroadcastMessage(reply, 800);
   if (!message) return null;
   if (!containsChineseText(message)) {
     pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message did not contain Chinese text.\n${message}`);
@@ -4207,7 +4508,61 @@ async function translateWorldObservationForBroadcast(
     pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message contains an @ mention.\n${message}`);
     return null;
   }
+
+  // Fallback: if the model dropped the links, append the observed page URLs so
+  // the broadcast always carries its sources.
+  if (!/https?:\/\//i.test(message)) {
+    const sourceLinks = observation.urls.slice(0, 2).join(" ");
+    if (sourceLinks) {
+      message = `${message}\n来源: ${sourceLinks}`;
+    }
+  }
   return message;
+}
+
+// Failed observations get a short notice in the failure group instead of a
+// status-level silent skip, so broken fetches are visible from the chat itself.
+async function notifyWorldObservationFailure(topic: string, reason: string): Promise<void> {
+  const targetGroupId = autonomyConfig.worldObservationFailureGroupId;
+  if (!targetGroupId) return;
+
+  if (readOnlyMode) {
+    pushMonitorEntry(
+      "status",
+      "World Observation Failure Notice Skipped",
+      `read_only=true\ntopic=${topic}\n${reason}`,
+    );
+    return;
+  }
+
+  const groupKey = normalizeConversationGroupKey(targetGroupId);
+  const numericGroupId = Number(groupKey);
+  if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
+    pushMonitorEntry("error", "World Observation Failure Notice Skipped", `Invalid group_id=${targetGroupId}`);
+    return;
+  }
+
+  try {
+    const message = compactReflectionText(`世界观察失败: ${topic} — ${reason}`, 300);
+    const sentMessageId = await sendGroupMessage(numericGroupId, message);
+    appendConversationTurn({
+      groupId: groupKey,
+      role: "assistant",
+      senderName: null,
+      userId: null,
+      content: message,
+      timestamp: new Date().toISOString(),
+      messageId: sentMessageId,
+    });
+    pushMonitorEntry(
+      "outgoing",
+      "World Observation Failure Notice Sent",
+      `group_id=${groupKey}\ntopic=${topic}\n${reason}`,
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "World Observation Failure Notice Failed", `topic=${topic}\n${detail}`);
+  }
 }
 
 async function maybeBroadcastWorldObservation(
@@ -4218,6 +4573,15 @@ async function maybeBroadcastWorldObservation(
   const targetGroupId = autonomyConfig.worldObservationBroadcastGroupId;
   if (!targetGroupId) return;
 
+  if (readOnlyMode) {
+    pushMonitorEntry(
+      "status",
+      "World Observation Broadcast Skipped",
+      `read_only=true\ntopic=${topic}\nObservation kept; nothing sent to the group.`,
+    );
+    return;
+  }
+
   const groupKey = normalizeConversationGroupKey(targetGroupId);
   const numericGroupId = Number(groupKey);
   if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
@@ -4225,9 +4589,44 @@ async function maybeBroadcastWorldObservation(
     return;
   }
 
+  const pageErrors = observation.pageErrors ?? [];
+  if (pageErrors.length > 0) {
+    pushMonitorEntry(
+      "status",
+      "World Observation Broadcast Skipped",
+      `group_id=${groupKey}\ntopic=${topic}\nPage open failed; notifying failure group.\n${pageErrors.slice(0, 3).join("\n")}`,
+    );
+    await notifyWorldObservationFailure(topic, `页面打开失败 ${pageErrors.slice(0, 2).join(" ; ")}`);
+    return;
+  }
+
+  // Success path only interrupts the broadcast group when the conversation
+  // there has lulled; an active chat means the news can wait for the next run.
+  const latestActivity = await latestKnownGroupActivity(groupKey);
+  if (latestActivity) {
+    const idleMs = Date.now() - latestActivity.timestampMs;
+    if (idleMs < autonomyConfig.worldObservationBroadcastLullMs) {
+      pushMonitorEntry(
+        "status",
+        "World Observation Broadcast Skipped",
+        `group_id=${groupKey}\nConversation still active: idle_minutes=${Math.floor(idleMs / 60000)} < ${Math.ceil(autonomyConfig.worldObservationBroadcastLullMs / 60000)}`,
+      );
+      return;
+    }
+  }
+
   const message = await translateWorldObservationForBroadcast(topic, observation);
   if (!message) {
-    pushMonitorEntry("status", "World Observation Broadcast Skipped", `group_id=${groupKey}\ntopic=${topic}\nNo translated message.`);
+    // Show the head of the source summary so the monitor makes it obvious when
+    // the skip is because the observation was boilerplate (cookie/nav) noise
+    // rather than a transient LLM issue.
+    const summaryHead = observation.summary.replace(/\s+/g, " ").trim().slice(0, 80);
+    pushMonitorEntry(
+      "status",
+      "World Observation Broadcast Skipped",
+      `group_id=${groupKey}\ntopic=${topic}\nNo usable translated message (source may be noise); notifying failure group.\nsummary_head=${summaryHead || "(empty)"}`,
+    );
+    await notifyWorldObservationFailure(topic, `抓到的内容不可用(可能是噪声或翻译失败) ${summaryHead ? `开头=「${summaryHead}」` : ""}`.trim());
     return;
   }
 
@@ -4331,6 +4730,15 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
   const targetGroupId = autonomyConfig.memoryReflectionBroadcastGroupId;
   if (!targetGroupId) return;
 
+  if (readOnlyMode) {
+    pushMonitorEntry(
+      "status",
+      "Memory Reflection Broadcast Skipped",
+      `read_only=true\ntopic=${request.topic}\nMemory kept; nothing sent to the group.`,
+    );
+    return;
+  }
+
   const groupKey = normalizeConversationGroupKey(targetGroupId);
   const numericGroupId = Number(groupKey);
   if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
@@ -4398,6 +4806,7 @@ function formatWorldObservationsForReflection(nowMs: number): string[] {
       `- topic: ${item.topic}`,
       `- query: ${item.observation.query}`,
       `- urls: ${item.observation.urls.slice(0, 3).join(" ") || "(none)"}`,
+      `- page_errors: ${(item.observation.pageErrors ?? []).slice(0, 3).join(" ") || "(none)"}`,
       `- summary: ${compactReflectionText(item.observation.summary, 900)}`,
     ].join("\n"));
 }
@@ -4556,27 +4965,276 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
   }
 }
 
+const ARCHIVE_LOG_PATH = join(ARCHIVE_DIR, "archive.jsonl");
+const ARCHIVE_MEMORY_LIMIT = 400;
+const ARCHIVE_TITLE_MAX_CHARS = 120;
+const ARCHIVE_CONTENT_MAX_CHARS = 12000;
+
+const ARCHIVE_COMPOSE_JSON_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["should_write", "kind", "title", "content", "reason"],
+  properties: {
+    should_write: { type: "boolean" },
+    kind: { type: "string", enum: ["article", "poem"] },
+    title: { type: "string" },
+    content: { type: "string" },
+    reason: { type: "string" },
+  },
+};
+
+// Unlike compactReflectionText this keeps line breaks — a poem's shape is part
+// of the work.
+function clampArchiveText(text: string, maxChars: number): string {
+  const normalized = text.replace(/\r\n/g, "\n").trim();
+  if (normalized.length <= maxChars) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxChars - 3)).trimEnd()}...`;
+}
+
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function archiveKindLabel(kind: ArchiveWorkKind): string {
+  return kind === "poem" ? "诗" : "文章";
+}
+
+function renderArchiveWorkHtml(work: ArchiveWorkRecord): string {
+  const writtenAt = new Date(work.ts).toLocaleString("zh-CN");
+  return `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>${escapeHtml(work.title)} · Holly Archive</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      min-height: 100vh; padding: 48px 20px;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: #1e293b;
+      background: linear-gradient(135deg, #f0f4f8, #e8eef5);
+      display: flex; justify-content: center;
+    }
+    .work {
+      width: 100%; max-width: 720px;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(148,163,184,0.28);
+      border-radius: 14px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      padding: 40px 44px;
+    }
+    .kind {
+      display: inline-block; padding: 4px 10px; border-radius: 999px;
+      font-size: 11px; font-weight: 700; background: #ccfbf1; color: #0f766e;
+      margin-bottom: 14px;
+    }
+    h1 { font-size: 26px; letter-spacing: -0.02em; margin-bottom: 8px; }
+    .meta { font-size: 12px; color: #64748b; margin-bottom: 28px; }
+    .content {
+      white-space: pre-wrap; word-break: break-word;
+      font-family: Georgia, "Noto Serif SC", serif;
+      font-size: 16px; line-height: 1.9;
+    }
+    .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid rgba(148,163,184,0.28); font-size: 11px; color: #94a3b8; }
+  </style>
+</head>
+<body>
+  <article class="work">
+    <span class="kind">${escapeHtml(archiveKindLabel(work.kind))}</span>
+    <h1>${escapeHtml(work.title)}</h1>
+    <div class="meta">Holly · ${escapeHtml(writtenAt)}${work.reason ? ` · ${escapeHtml(work.reason)}` : ""}</div>
+    <div class="content">${escapeHtml(work.content)}</div>
+    <div class="footer">Holly Archive · ${escapeHtml(work.id)}</div>
+  </article>
+</body>
+</html>
+`;
+}
+
+function coerceArchiveWork(value: unknown): ArchiveWorkRecord | null {
+  if (!value || typeof value !== "object") return null;
+  const v = value as Record<string, unknown>;
+  const id = typeof v.id === "string" ? v.id.trim() : "";
+  const ts = typeof v.ts === "string" ? v.ts : "";
+  const title = typeof v.title === "string" ? v.title.trim() : "";
+  const content = typeof v.content === "string" ? v.content : "";
+  if (!id || !ts || !title || !content) return null;
+  return {
+    id,
+    ts,
+    kind: v.kind === "poem" ? "poem" : "article",
+    title,
+    content,
+    reason: typeof v.reason === "string" ? v.reason : "",
+    file: typeof v.file === "string" ? v.file : "",
+  };
+}
+
+async function loadArchiveWorks(): Promise<void> {
+  let raw: string;
+  try {
+    raw = await readFile(ARCHIVE_LOG_PATH, "utf-8");
+  } catch {
+    return; // No archive yet.
+  }
+  const works: ArchiveWorkRecord[] = [];
+  for (const line of raw.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const work = coerceArchiveWork(JSON.parse(trimmed));
+      if (work) works.push(work);
+    } catch {
+      // Skip corrupt lines; never block startup on a bad archive record.
+    }
+  }
+  archiveWorks = works.slice(-ARCHIVE_MEMORY_LIMIT);
+}
+
+function parseArchiveComposition(raw: string): AutonomyArchiveWriteRequest | null {
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(unwrapJsonBlock(raw)) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+
+  if (parsed.should_write !== true) return null;
+  const kind: ArchiveWorkKind = parsed.kind === "poem" ? "poem" : "article";
+  const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
+  const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
+  const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : "";
+  if (!title || !content) return null;
+  return {
+    kind,
+    title: compactReflectionText(title, ARCHIVE_TITLE_MAX_CHARS),
+    content: clampArchiveText(content, ARCHIVE_CONTENT_MAX_CHARS),
+    reason: compactReflectionText(reason || "scheduled archive writing", 240),
+  };
+}
+
+async function composeArchiveForAutonomy(
+  request: AutonomyArchiveComposeRequest,
+): Promise<AutonomyArchiveWriteRequest | null> {
+  const client = activeLlmClient;
+  if (!client) return null;
+
+  const nowMs = Date.parse(request.nowIso);
+  const worldBlocks = formatWorldObservationsForReflection(Number.isFinite(nowMs) ? nowMs : Date.now());
+  const internalBlocks = await formatInternalMemoriesForReflection();
+  const conversationBlocks = formatRecentTurnsForReflection();
+  const recentTitles = archiveWorks.slice(-8).map((work) => `- [${work.kind}] ${work.title}`);
+  const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
+  if (material.length === 0) return null;
+
+  const prompt = [
+    "You are Holly's creative writing impulse.",
+    "Decide whether Holly genuinely feels like writing a short article (文章) or a poem (诗) right now, inspired by the material below.",
+    "Only write when something in the material truly sparks it; most of the time nothing does — then set should_write=false.",
+    "If you write: write the complete work, in Chinese or natural mixed Chinese/English, in Holly's own voice.",
+    "A poem should keep its line breaks. An article should be a few coherent paragraphs, not a news digest.",
+    "Do not repeat a recent work's theme.",
+    "Return JSON only with this shape:",
+    '{"should_write": true, "kind": "article" | "poem", "title": "short title", "content": "the full work", "reason": "short reason"}',
+    "",
+    `now=${request.nowIso}`,
+    `reason=${request.reason}`,
+    "",
+    recentTitles.length > 0 ? ["Recent works (avoid repeating):", ...recentTitles, ""].join("\n") : "",
+    material.join("\n\n"),
+  ].filter(Boolean).join("\n");
+
+  let reply: string;
+  try {
+    reply = await client.generateText({
+      systemPrompt: "You write Holly's private creative works. Be genuine and concrete; do not roleplay a public chat reply.",
+      messages: [{ role: "user", content: prompt }],
+      jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,
+    });
+  } catch (error) {
+    pushMonitorEntry("error", "Autonomy Archive Model Error", error instanceof Error ? error.message : String(error));
+    return null;
+  }
+
+  broadcastLatestLlmUsage();
+
+  return parseArchiveComposition(reply);
+}
+
+function appendArchiveWorkLog(record: ArchiveWorkRecord, html: string): Promise<void> {
+  archiveWriteQueue = archiveWriteQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      await mkdir(ARCHIVE_DIR, { recursive: true });
+      await writeFile(join(ARCHIVE_DIR, record.file), html, "utf-8");
+      await appendFile(ARCHIVE_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    });
+  return archiveWriteQueue;
+}
+
+async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Promise<void> {
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("") + "-" + [
+    String(now.getHours()).padStart(2, "0"),
+    String(now.getMinutes()).padStart(2, "0"),
+    String(now.getSeconds()).padStart(2, "0"),
+  ].join("");
+  const id = `${stamp}-${request.kind}`;
+  const record: ArchiveWorkRecord = {
+    id,
+    ts: now.toISOString(),
+    kind: request.kind,
+    title: request.title,
+    content: request.content,
+    reason: request.reason,
+    file: `${id}.html`,
+  };
+
+  await appendArchiveWorkLog(record, renderArchiveWorkHtml(record));
+  archiveWorks.push(record);
+  archiveWorks = archiveWorks.slice(-ARCHIVE_MEMORY_LIMIT);
+  broadcastMonitorEvent({ type: "archive", work: record });
+  pushMonitorEntry(
+    "status",
+    "Archive Work Saved",
+    `kind=${record.kind}\ntitle=${record.title}\nfile=archive/${record.file}`,
+  );
+}
+
 // Gate B (6A): reuse the exact cached system + global-history prefix a reactive
 // reply uses; the proactive instruction rides only in the current-message slot,
 // so this call hits the 1h prompt cache instead of reprocessing the full context.
+// The timeline goes whole and unmarked; the instruction only names the group and
+// the current trigger cycle start, so the model tails the timeline itself.
 async function evaluateProactiveRevival(
-  groupKey: string,
-  threadSummary: string,
+  request: ProactiveRevivalRequest,
 ): Promise<ProactiveDecision | null> {
   const client = activeLlmClient;
   if (!client) return null;
 
   const context: ModelRequestContext = {
-    groupId: groupKey,
+    groupId: request.groupKey,
     userId: null,
     senderName: null,
     rawMessage: null,
     receivedAt: new Date().toISOString(),
     messageLagMs: null,
   };
-  const conversationMessages = buildGlobalConversationMessages(context, []);
-  const instruction = buildProactiveRevivePrompt(threadSummary);
-  const prepared = prepareModelRequest(client.systemPrompt, "", conversationMessages, instruction);
+  const conversationTurns = buildGlobalConversationTurns(context);
+  const instruction = buildProactiveRevivePrompt(request);
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, instruction);
   if (prepared.messages.length === 0) return null;
 
   let reply: string;
@@ -4653,6 +5311,7 @@ function emptyProactiveResult(): ProactiveTickResult {
 // Only the group-message action enters modelQueue. Browser world observation is
 // driven by autonomyQueue so a slow page load cannot block reactive replies.
 function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
+  if (readOnlyMode) return Promise.resolve(emptyProactiveResult());
   const deps = buildProactiveDeps();
   if (!deps || !deps.config.enabled) return Promise.resolve(emptyProactiveResult());
 
@@ -4688,6 +5347,8 @@ function buildAutonomyDeps() {
     observeWorld: observeWorldForAutonomy,
     reflectMemory: reflectMemoryForAutonomy,
     writeMemory: writeMemoryForAutonomy,
+    composeArchive: composeArchiveForAutonomy,
+    writeArchive: writeArchiveForAutonomy,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
     log: (kind: "status" | "error", title: string, body: string) => {
       pushMonitorEntry(kind, title, body);
@@ -4744,6 +5405,12 @@ function claimIncomingMessageId(messageId: string | null): boolean {
 }
 
 function queueUnreadMessageForModel(message: string, context: ModelRequestContext): number | null {
+  // Read-only: the message is already stored and in context; just never hand it
+  // to the reply model. The sidebar toggle makes the silence visible.
+  if (readOnlyMode) {
+    return null;
+  }
+
   const groupKey = normalizeConversationGroupKey(context.groupId);
   if (!groupKey) {
     pushMonitorEntry("status", "Message Skipped", "Cannot schedule model processing without a group_id.");
@@ -4764,6 +5431,20 @@ function queueUnreadMessageForModel(message: string, context: ModelRequestContex
 
 function flushUnreadMessagesToModel(): void {
   if (unreadModelMessagesByGroup.size === 0) {
+    return;
+  }
+
+  // Messages queued just before read-only was switched on: drop them instead of
+  // replying late after the mode is switched back off.
+  if (readOnlyMode) {
+    const dropped = Array.from(unreadModelMessagesByGroup.values())
+      .reduce((count, messages) => count + messages.length, 0);
+    unreadModelMessagesByGroup.clear();
+    pushMonitorEntry(
+      "status",
+      "Read-Only Mode",
+      `Dropped ${dropped} queued unread message(s) without model processing.`,
+    );
     return;
   }
 
@@ -5022,6 +5703,18 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .nav-item:hover { background: rgba(255,255,255,0.06); color: #c8d6e5; }
     .nav-item.active { background: rgba(255,255,255,0.11); color: #fff; }
     .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
+    .mode-row {
+      padding: 12px 18px; border-top: 1px solid rgba(255,255,255,0.07);
+      display: flex; align-items: center; gap: 8px;
+      font-size: 11px; color: var(--sidebar-text);
+      cursor: pointer; user-select: none;
+    }
+    .mode-row:hover { color: #c8d6e5; }
+    .mode-row.on { color: #fbbf24; }
+    .mode-switch { width: 30px; height: 16px; border-radius: 999px; background: #334155; position: relative; transition: background 0.15s; flex-shrink: 0; }
+    .mode-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #94a3b8; transition: left 0.15s, background 0.15s; }
+    .mode-switch.on { background: #b45309; }
+    .mode-switch.on::after { left: 16px; background: #fde68a; }
     .ws-status {
       padding: 14px 18px; border-top: 1px solid rgba(255,255,255,0.07);
       display: flex; align-items: center; gap: 8px;
@@ -5107,6 +5800,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .reflect-links a:hover { text-decoration: underline; }
     .reflect-pill { border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; background: #e2e8f0; color: #334155; }
     .reflect-pill.on { background: #ccfbf1; color: #0f766e; }
+    .archive-body { font-family: Georgia, "Noto Serif SC", serif; font-size: 14px; line-height: 1.85; max-height: 340px; overflow-y: auto; }
     .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
     input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
@@ -5154,7 +5848,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     }
     @media (max-width: 640px) {
       :root { --sidebar-w: 58px; }
-      .brand-name, .brand-sub, .nav-label, .ws-status span:last-child { display: none; }
+      .brand-name, .brand-sub, .nav-label, .mode-label, .ws-status span:last-child { display: none; }
       .nav-item { justify-content: center; }
       .reflect-grid { grid-template-columns: 1fr; }
       .fgrid { grid-template-columns: 1fr; }
@@ -5202,6 +5896,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </svg>
         <span class="nav-label">Reflect</span>
       </li>
+      <li class="nav-item" :class="{active: tab === 'archive'}" @click="tab = 'archive'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M4 19.5A2.5 2.5 0 016.5 17H20"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M6.5 2H20v20H6.5A2.5 2.5 0 014 19.5v-15A2.5 2.5 0 016.5 2z"/>
+        </svg>
+        <span class="nav-label">Archive</span>
+      </li>
       <li class="nav-item" :class="{active: tab === 'usage'}" @click="tab = 'usage'">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M3 3v18h18"/>
@@ -5210,6 +5911,11 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         <span class="nav-label">Usage</span>
       </li>
     </ul>
+    <div class="mode-row" :class="{on: readOnly}" @click="toggleReadOnly"
+      :title="readOnly ? '只读模式：不回复群消息，仍会观察世界、反思记忆和写作' : '正常模式：正常回复群消息'">
+      <span class="mode-switch" :class="{on: readOnly}"></span>
+      <span class="mode-label">{{ readOnly ? '只读模式' : '正常模式' }}{{ modeSwitching ? ' …' : '' }}</span>
+    </div>
     <div class="ws-status">
       <span class="dot" :class="wsStatus.state"></span>
       <span>{{ wsStatusLabel }}</span>
@@ -5527,6 +6233,42 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </template>
     </div>
 
+    <!-- Archive -->
+    <div v-else-if="tab === 'archive'">
+      <div class="ph">
+        <div class="ph-eye">Holly</div>
+        <div class="ph-title">Archive</div>
+        <div class="ph-desc">Holly 想写就写的文章与诗，每篇都以独立网页保存在本地 archive/ 目录。</div>
+      </div>
+      <div class="panel">
+        <div class="ph2">
+          <span class="ph2-title">Works <span v-if="archiveItems.length" style="color:var(--muted);font-weight:600;">&middot; {{ archiveItems.length }}</span></span>
+          <button class="sec sm" @click="loadArchive">Refresh</button>
+        </div>
+        <div class="pb">
+          <div v-if="archiveLoading" class="empty">Loading...</div>
+          <div v-else-if="archiveErr" class="empty">{{ archiveErr }}</div>
+          <div v-else-if="!archiveItems.length" class="empty">Holly 还没有写下任何作品。</div>
+          <div v-else class="reflect-list">
+            <article v-for="w in archiveItems" :key="w.id" class="reflect-card">
+              <div class="reflect-card-head">
+                <span class="reflect-topic">{{ w.title }}</span>
+                <span class="reflect-time">{{ fmtDateTime(w.ts) }}</span>
+              </div>
+              <div class="reflect-meta">
+                <span>{{ w.kind === 'poem' ? '诗' : '文章' }}</span>
+                <span v-if="w.reason">{{ w.reason }}</span>
+              </div>
+              <div class="reflect-body archive-body">{{ w.content }}</div>
+              <div class="reflect-links" v-if="w.file">
+                <a :href="'/archive/' + w.file" target="_blank" rel="noreferrer">本地页面 &middot; archive/{{ w.file }}</a>
+              </div>
+            </article>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <!-- Usage -->
     <div v-else-if="tab === 'usage'">
       <div class="ph">
@@ -5645,6 +6387,15 @@ createApp({
       return Array.isArray(items) ? items.slice().reverse() : [];
     });
 
+    // Archive state
+    var archiveItems = ref([]);
+    var archiveLoading = ref(false);
+    var archiveErr = ref('');
+
+    // Read-only mode state
+    var readOnly = ref(false);
+    var modeSwitching = ref(false);
+
     // Group Talk state
     var groups = ref([]);
     var selGroupId = ref(null);
@@ -5687,6 +6438,11 @@ createApp({
     function fmtTime(ts) {
       if (!ts) return '-';
       try { return new Date(ts).toLocaleTimeString(); } catch(e) { return String(ts); }
+    }
+
+    function fmtDateTime(ts) {
+      if (!ts) return '-';
+      try { return new Date(ts).toLocaleString(); } catch(e) { return String(ts); }
     }
 
     function fmtBody(body) {
@@ -5734,6 +6490,7 @@ createApp({
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
       autonomySidebar.value = payload.autonomySidebar || null;
+      readOnly.value = !!payload.readOnly;
       if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
       if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
@@ -5748,6 +6505,8 @@ createApp({
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
       if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); } return; }
       if (payload.type === 'autonomy') { autonomySidebar.value = payload.autonomySidebar || null; return; }
+      if (payload.type === 'archive') { applyArchiveWork(payload.work); return; }
+      if (payload.type === 'mode') { readOnly.value = !!payload.readOnly; return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
@@ -5844,6 +6603,48 @@ createApp({
       });
     }
 
+    function loadArchive() {
+      archiveLoading.value = true;
+      archiveErr.value = '';
+      fetch('/api/archive').then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load archive');
+          archiveItems.value = d.items || [];
+        });
+      }).catch(function(e) {
+        archiveErr.value = e.message;
+        archiveItems.value = [];
+      }).finally(function() {
+        archiveLoading.value = false;
+      });
+    }
+
+    function applyArchiveWork(work) {
+      if (!work || !work.id) return;
+      var exists = archiveItems.value.some(function(w) { return w.id === work.id; });
+      if (!exists) archiveItems.value.unshift(work);
+    }
+
+    function toggleReadOnly() {
+      if (modeSwitching.value) return;
+      var next = !readOnly.value;
+      modeSwitching.value = true;
+      fetch('/api/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ read_only: next })
+      }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to switch mode');
+          readOnly.value = !!d.readOnly;
+        });
+      }).catch(function(e) {
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Mode Switch Failed', body: e.message, timestamp: new Date().toISOString() });
+      }).finally(function() {
+        modeSwitching.value = false;
+      });
+    }
+
     function loadGroups() {
       fetch('/api/conversations').then(function(r) {
         return r.json().then(function(d) { groups.value = d.groups || []; });
@@ -5888,6 +6689,7 @@ createApp({
       if (t === 'memory') { loadMemories(); loadGroups(); }
       if (t === 'group') { loadGroups(); }
       if (t === 'usage') { loadUsageHistory(); }
+      if (t === 'archive') { loadArchive(); }
     });
 
     function fmtNum(n) {
@@ -5928,11 +6730,13 @@ createApp({
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       autonomySidebar, reflectMemories, reflectWorldObservations,
+      archiveItems, archiveLoading, archiveErr,
+      readOnly, modeSwitching, toggleReadOnly,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
+      fmtTime, fmtDateTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
-      loadUsageHistory
+      loadUsageHistory, loadArchive
     };
   }
 }).mount('#app');
@@ -5951,6 +6755,7 @@ async function bootstrap(): Promise<void> {
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  readOnlyMode = await loadReadOnlyConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
@@ -5969,8 +6774,13 @@ async function bootstrap(): Promise<void> {
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   incomingMessageStore = store;
+  // Restore the persisted merged timeline BEFORE the WS connects, so incoming
+  // messages and the autonomy/proactive loops see the full context immediately.
+  conversationContextStore = new ConversationContextStore(join(LOG_DIR, "conversation-context.json"));
+  await restoreConversationContext(conversationContextStore);
   await loadWorldObservationMemory();
   await loadHollyMemorySidebarRecords();
+  await loadArchiveWorks();
   startConfigWatcher();
   if (store) {
     pushMonitorEntry("status", "Qdrant Ready", store.description);
@@ -5983,7 +6793,14 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Context Budget Ready",
-    `limit=${contextBudgetConfig.limitTokens} tokens\ncompress_at=${contextBudgetConfig.compressThresholdTokens} tokens`,
+    `limit=${contextBudgetConfig.limitTokens} tokens\ncompress_at=${contextBudgetConfig.compressThresholdTokens} tokens\ncompress_to=${contextBudgetConfig.compressTargetTokens} tokens`,
+  );
+  pushMonitorEntry(
+    "status",
+    "Reply Mode",
+    readOnlyMode
+      ? "read_only=true\nGroup sends are suppressed; internal loops keep running."
+      : "read_only=false",
   );
 
   connectWebSocketClient();
@@ -5995,12 +6812,24 @@ async function bootstrap(): Promise<void> {
   // Keep the merged global context's 1h prompt cache warm; skips when idle.
   setInterval(scheduleGlobalContextWarm, CONTEXT_WARM_INTERVAL_MS);
 
+  // Snapshot the merged timeline to disk so a restart keeps the whole context.
+  setInterval(persistConversationContext, CONVERSATION_CONTEXT_PERSIST_INTERVAL_MS);
+  const flushContextAndExit = () => {
+    const contextStore = conversationContextStore;
+    const flush = contextStore && conversationHistoryPersistDirty
+      ? contextStore.save(conversationHistoryByGroup)
+      : Promise.resolve();
+    void flush.finally(() => process.exit(0));
+  };
+  process.once("SIGINT", flushContextAndExit);
+  process.once("SIGTERM", flushContextAndExit);
+
   // Autonomy loop: on a timer, decide whether Holly should observe the world,
   // write internal memory, speak in a group, or do nothing.
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} reflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} reflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",
@@ -6143,6 +6972,50 @@ async function bootstrap(): Promise<void> {
           ? Math.max(1, Math.min(365, Math.floor(limitParam)))
           : 60;
         sendJson(res, 200, getTokenStatsHistory(limit));
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/mode") {
+        sendJson(res, 200, { readOnly: readOnlyMode });
+        return;
+      }
+
+      if (req.method === "POST" && url.pathname === "/api/mode") {
+        const data = (await readJsonBody(req)) as { read_only?: unknown; readOnly?: unknown };
+        const flag = data.read_only ?? data.readOnly;
+        if (typeof flag !== "boolean") {
+          sendJson(res, 400, { error: "read_only (boolean) is required" });
+          return;
+        }
+        applyReadOnlyMode(flag, "monitor ui");
+        await persistReadOnlyMode(flag);
+        sendJson(res, 200, { readOnly: readOnlyMode });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/archive") {
+        const limitValue = Number(url.searchParams.get("limit") || "100");
+        const limit = Number.isFinite(limitValue)
+          ? Math.max(1, Math.min(ARCHIVE_MEMORY_LIMIT, Math.floor(limitValue)))
+          : 100;
+        const items = archiveWorks.slice(-limit).reverse();
+        sendJson(res, 200, { items, directory: ARCHIVE_DIR });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname.startsWith("/archive/")) {
+        const fileName = decodeURIComponent(url.pathname.slice("/archive/".length));
+        // Only files we generated (timestamp-kind.html); rejects traversal.
+        if (!/^[A-Za-z0-9_-]+\.html$/.test(fileName)) {
+          sendJson(res, 404, { error: "Not found" });
+          return;
+        }
+        try {
+          const html = await readFile(join(ARCHIVE_DIR, fileName), "utf-8");
+          sendHtml(res, html);
+        } catch {
+          sendJson(res, 404, { error: "Not found" });
+        }
         return;
       }
 

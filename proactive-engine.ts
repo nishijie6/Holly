@@ -23,6 +23,19 @@ export type ProactiveDecision = {
   thinkingProcess: string;
 };
 
+// Gate-B request. The timeline itself carries no extra marking or re-quoted
+// excerpt: the model reads the group's tail straight from the global timeline,
+// and this only tells it where the current proactive trigger cycle starts.
+export type ProactiveRevivalRequest = {
+  groupKey: string;
+  // Start of the current proactive trigger cycle (the interest window the rule
+  // gate scanned before the lull), ms epoch.
+  cycleStartMs: number;
+  // Optional browser observation, passed as reference material — never spliced
+  // into the timeline.
+  observationSummary: string | null;
+};
+
 export type ProactiveWorldObservationRequest = {
   groupKey: string;
   threadKey: string;
@@ -35,6 +48,7 @@ export type ProactiveWorldObservation = {
   query: string;
   summary: string;
   urls: string[];
+  pageErrors?: string[];
   cached?: boolean;
 };
 
@@ -85,7 +99,7 @@ export type ProactiveDeps = {
   listGroups: () => string[];
   getHistory: (groupKey: string) => ProactiveTurn[];
   observeWorld?: (request: ProactiveWorldObservationRequest) => Promise<ProactiveWorldObservation | null>;
-  evaluateRevival: (groupKey: string, threadSummary: string) => Promise<ProactiveDecision | null>;
+  evaluateRevival: (request: ProactiveRevivalRequest) => Promise<ProactiveDecision | null>;
   // Returns the upstream id of the sent message when known (null otherwise), so
   // the recorded assistant turn can dedupe against the same message if it later
   // re-enters context via the day-history bootstrap.
@@ -124,29 +138,54 @@ export function validateProactiveLine(text: string, maxChars: number): { ok: boo
   return { ok: true };
 }
 
+function formatCycleStartForModel(ms: number): string {
+  const date = new Date(ms);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} `
+    + `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 // The gate-B decision instruction. It rides in the *current message* slot so the
 // cached system + global-history prefix is reused (6A) — only this tail differs
-// from a reactive call, so the proactive call hits the prompt cache. Kept here
+// from a reactive call, so the proactive call hits the prompt cache. The timeline
+// is sent whole with no extra marking or re-quoted excerpt: this instruction only
+// names the group and the start of the current proactive trigger cycle, and the
+// model reads that group's tail straight from the timeline above. Kept here
 // (not in main.ts) so the eval harness can exercise the exact production prompt.
-export function buildProactiveRevivePrompt(threadSummary: string): string {
-  return [
-    "现在没有人 @ Holly，群里已经冷场了一会儿。",
-    "冷场前，群里聊过下面这个可能和 Holly 兴趣（数学/AI/天文）相关、但没继续下去的话题：",
-    "---",
-    threadSummary,
-    "---",
-    "判断 Holly 现在要不要【主动】把这个话题捡回来，自然地说一句。",
+export function buildProactiveRevivePrompt(request: ProactiveRevivalRequest): string {
+  const lines = [
+    "现在没有人 @ Holly，下面这个群已经冷场了一会儿：",
+    `- group_id: ${request.groupKey}`,
+    `- 本次主动触发周期起点: ${formatCycleStartForModel(request.cycleStartMs)}`,
+    "- 上方全局时间线已包含全部消息，没有任何额外标记或摘录。只看该群位于时间线末尾、本次主动触发周期内（起点之后）的消息；更早的内容仅作背景，不要当作要捡的话题。",
+  ];
+  if (request.observationSummary) {
+    lines.push(
+      "Holly 决定开口前浏览了网页，下面的 Browser observation 仅作参考材料，不要再要求搜索：",
+      "---",
+      request.observationSummary,
+      "---",
+    );
+  }
+  lines.push(
+    "判断 Holly 现在要不要【主动】把周期内和她兴趣（数学/AI/天文）相关、但冷掉的话题捡回来，自然地说一句。",
     "只有当她确实有具体的东西能补、并且这一句不尬、不像硬找话时，才 should_reply=true。",
     "拿不准、或只是为了说话而说话 → should_reply=false。",
     "返回 JSON，shape：",
     '{"should_reply": true, "final_answer": "一句简短中文", "thinking_process": "简短中文决策摘要", "need_search": false, "search_query": ""}',
     "final_answer 必须是一句简短中文、单行、不 @ 任何人；should_reply=false 时 final_answer 为空字符串。",
     "need_search 固定为 false，search_query 留空字符串（主动开口不走搜索）。",
-    "If a Browser observation block is included above, use it only as reference material; do not ask to search again.",
-  ].join("\n");
+  );
+  return lines.join("\n");
 }
 
-export type DroppedThread = { threadKey: string; summary: string; matchedKeyword: string };
+export type DroppedThread = {
+  threadKey: string;
+  summary: string;
+  matchedKeyword: string;
+  // Start of the scanned interest window = start of this proactive trigger cycle.
+  windowStartMs: number;
+};
 
 // Find an interest topic that appeared in the recent window just before the
 // group went quiet. Loose keyword match (4A) — the model is the real authority.
@@ -186,7 +225,7 @@ export function findDroppedInterestThread(
     .map((t) => `${t.senderName ?? "某人"}: ${t.content.trim()}`)
     .join("\n");
 
-  return { threadKey, summary, matchedKeyword };
+  return { threadKey, summary, matchedKeyword, windowStartMs: windowStart };
 }
 
 function backoffFactor(level: number, multiplier: number): number {
@@ -257,8 +296,8 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<ProactiveTi
     // ④ 已接过(TTL 内)
     if (deps.state.isThreadEngaged(groupKey, thread.threadKey, now)) continue;
 
-    // ⑤ 门控B:模型判要不要捡 + 写话
-    let threadSummary = thread.summary;
+    // ⑤ 门控B:模型判要不要捡 + 写话。时间线不再做摘录/额外标记 —— 指令只报
+    //    group_id + 本次触发周期起点,模型直接读全局时间线末尾。
     let worldObservation: ProactiveWorldObservation | null = null;
     if (deps.observeWorld) {
       try {
@@ -281,18 +320,16 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<ProactiveTi
           worldObservation.cached ? "Proactive browser observation cached" : "Proactive browser observation",
           `group=${groupKey} keyword=${thread.matchedKeyword}\nquery=${worldObservation.query}\n${sources}`,
         );
-        threadSummary = [
-          thread.summary,
-          "",
-          "Holly browsed the web for this dropped topic before deciding whether to revive it:",
-          worldObservation.summary,
-        ].join("\n");
       }
     }
 
     let decision: ProactiveDecision | null;
     try {
-      decision = await deps.evaluateRevival(groupKey, threadSummary);
+      decision = await deps.evaluateRevival({
+        groupKey,
+        cycleStartMs: thread.windowStartMs,
+        observationSummary: worldObservation?.summary ?? null,
+      });
     } catch (error) {
       deps.log("error", "Proactive 门控B失败", error instanceof Error ? error.message : String(error));
       continue;

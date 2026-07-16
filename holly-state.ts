@@ -28,6 +28,10 @@ export type HollyAutonomyState = {
   lastMemoryReflectionAttemptAt: number;
   memoryReflectionDailyDate: string;
   memoryReflectionDailyCount: number;
+  lastArchiveWritingAt: number;
+  lastArchiveWritingAttemptAt: number;
+  archiveWritingDailyDate: string;
+  archiveWritingDailyCount: number;
 };
 
 export type HollyGroupState = {
@@ -77,6 +81,10 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     lastMemoryReflectionAttemptAt: 0,
     memoryReflectionDailyDate: dateKey,
     memoryReflectionDailyCount: 0,
+    lastArchiveWritingAt: 0,
+    lastArchiveWritingAttemptAt: 0,
+    archiveWritingDailyDate: dateKey,
+    archiveWritingDailyCount: 0,
   };
 }
 
@@ -111,6 +119,15 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
       typeof v.memoryReflectionDailyDate === "string" ? v.memoryReflectionDailyDate : dateKey,
     memoryReflectionDailyCount: isFiniteNumber(v.memoryReflectionDailyCount)
       ? Math.max(0, Math.floor(v.memoryReflectionDailyCount))
+      : 0,
+    lastArchiveWritingAt: isFiniteNumber(v.lastArchiveWritingAt) ? v.lastArchiveWritingAt : 0,
+    lastArchiveWritingAttemptAt: isFiniteNumber(v.lastArchiveWritingAttemptAt)
+      ? v.lastArchiveWritingAttemptAt
+      : 0,
+    archiveWritingDailyDate:
+      typeof v.archiveWritingDailyDate === "string" ? v.archiveWritingDailyDate : dateKey,
+    archiveWritingDailyCount: isFiniteNumber(v.archiveWritingDailyCount)
+      ? Math.max(0, Math.floor(v.archiveWritingDailyCount))
       : 0,
   };
 }
@@ -211,6 +228,10 @@ export class HollyStateStore {
     if (this.data.autonomy.memoryReflectionDailyDate !== today) {
       this.data.autonomy.memoryReflectionDailyDate = today;
       this.data.autonomy.memoryReflectionDailyCount = 0;
+    }
+    if (this.data.autonomy.archiveWritingDailyDate !== today) {
+      this.data.autonomy.archiveWritingDailyDate = today;
+      this.data.autonomy.archiveWritingDailyCount = 0;
     }
     for (const g of Object.values(this.data.groups)) {
       if (g.dailyDate !== today) {

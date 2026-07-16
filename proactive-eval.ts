@@ -45,54 +45,71 @@ type Scenario = {
   name: string;
   expect: Expect;
   history: LlmMessage[];
-  summary: string;
 };
+
+// Scenario history mimics the production global timeline: unmarked, permanent
+// format ("HH:MM:SS 群聊 [群名(群号)] [发送人(编号)] 内容"); the gate-B
+// instruction only names group_id + the trigger-cycle start and the model tails
+// the timeline itself.
+const EVAL_GROUP = "111";
+
+function todayAt(hours: number, minutes: number): Date {
+  const d = new Date();
+  d.setHours(hours, minutes, 0, 0);
+  return d;
+}
+
+const CYCLE_START_MS = todayAt(13, 30).getTime();
+
+function groupLine(hours: number, minutes: number, sender: string, uid: string, content: string): LlmMessage {
+  const time = todayAt(hours, minutes).toLocaleTimeString("zh-CN", { hour12: false });
+  return { role: "user", content: `${time} 群聊 [考研互助群(${EVAL_GROUP})] [${sender}(${uid})] ${content}` };
+}
+
+function hollyLine(content: string): LlmMessage {
+  return { role: "assistant", content: `[群${EVAL_GROUP}] ${content}` };
+}
 
 const SCENARIOS: Scenario[] = [
   {
     name: "黑洞话题冷掉(应捡)",
     expect: "yes",
     history: [
-      { role: "user", content: "群友A: 昨天看了事件视界望远镜拍黑洞的纪录片" },
-      { role: "user", content: "群友B: 那个 M87 的照片是不是 P 的啊哈哈" },
-      { role: "user", content: "群友A: 不是 是射电干涉拼出来的" },
+      groupLine(13, 41, "群友A", "10001", "昨天看了事件视界望远镜拍黑洞的纪录片"),
+      groupLine(13, 42, "群友B", "10002", "那个 M87 的照片是不是 P 的啊哈哈"),
+      groupLine(13, 44, "群友A", "10001", "不是 是射电干涉拼出来的"),
     ],
-    summary: "群友A: 昨天看了事件视界望远镜拍黑洞的纪录片\n群友B: 那个 M87 的照片是不是 P 的\n群友A: 不是 是射电干涉拼出来的",
   },
   {
     name: "午饭闲聊(不该插)",
     expect: "no",
     history: [
-      { role: "user", content: "群友C: 中午吃啥啊" },
-      { role: "user", content: "群友D: 楼下黄焖鸡?" },
-      { role: "user", content: "群友C: 行 走" },
+      groupLine(13, 41, "群友C", "10003", "中午吃啥啊"),
+      groupLine(13, 42, "群友D", "10004", "楼下黄焖鸡?"),
+      groupLine(13, 43, "群友C", "10003", "行 走"),
     ],
-    summary: "群友C: 中午吃啥\n群友D: 楼下黄焖鸡\n群友C: 行 走",
   },
   {
     name: "AI 话题已收尾(两可)",
     expect: "either",
     history: [
-      { role: "user", content: "群友E: 大模型那个 KV cache 到底咋省显存的" },
-      { role: "assistant", content: "就是把算过的 k/v 存下来不重算" },
-      { role: "user", content: "群友E: 哦懂了 谢" },
+      groupLine(13, 41, "群友E", "10005", "大模型那个 KV cache 到底咋省显存的"),
+      hollyLine("就是把算过的 k/v 存下来不重算"),
+      groupLine(13, 43, "群友E", "10005", "哦懂了 谢"),
     ],
-    summary: "群友E: 大模型 KV cache 怎么省显存\nHolly: 把算过的 k/v 存下来不重算\n群友E: 懂了 谢",
   },
   {
     name: "含糊一句(不该硬找话)",
     expect: "no",
-    history: [{ role: "user", content: "群友F: 唉今天好累" }],
-    summary: "群友F: 唉今天好累",
+    history: [groupLine(13, 45, "群友F", "10006", "唉今天好累")],
   },
   {
     name: "火星冲日(应捡)",
     expect: "yes",
     history: [
-      { role: "user", content: "群友G: 听说今晚火星冲日 肉眼能看见" },
-      { role: "user", content: "群友H: 真的假的 要望远镜不" },
+      groupLine(13, 46, "群友G", "10007", "听说今晚火星冲日 肉眼能看见"),
+      groupLine(13, 47, "群友H", "10008", "真的假的 要望远镜不"),
     ],
-    summary: "群友G: 今晚火星冲日 肉眼能看见\n群友H: 要望远镜不",
   },
 ];
 
@@ -122,7 +139,14 @@ async function main(): Promise<void> {
   for (const scenario of SCENARIOS) {
     const messages: LlmMessage[] = [
       ...scenario.history,
-      { role: "user", content: buildProactiveRevivePrompt(scenario.summary) },
+      {
+        role: "user",
+        content: buildProactiveRevivePrompt({
+          groupKey: EVAL_GROUP,
+          cycleStartMs: CYCLE_START_MS,
+          observationSummary: null,
+        }),
+      },
     ];
 
     let raw: string;

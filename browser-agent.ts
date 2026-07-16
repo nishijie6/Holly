@@ -20,10 +20,18 @@ export type BrowserAgentConfig = {
   contentMaxChars: number;
 };
 
+export type BrowserPageLink = {
+  text: string;
+  url: string;
+};
+
 export type BrowserPageObservation = {
   title: string;
   url: string;
   excerpt: string;
+  // Article links found inside the content area, so downstream consumers can
+  // cite an item's own detail page instead of a listing/homepage URL.
+  links?: BrowserPageLink[];
   error?: string;
 };
 
@@ -59,6 +67,43 @@ const STEALTH_SCRIPT = [
   "Object.defineProperty(navigator, 'webdriver', { get: () => undefined });",
   "Object.defineProperty(navigator, 'languages', { get: () => ['zh-CN', 'zh', 'en'] });",
 ].join("\n");
+
+// Pull readable text instead of the raw body: strip scripts, page chrome
+// (nav/header/footer/aside/forms) and cookie-consent/GDPR banners, then prefer
+// <main>/<article>. A plain body.innerText otherwise captures cookie walls and
+// nav menus as the "content", which then condenses to nothing useful downstream.
+// Mutates the page, but it's a throwaway tab closed right after this read. Falls
+// back to the full body if the trimmed root came out too short.
+// Also collects article links from the content area (anchors with real title
+// text, after page chrome was stripped) so listing pages yield each item's own
+// detail URL instead of only the listing/homepage URL.
+const CONTENT_EXTRACTION_EXPRESSION = `(() => {
+  try {
+    document.querySelectorAll('script,style,noscript,template,nav,header,footer,aside,form,[role="navigation"],[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]').forEach((el) => el.remove());
+  } catch (_) { /* best effort */ }
+  const body = document.body;
+  const root = document.querySelector('main, article') || body;
+  const scoped = root ? (root.innerText || root.textContent || "") : "";
+  const full = body ? (body.innerText || body.textContent || "") : "";
+  const text = scoped.trim().length >= 200 ? scoped : full;
+  const links = [];
+  try {
+    const seen = new Set();
+    const currentUrl = location.href.split('#')[0];
+    const anchors = (root || document).querySelectorAll('a[href]');
+    for (const anchor of anchors) {
+      if (links.length >= 20) break;
+      const label = (anchor.innerText || anchor.textContent || '').replace(/\\s+/g, ' ').trim();
+      if (label.length < 6) continue;
+      const href = (anchor.href || '').split('#')[0];
+      if (!/^https?:/i.test(href) || href === currentUrl) continue;
+      if (seen.has(href)) continue;
+      seen.add(href);
+      links.push({ text: label.slice(0, 80), url: href });
+    }
+  } catch (_) { /* best effort */ }
+  return JSON.stringify({ title: document.title || "", url: location.href, text: text, links: links });
+})()`;
 
 // Diagnostic emitted per page so callers can surface why a read produced no
 // usable text (hard error vs. empty body) instead of a silent overall null.
@@ -364,11 +409,20 @@ async function readPageWithBrowser(
       source: STEALTH_SCRIPT,
     }, config.timeoutMs).catch(() => undefined);
     const loaded = page.waitForEvent("Page.loadEventFired", config.timeoutMs).catch(() => undefined);
-    await page.send("Page.navigate", { url: navUrl }, config.timeoutMs);
+    const navigation = await page.send("Page.navigate", { url: navUrl }, config.timeoutMs);
+    const navigationError = typeof navigation.errorText === "string" ? navigation.errorText.trim() : "";
+    if (navigationError) {
+      return {
+        title: "",
+        url,
+        excerpt: "",
+        error: navigationError,
+      };
+    }
     await loaded;
     await delay(DEFAULT_PAGE_LOAD_SETTLE_MS);
     const evaluated = await page.send("Runtime.evaluate", {
-      expression: `JSON.stringify({ title: document.title || "", url: location.href, text: document.body ? document.body.innerText : "" })`,
+      expression: CONTENT_EXTRACTION_EXPRESSION,
       returnByValue: true,
       awaitPromise: true,
     }, config.timeoutMs);
@@ -377,10 +431,28 @@ async function readPageWithBrowser(
     const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
     const finalUrl = typeof parsed.url === "string" ? parsed.url.trim() : navUrl;
     const text = typeof parsed.text === "string" ? parsed.text : "";
+    const links = (Array.isArray(parsed.links) ? parsed.links : [])
+      .map((item): BrowserPageLink | null => {
+        if (!item || typeof item !== "object") return null;
+        const record = item as Record<string, unknown>;
+        const label = typeof record.text === "string" ? record.text.trim() : "";
+        const linkUrl = typeof record.url === "string" ? record.url.trim() : "";
+        return label && linkUrl ? { text: label, url: linkUrl } : null;
+      })
+      .filter((item): item is BrowserPageLink => item !== null);
+    if (finalUrl.startsWith("chrome-error://")) {
+      return {
+        title,
+        url,
+        excerpt: "",
+        error: `Chrome error page loaded for ${navUrl}`,
+      };
+    }
     return {
       title,
       url: finalUrl,
       excerpt: trimText(text, config.contentMaxChars),
+      ...(links.length > 0 ? { links } : {}),
     };
   } catch (error) {
     return {
@@ -402,11 +474,21 @@ function formatObservationSummary(query: string, pages: BrowserPageObservation[]
   }
   return [
     `[Browser observation] query=${query}`,
-    ...readable.map((page, index) => [
-      `${index + 1}. ${page.title || "(untitled)"}`,
-      `Source: ${page.url}`,
-      page.excerpt,
-    ].join("\n")),
+    ...readable.map((page, index) => {
+      const lines = [
+        `${index + 1}. ${page.title || "(untitled)"}`,
+        `Source: ${page.url}`,
+        page.excerpt,
+      ];
+      const detailLinks = (page.links ?? []).slice(0, 10);
+      if (detailLinks.length > 0) {
+        lines.push("Detail links:");
+        for (const link of detailLinks) {
+          lines.push(`- ${link.text}: ${link.url}`);
+        }
+      }
+      return lines.join("\n");
+    }),
   ].join("\n\n");
 }
 

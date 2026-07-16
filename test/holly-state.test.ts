@@ -73,6 +73,9 @@ test("autonomy state: persists world observation cadence", async () => {
   autonomy.lastMemoryReflectionAt = 789;
   autonomy.lastMemoryReflectionAttemptAt = 1000;
   autonomy.memoryReflectionDailyCount = 3;
+  autonomy.lastArchiveWritingAt = 1100;
+  autonomy.lastArchiveWritingAttemptAt = 1200;
+  autonomy.archiveWritingDailyCount = 1;
   await store.save();
 
   const reloaded = await HollyStateStore.load(path, TTL);
@@ -84,6 +87,9 @@ test("autonomy state: persists world observation cadence", async () => {
   assert.equal(persisted.lastMemoryReflectionAt, 789);
   assert.equal(persisted.lastMemoryReflectionAttemptAt, 1000);
   assert.equal(persisted.memoryReflectionDailyCount, 3);
+  assert.equal(persisted.lastArchiveWritingAt, 1100);
+  assert.equal(persisted.lastArchiveWritingAttemptAt, 1200);
+  assert.equal(persisted.archiveWritingDailyCount, 1);
   await rm(path, { force: true });
 });
 

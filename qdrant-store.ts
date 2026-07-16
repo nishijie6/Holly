@@ -65,6 +65,7 @@ export type WorldObservationMemoryRecord = {
   summary: string;
   reason?: string | null;
   urls?: string[];
+  pageErrors?: string[];
   cached?: boolean;
 };
 
@@ -85,6 +86,7 @@ export type StoredMemoryRecord = {
   memoryReason: string | null;
   memoryQuery: string | null;
   memoryUrls: string[];
+  worldObservationPageErrors: string[];
 };
 
 type ResolvedQdrantConfig = {
@@ -170,6 +172,9 @@ function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemory
   const memoryUrls = Array.isArray(payload.memory_urls)
     ? payload.memory_urls.filter((item): item is string => typeof item === "string")
     : [];
+  const worldObservationPageErrors = Array.isArray(payload.world_observation_page_errors)
+    ? payload.world_observation_page_errors.filter((item): item is string => typeof item === "string")
+    : [];
   return {
     sessionId: asOptionalString(payload.session_id),
     sessionStartedAt: asOptionalString(payload.session_started_at),
@@ -187,6 +192,7 @@ function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemory
     memoryReason: asOptionalString(payload.memory_reason),
     memoryQuery: asOptionalString(payload.memory_query),
     memoryUrls,
+    worldObservationPageErrors,
   };
 }
 
@@ -411,6 +417,7 @@ export async function createIncomingMessageStore(
               memory_reason: record.reason ?? null,
               memory_query: record.query,
               memory_urls: record.urls ?? [],
+              world_observation_page_errors: record.pageErrors ?? [],
               world_observation_cached: record.cached ?? false,
             },
           },

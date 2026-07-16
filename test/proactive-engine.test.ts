@@ -13,6 +13,7 @@ import {
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
+  type ProactiveRevivalRequest,
   type ProactiveWorldObservation,
   type ProactiveTurn,
 } from "../proactive-engine.js";
@@ -69,7 +70,7 @@ type Harness = {
   shadows: Record<string, unknown>[];
   appended: Array<{ groupKey: string; text: string }>;
   evalCalls: { n: number };
-  evalSummaries: string[];
+  evalRequests: ProactiveRevivalRequest[];
   observeCalls: { n: number };
 };
 
@@ -87,7 +88,7 @@ async function makeHarness(opts: {
   const appended: Harness["appended"] = [];
   const evalCalls = { n: 0 };
   const observeCalls = { n: 0 };
-  const evalSummaries: string[] = [];
+  const evalRequests: ProactiveRevivalRequest[] = [];
   const callIdx = new Map<string, number>();
 
   const deps: ProactiveDeps = {
@@ -104,9 +105,9 @@ async function makeHarness(opts: {
           observeCalls.n += 1;
           return opts.observation ?? null;
         },
-    evaluateRevival: async (_groupKey, threadSummary) => {
+    evaluateRevival: async (request) => {
       evalCalls.n += 1;
-      evalSummaries.push(threadSummary);
+      evalRequests.push(request);
       return opts.decision === undefined ? DEFAULT_DECISION : opts.decision;
     },
     send: async (groupId, text) => {
@@ -127,7 +128,7 @@ async function makeHarness(opts: {
     config: baseConfig(opts.config),
     state: store,
   };
-  return { deps, store, sends, shadows, appended, evalCalls, evalSummaries, observeCalls };
+  return { deps, store, sends, shadows, appended, evalCalls, evalRequests, observeCalls };
 }
 
 // ── validateProactiveLine ────────────────────────────────────────────────────
@@ -154,6 +155,8 @@ test("findDroppedInterestThread: interest keyword in window → thread", () => {
   assert.ok(thread);
   assert.equal(thread?.matchedKeyword, "黑洞");
   assert.match(thread?.summary ?? "", /黑洞/);
+  // Cycle start = interest window start before the last message.
+  assert.equal(thread?.windowStartMs, NOW - 20 * MIN - 45 * MIN);
 });
 test("findDroppedInterestThread: no interest keyword → null", () => {
   assert.equal(findDroppedInterestThread([userTurn("今天天气不错", NOW - 20 * MIN)], baseConfig()), null);
@@ -242,6 +245,12 @@ test("tick: valid candidate in shadow → logs, never sends, records state", asy
   });
   await runProactiveTick(h.deps);
   assert.equal(h.evalCalls.n, 1);
+  // Gate B gets the group + cycle start only — no re-quoted excerpt of the timeline.
+  assert.deepEqual(h.evalRequests[0], {
+    groupKey: "111",
+    cycleStartMs: NOW - 20 * MIN - 45 * MIN,
+    observationSummary: null,
+  });
   assert.equal(h.shadows.length, 1);
   assert.equal(h.sends.length, 0); // shadow never sends
   assert.equal(h.store.getGroup("111").dailyCount, 1);
@@ -261,7 +270,7 @@ test("tick: browser observation is injected before model decision", async () => 
   await runProactiveTick(h.deps);
   assert.equal(h.observeCalls.n, 1);
   assert.equal(h.evalCalls.n, 1);
-  assert.match(h.evalSummaries[0], /Browser found one relevant update/);
+  assert.equal(h.evalRequests[0].observationSummary, "Browser found one relevant update.");
   assert.deepEqual(h.shadows[0].worldObservation, {
     query: "ai latest",
     urls: ["https://example.com/ai"],

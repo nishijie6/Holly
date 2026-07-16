@@ -1,6 +1,8 @@
 node_modules/
 dist/
 logs/
+# Runtime-generated creative works (served from the monitor's archive view)
+archive/
 __pycache__/
 .idea/
 .vscode/
