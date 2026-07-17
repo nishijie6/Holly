@@ -11,6 +11,7 @@ export const MODEL_DECISION_PROMPT = [
   "Rules:",
   "- Obey the persona and per-group rules in the system prompt above, matched via the group_id shown in the batch header (e.g. a group where Holly may only echo repeats and must otherwise stay silent). Such per-group restrictions override the reply conditions below.",
   "- The conversation timeline above contains ALL messages from every group in chronological order, including the new ones. The final instruction message only names which group_id to scan; judge that group's latest messages at the END of the timeline — everything earlier is context.",
+  "- Every timeline message starts with its send time as [MM-DD HH:MM]. Compare send times with current_time from the final instruction to judge how long ago a message was sent and whether the conversation has moved on. Never copy such time tags into a reply.",
   "- Proactive trigger scans use the same timeline with no extra marking or re-quoted excerpt. When the final instruction is a proactive trigger, it names the group_id and the start time of the current proactive trigger cycle: judge ONLY that group's messages at the end of the timeline that fall within the current cycle; everything before the cycle start is context only, never a topic to revive.",
   "- The latest activity may span several same-group messages. Treat them as one recent activity batch and send at most one reply to the content most worth responding to.",
   "- Already handled: anything Holly's own assistant turns already replied to, and any message that appears before Holly's latest turn in that group. Never reply to already-handled messages again; they are context only.",
@@ -52,13 +53,14 @@ export function buildModelSystemPrompt(basePrompt: string): string {
 }
 
 // Context-format prefixes the model sometimes mimics at the start of a reply.
-// The merged context labels turns as "[群123456] ...", "群聊 [群名(群号)]
-// [发送人(编号)] ..." or "[发送人(编号)] ...", and batch headers carry
-// "group_id: 123456" — none of that belongs in the message actually sent to the
-// group. Every pattern requires digits or the exact bracket shape so a reply
+// The merged context labels turns as "[MM-DD HH:MM] ..." (send time),
+// "[群123456] ...", "群聊 [群名(群号)] [发送人(编号)] ..." or "[发送人(编号)]
+// ...", and batch headers carry "group_id: 123456" — none of that belongs in
+// the message actually sent to the group. Every pattern requires digits or the exact bracket shape so a reply
 // that merely starts with 群/[ stays intact (bare "群123456" without a colon is
 // left alone too — it could be Holly talking about a group).
 const REPLY_META_PREFIX_PATTERNS: readonly RegExp[] = [
+  /^\[\d{2}-\d{2} \d{2}:\d{2}\]\s*[:：]?\s*/u,
   /^群聊\s*\[[^\]\n]+\]\s*\[[^\]\n]+\]\s*[:：]?\s*/u,
   /^\[群\s*\d+\]\s*[:：]?\s*/u,
   /^群\s*\d+\s*[:：]\s*/u,

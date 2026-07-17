@@ -2910,15 +2910,21 @@ function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
 
 // Like formatConversationTurnForModel but preserves group labeling so a merged
 // cross-group log stays unambiguous about which group each line belongs to.
+// Each turn is prefixed with its send time so the model can compare any
+// message against the tail's current_time (message age, conversation pace).
+// A turn's send time is immutable, so the rendered prefix stays byte-stable
+// across requests and the prompt cache keeps accruing.
 function formatGlobalConversationTurnForModel(turn: ConversationTurn): LlmMessage {
+  const sentAtMs = parseIsoTimestamp(turn.timestamp);
+  const timeTag = sentAtMs === null ? "" : `[${formatTopicTimestamp(sentAtMs)}] `;
   if (turn.role === "user") {
     // Keep the raw "群聊 [群名(群号)] [发送人(编号)] 内容" prefix intact.
-    return { role: "user", content: normalizeMessageContent(turn.content) };
+    return { role: "user", content: `${timeTag}${normalizeMessageContent(turn.content)}` };
   }
 
   // Assistant turns carry only Holly's reply text; tag the group she spoke in.
   const groupTag = turn.groupId ? `[群${turn.groupId}] ` : "";
-  return { role: "assistant", content: `${groupTag}${normalizeMessageContent(turn.content)}` };
+  return { role: "assistant", content: `${timeTag}${groupTag}${normalizeMessageContent(turn.content)}` };
 }
 
 function getCurrentMessageLagMs(context: ModelRequestContext): number {

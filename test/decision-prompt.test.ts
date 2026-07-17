@@ -36,6 +36,8 @@ test("stripGroupReplyPrefix removes mimicked context prefixes", () => {
   );
   assert.equal(stripGroupReplyPrefix("[Holly(10000003)] 这个极限是 0"), "这个极限是 0");
   assert.equal(stripGroupReplyPrefix("group_id: 20000002 好啊"), "好啊");
+  assert.equal(stripGroupReplyPrefix("[07-17 14:32] 好啊，明天见"), "好啊，明天见");
+  assert.equal(stripGroupReplyPrefix("[07-17 14:32] [群20000002] 好啊"), "好啊");
 });
 
 test("stripGroupReplyPrefix removes stacked prefixes", () => {

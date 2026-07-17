@@ -157,7 +157,7 @@ export function buildProactiveRevivePrompt(request: ProactiveRevivalRequest): st
     "现在没有人 @ Holly，下面这个群已经冷场了一会儿：",
     `- group_id: ${request.groupKey}`,
     `- 本次主动触发周期起点: ${formatCycleStartForModel(request.cycleStartMs)}`,
-    "- 上方全局时间线已包含全部消息，没有任何额外标记或摘录。只看该群位于时间线末尾、本次主动触发周期内（起点之后）的消息；更早的内容仅作背景，不要当作要捡的话题。",
+    "- 上方全局时间线已包含全部消息，每条消息开头的 [月-日 时:分] 是发送时间。只看该群位于时间线末尾、发送时间在本次周期起点之后的消息；更早的内容仅作背景，不要当作要捡的话题。",
   ];
   if (request.observationSummary) {
     lines.push(
