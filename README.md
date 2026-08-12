@@ -71,6 +71,9 @@ Message memory is backed by Qdrant. When enabled, the service:
 - Creates the target collection if needed
 - Stores each incoming message with payload metadata
 - Supports filtered lookup by group, user, and message type
+- Journals writes in `logs/qdrant-outbox/` before remote delivery, then
+  automatically replays pending records after transient network failures or a
+  process restart
 
 ## Requirements
 

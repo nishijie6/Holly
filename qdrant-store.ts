@@ -1,9 +1,12 @@
 import { randomUUID } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { QdrantClient } from "@qdrant/js-client-rest";
 import YAML from "yaml";
+
+import { DurableOutbox } from "./qdrant-outbox.js";
 
 type QdrantConfig = {
   enabled?: boolean;
@@ -98,8 +101,15 @@ type ResolvedQdrantConfig = {
   onDiskPayload: boolean;
 };
 
+type PersistedQdrantPoint = {
+  id: string;
+  vector: Record<string, never>;
+  payload: Record<string, unknown>;
+};
+
 const DEFAULT_COLLECTION_NAME = "ws_incoming_messages";
 const DEFAULT_TIMEOUT_MS = 10000;
+const OUTBOX_REPLAY_INTERVAL_MS = 60_000;
 // This collection is currently used as an ordered/filterable document store,
 // not for nearest-neighbour search. Qdrant accepts points with no vectors; the
 // empty vector map avoids allocating a meaningless `[0]` dense vector per row
@@ -420,18 +430,67 @@ export async function createIncomingMessageStore(
     maxConnections: 1,
   });
 
+  const outbox = new DurableOutbox<PersistedQdrantPoint>(
+    join(dirname(configPath), "logs", "qdrant-outbox"),
+  );
+
+  const flushOutbox = (): Promise<number> => outbox.drain(async (points) => {
+    await withQdrantRetry(() => client.upsert(config.collectionName, {
+      wait: true,
+      points: [...points],
+    }));
+  });
+
   try {
-    // Same one-shot retry as runtime reads/writes: a remote cloud cluster reached
-    // through a proxy is more prone to a transient socket drop on the very first
-    // call, and without this a single blip aborts startup.
+    // A remote cloud cluster reached through a proxy is more prone to a
+    // transient socket drop on the first call, so use the runtime retry budget.
     await withQdrantRetry(() => ensureCollection(client, config));
+    await flushOutbox();
   } catch (error) {
-    throw new Error(diagnoseQdrantStartupError(error, config));
+    if (isTransientConnectionError(error) || isTransientTimeoutError(error)) {
+      // Local logs remain the source of truth while Qdrant is unavailable.
+      // Writes below are journaled before delivery and the replay loop retries,
+      // so a temporary cloud outage must not prevent Holly from starting.
+      console.error(`Qdrant unavailable at startup; continuing with durable outbox: ${describeErrorChain(error)}`);
+    } else {
+      throw new Error(diagnoseQdrantStartupError(error, config));
+    }
   }
 
   const sessionId = options.sessionId?.trim() || randomUUID();
   const sessionStartedAt = options.sessionStartedAt?.trim() || new Date().toISOString();
   const description = `${config.collectionName} @ ${config.url} (session ${sessionId})`;
+
+  const persistPoint = async (point: PersistedQdrantPoint): Promise<void> => {
+    await outbox.enqueue(point, point.id);
+    await flushOutbox();
+  };
+
+  const scheduleOutboxReplay = (): void => {
+    const timer = setTimeout(() => {
+      void outbox.pendingCount()
+        .then(async (pending) => {
+          if (pending === 0) return 0;
+          // Startup may have happened while the cluster was unreachable. Ensure
+          // collection/schema readiness before attempting the retained batch.
+          await withQdrantRetry(() => ensureCollection(client, config));
+          return flushOutbox();
+        })
+        .then((delivered) => {
+          if (delivered > 0) {
+            console.log(`Replayed ${delivered} pending Qdrant outbox record(s).`);
+          }
+        })
+        .catch((error) => {
+          // Keep the records on disk and try again on the next interval. This is
+          // deliberately non-fatal: a cloud outage must not take down Holly.
+          console.error(`Qdrant outbox replay failed; records remain pending: ${describeErrorChain(error)}`);
+        })
+        .finally(scheduleOutboxReplay);
+    }, OUTBOX_REPLAY_INTERVAL_MS);
+    timer.unref();
+  };
+  scheduleOutboxReplay();
 
   return {
     sessionId,
@@ -449,92 +508,77 @@ export async function createIncomingMessageStore(
       // applied the write, reusing the same id makes the retry an idempotent
       // overwrite instead of inserting a duplicate point under a fresh id.
       const pointId = randomUUID();
-      await withQdrantRetry(() => client.upsert(config.collectionName, {
-        wait: true,
-        points: [
-          {
-            id: pointId,
-            vector: NO_STORAGE_VECTOR,
-            payload: {
-              schema_version: 2,
-              session_id: sessionId,
-              session_started_at: sessionStartedAt,
-              ws_target_url: options.wsTargetUrl ?? null,
-              source: "upstream_ws",
-              sequence: record.sequence,
-              received_at: record.receivedAt,
-              is_binary: record.isBinary,
-              raw_encoding: record.rawEncoding,
-              raw_content: record.rawContent,
-              binary_size: record.binarySize,
-              display_text: record.displayText,
-              message_type: record.messageType,
-              group_id: record.groupId,
-              group_name: record.groupName,
-              user_id: record.userId,
-              sender_name: record.senderName,
-              raw_message: record.rawMessage,
-            },
-          },
-        ],
-      }));
+      await persistPoint({
+        id: pointId,
+        vector: NO_STORAGE_VECTOR,
+        payload: {
+          schema_version: 2,
+          session_id: sessionId,
+          session_started_at: sessionStartedAt,
+          ws_target_url: options.wsTargetUrl ?? null,
+          source: "upstream_ws",
+          sequence: record.sequence,
+          received_at: record.receivedAt,
+          is_binary: record.isBinary,
+          raw_encoding: record.rawEncoding,
+          raw_content: record.rawContent,
+          binary_size: record.binarySize,
+          display_text: record.displayText,
+          message_type: record.messageType,
+          group_id: record.groupId,
+          group_name: record.groupName,
+          user_id: record.userId,
+          sender_name: record.senderName,
+          raw_message: record.rawMessage,
+        },
+      });
     },
     async saveInternalMemory(record): Promise<void> {
       // Same idempotency guard as saveMessage: fix the id before the retry closure
       // so a retried write overwrites rather than duplicating.
       const pointId = randomUUID();
-      await withQdrantRetry(() => client.upsert(config.collectionName, {
-        wait: true,
-        points: [
-          {
-            id: pointId,
-            vector: NO_STORAGE_VECTOR,
-            payload: {
-              schema_version: 2,
-              session_id: sessionId,
-              session_started_at: sessionStartedAt,
-              source: "holly_internal",
-              received_at: record.receivedAt,
-              content: record.content,
-              message_type: "internal_memory",
-              user_id: "holly",
-              sender_name: "Holly",
-              memory_topic: record.topic ?? null,
-              memory_reason: record.reason ?? null,
-              memory_urls: record.urls ?? [],
-            },
-          },
-        ],
-      }));
+      await persistPoint({
+        id: pointId,
+        vector: NO_STORAGE_VECTOR,
+        payload: {
+          schema_version: 2,
+          session_id: sessionId,
+          session_started_at: sessionStartedAt,
+          source: "holly_internal",
+          received_at: record.receivedAt,
+          content: record.content,
+          message_type: "internal_memory",
+          user_id: "holly",
+          sender_name: "Holly",
+          memory_topic: record.topic ?? null,
+          memory_reason: record.reason ?? null,
+          memory_urls: record.urls ?? [],
+        },
+      });
     },
     async saveWorldObservation(record): Promise<void> {
       const pointId = randomUUID();
-      await withQdrantRetry(() => client.upsert(config.collectionName, {
-        wait: true,
-        points: [
-          {
-            id: pointId,
-            vector: NO_STORAGE_VECTOR,
-            payload: {
-              schema_version: 2,
-              session_id: sessionId,
-              session_started_at: sessionStartedAt,
-              source: "holly_world_observation",
-              received_at: record.observedAt,
-              content: record.summary,
-              message_type: "world_observation",
-              user_id: "holly",
-              sender_name: "Holly",
-              memory_topic: record.topic,
-              memory_reason: record.reason ?? null,
-              memory_query: record.query,
-              memory_urls: record.urls ?? [],
-              world_observation_page_errors: record.pageErrors ?? [],
-              world_observation_cached: record.cached ?? false,
-            },
-          },
-        ],
-      }));
+      await persistPoint({
+        id: pointId,
+        vector: NO_STORAGE_VECTOR,
+        payload: {
+          schema_version: 2,
+          session_id: sessionId,
+          session_started_at: sessionStartedAt,
+          source: "holly_world_observation",
+          received_at: record.observedAt,
+          content: record.summary,
+          message_type: "world_observation",
+          user_id: "holly",
+          sender_name: "Holly",
+          memory_topic: record.topic,
+          memory_reason: record.reason ?? null,
+          memory_query: record.query,
+          memory_urls: record.urls ?? [],
+          world_observation_page_errors: record.pageErrors ?? [],
+          world_observation_cached: record.cached ?? false,
+        },
+      });
     },
     async listRecentMemories(input): Promise<StoredMemoryRecord[]> {
       const conditions: Array<Record<string, unknown>> = [];
