@@ -12,6 +12,7 @@
 
 import { readFile, writeFile, rename, mkdir } from "node:fs/promises";
 import { dirname } from "node:path";
+import type { QqRuntimeMode } from "./holly-bootstrap.js";
 
 export type PendingObservation = {
   sentAt: number; // ms epoch
@@ -34,6 +35,18 @@ export type HollyAutonomyState = {
   archiveWritingDailyCount: number;
 };
 
+export type HollyLifecycleState = {
+  bootCount: number;
+  lastBootStartedAt: number;
+  lastBootCompletedAt: number;
+  lastBootThoughtAt: number;
+  lastBootThought: string;
+  qqMode: QqRuntimeMode;
+  qqModeReason: string;
+  qqModeDecidedAt: number;
+  qqModeReconsiderAt: number;
+};
+
 export type HollyGroupState = {
   lastProactiveAt: number; // ms epoch, 0 = never
   backoffLevel: number; // 0..n,温和退避:有效阈值 ×(multiplier ^ level)
@@ -49,6 +62,7 @@ export type HollyStatePersisted = {
   globalDailyDate: string;
   globalDailyCount: number;
   autonomy: HollyAutonomyState;
+  lifecycle: HollyLifecycleState;
   groups: Record<string, HollyGroupState>;
 };
 
@@ -85,6 +99,20 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     lastArchiveWritingAttemptAt: 0,
     archiveWritingDailyDate: dateKey,
     archiveWritingDailyCount: 0,
+  };
+}
+
+function freshLifecycleState(): HollyLifecycleState {
+  return {
+    bootCount: 0,
+    lastBootStartedAt: 0,
+    lastBootCompletedAt: 0,
+    lastBootThoughtAt: 0,
+    lastBootThought: "",
+    qqMode: "offline",
+    qqModeReason: "",
+    qqModeDecidedAt: 0,
+    qqModeReconsiderAt: 0,
   };
 }
 
@@ -132,6 +160,28 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
   };
 }
 
+function coerceQqMode(value: unknown): QqRuntimeMode {
+  return value === "offline" || value === "observe" || value === "active" ? value : "offline";
+}
+
+function coerceLifecycleState(value: unknown): HollyLifecycleState {
+  if (!value || typeof value !== "object") {
+    return freshLifecycleState();
+  }
+  const v = value as Record<string, unknown>;
+  return {
+    bootCount: isFiniteNumber(v.bootCount) ? Math.max(0, Math.floor(v.bootCount)) : 0,
+    lastBootStartedAt: isFiniteNumber(v.lastBootStartedAt) ? v.lastBootStartedAt : 0,
+    lastBootCompletedAt: isFiniteNumber(v.lastBootCompletedAt) ? v.lastBootCompletedAt : 0,
+    lastBootThoughtAt: isFiniteNumber(v.lastBootThoughtAt) ? v.lastBootThoughtAt : 0,
+    lastBootThought: typeof v.lastBootThought === "string" ? v.lastBootThought : "",
+    qqMode: coerceQqMode(v.qqMode),
+    qqModeReason: typeof v.qqModeReason === "string" ? v.qqModeReason : "",
+    qqModeDecidedAt: isFiniteNumber(v.qqModeDecidedAt) ? v.qqModeDecidedAt : 0,
+    qqModeReconsiderAt: isFiniteNumber(v.qqModeReconsiderAt) ? v.qqModeReconsiderAt : 0,
+  };
+}
+
 // Defensive parse: anything malformed degrades to a default, never throws.
 function coerceGroupState(value: unknown, dateKey: string): HollyGroupState {
   const base = freshGroupState(dateKey);
@@ -168,6 +218,7 @@ function coercePersisted(raw: unknown, dateKey: string): HollyStatePersisted {
     globalDailyDate: dateKey,
     globalDailyCount: 0,
     autonomy: freshAutonomyState(dateKey),
+    lifecycle: freshLifecycleState(),
     groups: {},
   };
   if (!raw || typeof raw !== "object") return empty;
@@ -183,6 +234,7 @@ function coercePersisted(raw: unknown, dateKey: string): HollyStatePersisted {
     globalDailyDate: typeof r.globalDailyDate === "string" ? r.globalDailyDate : dateKey,
     globalDailyCount: isFiniteNumber(r.globalDailyCount) ? Math.max(0, Math.floor(r.globalDailyCount)) : 0,
     autonomy: coerceAutonomyState(r.autonomy, dateKey),
+    lifecycle: coerceLifecycleState(r.lifecycle),
     groups,
   };
 }
@@ -256,6 +308,10 @@ export class HollyStateStore {
 
   getAutonomyState(): HollyAutonomyState {
     return this.data.autonomy;
+  }
+
+  getLifecycleState(): HollyLifecycleState {
+    return this.data.lifecycle;
   }
 
   isThreadEngaged(groupKey: string, threadKey: string, now = Date.now()): boolean {

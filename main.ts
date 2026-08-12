@@ -20,6 +20,8 @@ import {
 } from "./llm-client.js";
 import {
   createIncomingMessageStore,
+  describeErrorChain,
+  isNapCatHeartbeat,
   type InternalMemoryRecord,
   type IncomingMessageRecord,
   type IncomingMessageStore,
@@ -61,7 +63,38 @@ import {
   detectIncompleteFinalAnswer,
   stripGroupReplyPrefix,
 } from "./decision-prompt.js";
+import {
+  ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
+  MEMORY_REFLECTION_SYSTEM_PROMPT,
+  WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
+  buildArchiveCompositionPrompt,
+  buildMemoryReflectionPrompt,
+  buildWorldObservationBroadcastPrompt,
+} from "./autonomy-prompts.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
+import {
+  ThoughtHistoryStore,
+  type ThoughtEntry,
+  type ThoughtEntryInput,
+} from "./thought-history.js";
+import {
+  BOOT_ORIENTATION_JSON_SCHEMA,
+  BOOT_ORIENTATION_SYSTEM_PROMPT,
+  DEFAULT_HOLLY_BOOTSTRAP_CONFIG,
+  QQ_MODE_DECISION_JSON_SCHEMA,
+  QQ_MODE_DECISION_SYSTEM_PROMPT,
+  buildBootOrientationPrompt,
+  buildQqModeDecisionPrompt,
+  fallbackQqModeDecision,
+  forcedQqModeDecision,
+  parseBootOrientation,
+  parseHollyBootstrapConfig,
+  parseQqModeDecision,
+  type BootOrientation,
+  type HollyBootstrapConfig,
+  type QqModeDecision,
+  type QqRuntimeMode,
+} from "./holly-bootstrap.js";
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
@@ -177,6 +210,7 @@ type AppConfig = {
   fetch?: { proxy_url?: string };
   autonomy?: Record<string, unknown>;
   browser_agent?: Record<string, unknown>;
+  holly_bootstrap?: Record<string, unknown>;
 };
 
 type ContextBudgetConfig = {
@@ -205,6 +239,7 @@ type MonitorSnapshot = {
   claudeUsage: ClaudeUsage | null;
   tokenStats: DailyTokenStats;
   readOnly: boolean;
+  thoughts: ThoughtEntry[];
 };
 
 type MonitorEvent =
@@ -244,6 +279,10 @@ type MonitorEvent =
   | {
       type: "mode";
       readOnly: boolean;
+    }
+  | {
+      type: "thought";
+      thought: ThoughtEntry;
     };
 
 type AutonomySidebarMemory = {
@@ -324,11 +363,29 @@ const VUE_RUNTIME_SOURCE = (() => {
 })();
 const HTTP_PORT = 5000;
 const HTTP_HOST = "127.0.0.1";
-const WS_HOST = "127.0.0.1";
-const WS_PORT = 8082;
-const WS_TARGET_URL = `ws://${WS_HOST}:${WS_PORT}`;
+// Upstream OneBot/NapCat WebSocket target. Read synchronously at module load so
+// WS_TARGET_URL is a plain const before the module-eval usages below, while still
+// letting the endpoint (and NapCat's optional access token) move with the
+// environment via config.yaml `napcat:` instead of being hard-coded.
+const UPSTREAM_WS = (() => {
+  const fallbackUrl = "ws://127.0.0.1:8082";
+  try {
+    const parsed = YAML.parse(readFileSync(CONFIG_PATH, "utf-8")) as
+      | { napcat?: { ws_url?: unknown; access_token?: unknown } }
+      | null;
+    const napcat = parsed?.napcat ?? {};
+    const url = typeof napcat.ws_url === "string" && napcat.ws_url.trim() ? napcat.ws_url.trim() : fallbackUrl;
+    const token = typeof napcat.access_token === "string" ? napcat.access_token.trim() : "";
+    return { url, token };
+  } catch {
+    return { url: fallbackUrl, token: "" };
+  }
+})();
+const WS_TARGET_URL = UPSTREAM_WS.url;
+const WS_ACCESS_TOKEN = UPSTREAM_WS.token;
 const WS_RECONNECT_DELAY_MS = 8000;
 const WS_HISTORY_LIMIT = 120;
+const THOUGHT_HISTORY_LIMIT = 400;
 const APP_SESSION_ID = randomUUID();
 const APP_SESSION_STARTED_AT = new Date().toISOString();
 const WS_ACTION_TIMEOUT_MS = 10_000;
@@ -475,6 +532,7 @@ let sessionLogPath: string | null = null;
 let monitorEntryId = 0;
 let wsClient: WebSocket | null = null;
 let wsReconnectTimer: NodeJS.Timeout | null = null;
+let qqModeReconsiderTimer: NodeJS.Timeout | null = null;
 let monitorHistory: MonitorEntry[] = [];
 let activeLlmClient: LlmClient | null = null;
 let activeLlmLabel = "Assistant";
@@ -490,6 +548,7 @@ let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 // second time even though we already handled it. Bounded by TTL + a size sweep.
 let ingestedMessageAtMsById = new Map<string, number>();
 let hollyStateStore: HollyStateStore | null = null;
+let thoughtHistoryStore: ThoughtHistoryStore | null = null;
 let conversationContextStore: ConversationContextStore | null = null;
 let conversationHistoryPersistDirty = false;
 let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
@@ -498,6 +557,8 @@ let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
 let browserAgentConfig: BrowserAgentRuntimeConfig = DEFAULT_BROWSER_AGENT_CONFIG;
+let hollyBootstrapConfig: HollyBootstrapConfig = DEFAULT_HOLLY_BOOTSTRAP_CONFIG;
+let qqRuntimeMode: QqRuntimeMode = "offline";
 let browserObservationCache = new Map<string, { observedAtMs: number; observation: ProactiveWorldObservation }>();
 let browserObservationAttemptAtMs = new Map<string, number>();
 let worldObservationMemory: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
@@ -515,9 +576,11 @@ let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
 let aiToneShadowQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
-// Set whenever the merged global context grows; the warmer only fires when true
-// so quiet periods don't burn rate-limit budget re-warming an unchanged context.
-let globalContextDirty = true;
+// Groups whose own history grew since the last warm pass (single-group focus:
+// each group now has its own cache-stable prefix, so warming is per-group —
+// see buildFocusedConversationTurns / warmDirtyGroupContexts). Quiet groups
+// stay out of this set so warming doesn't burn rate-limit budget on them.
+let dirtyGroupKeys = new Set<string>();
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
 let conversationHistoryBootstrapDayByGroup = new Map<string, string>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
@@ -663,8 +726,7 @@ async function loadProactiveConfig(configPath: string): Promise<ProactiveConfig>
   };
 }
 
-// Read the optional `search:` config section. The API key is NOT here — it comes
-// from the SERPER_API_KEY env var (see .env). Hot-reloaded by the config watcher.
+// Read the optional `search:` config section. Hot-reloaded by the config watcher.
 async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
   const base: AutonomyConfig = {
     ...DEFAULT_AUTONOMY_CONFIG,
@@ -751,6 +813,28 @@ async function loadReadOnlyConfig(configPath: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+async function loadHollyBootstrapConfig(configPath: string): Promise<HollyBootstrapConfig> {
+  if (!existsSync(configPath)) return { ...DEFAULT_HOLLY_BOOTSTRAP_CONFIG };
+  try {
+    const parsed = (YAML.parse(await readFile(configPath, "utf-8")) as AppConfig | null) ?? {};
+    return parseHollyBootstrapConfig(parsed.holly_bootstrap);
+  } catch {
+    return { ...DEFAULT_HOLLY_BOOTSTRAP_CONFIG };
+  }
+}
+
+function isQqConnectedMode(): boolean {
+  return qqRuntimeMode !== "offline";
+}
+
+function isQqParticipationEnabled(): boolean {
+  return qqRuntimeMode === "active" && !readOnlyMode;
+}
+
+function qqSuppressionDetail(): string {
+  return `qq_mode=${qqRuntimeMode}\nread_only=${readOnlyMode}`;
 }
 
 // Rewrites only the `read_only` key. parseDocument round-trips the file so the
@@ -867,6 +951,14 @@ async function applyProxyConfig(configPath: string): Promise<void> {
     process.env.HTTP_PROXY = proxyUrl;
     process.env.https_proxy = proxyUrl;
     process.env.http_proxy = proxyUrl;
+    // Node's global fetch/undici only honors HTTP(S)_PROXY when NODE_USE_ENV_PROXY
+    // is set. The npm scripts pass it, but a systemd/pm2/bare `node` launch may
+    // not — without it every outbound request (Qdrant Cloud, Anthropic, Serper)
+    // bypasses the proxy and fails on a restricted host. Set it here before the
+    // first fetch (this runs as bootstrap's first step); undici reads it lazily
+    // when the global dispatcher is first created. Don't override an explicit
+    // opt-out already in the environment.
+    process.env.NODE_USE_ENV_PROXY ??= "1";
     // The proxy is for outbound web fetches (Anthropic API, URL previews). Keep
     // loopback services — Qdrant :6333, the NapCat WS, the local monitor — OFF
     // the proxy: routing 127.0.0.1 through Clash/Mihomo can reset the connection
@@ -993,7 +1085,7 @@ function sanitizeConversationMessages(messages: readonly LlmMessage[]): LlmMessa
 }
 
 function formatConversationTurnsForModel(turns: readonly ConversationTurn[]): LlmMessage[] {
-  return sanitizeConversationMessages(turns.map(formatGlobalConversationTurnForModel));
+  return sanitizeConversationMessages(turns.map(formatConversationTurnForModel));
 }
 
 // --- Topic-segmented compression -------------------------------------------
@@ -1108,7 +1200,7 @@ function compressConversationTurns(turns: readonly ConversationTurn[], budgetTok
   let tailStart = turns.length;
   let tailTokens = 0;
   while (tailStart > 0) {
-    const candidate = formatGlobalConversationTurnForModel(turns[tailStart - 1]);
+    const candidate = formatConversationTurnForModel(turns[tailStart - 1]);
     const tokens = estimateMessageTokens({
       role: candidate.role,
       content: normalizeMessageContent(candidate.content),
@@ -1278,9 +1370,10 @@ function modelContextWindowTokens(model: string): number {
 
 function prepareModelRequest(
   baseSystemPrompt: string,
-  memoryPrompt: string,
+  rawMemoryPrompt: string,
   conversationTurns: readonly ConversationTurn[],
   currentMessage: string,
+  otherGroupsSummary = "",
 ): PreparedModelRequest {
   // System prompt = persona + decision protocol ONLY. The retrieved memory
   // block and the per-request batch instruction ride in the volatile tail
@@ -1288,6 +1381,13 @@ function prepareModelRequest(
   // byte-identical across requests (cache-stable prefix; only the tail after
   // the cache breakpoint changes per request).
   const systemPrompt = buildModelSystemPrompt(baseSystemPrompt).trim();
+
+  // otherGroupsSummary (other groups' recent activity, single-group-focus
+  // banner) shares the memory block's variable-budget, volatile-tail slot:
+  // both are per-request text that must never enter the cached prefix, so
+  // folding them into one budgeted blob reuses the existing compress/fit
+  // machinery instead of adding a third one.
+  const memoryPrompt = [rawMemoryPrompt.trim(), otherGroupsSummary.trim()].filter(Boolean).join("\n\n");
 
   const buildTailMessage = (memory: string, current: string): LlmMessage | null => {
     const content = [memory.trim(), normalizeMessageContent(current)].filter(Boolean).join("\n\n");
@@ -1408,6 +1508,8 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  const previousQqModePolicy = hollyBootstrapConfig.qqModePolicy;
+  const nextHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   const nextReadOnly = await loadReadOnlyConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
   activeLlmLabel = nextClient.displayName;
@@ -1418,8 +1520,17 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   browserAgentConfig = nextBrowserAgentConfig;
   browserObservationAttemptAtMs = new Map();
   aiToneConfig = nextAiToneConfig;
+  hollyBootstrapConfig = nextHollyBootstrapConfig;
   hollyStateStore?.setEngagedTtl(nextProactiveConfig.engagedTtlMs);
   applyReadOnlyMode(nextReadOnly, "config.yaml");
+  const forcedQqDecision = forcedQqModeDecision(nextHollyBootstrapConfig);
+  if (forcedQqDecision && (
+    forcedQqDecision.mode !== qqRuntimeMode || previousQqModePolicy !== nextHollyBootstrapConfig.qqModePolicy
+  )) {
+    await applyQqModeDecision(forcedQqDecision);
+  } else if (!forcedQqDecision && previousQqModePolicy !== "auto") {
+    scheduleQqModeReconsideration(nextHollyBootstrapConfig.defaultReconsiderMs);
+  }
   pushMonitorEntry(
     "status",
     "Config Reloaded",
@@ -2464,6 +2575,23 @@ function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, l
   return entry;
 }
 
+async function recordMonitorThought(input: ThoughtEntryInput): Promise<ThoughtEntry | null> {
+  const store = thoughtHistoryStore;
+  if (!store) return null;
+  try {
+    const thought = await store.append(input);
+    broadcastMonitorEvent({ type: "thought", thought });
+    return thought;
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Thought Timeline Persistence Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  }
+}
+
 function updateMonitorStatus(state: MonitorConnectionState, detail: string): void {
   monitorStatus = {
     state,
@@ -2488,6 +2616,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     claudeUsage: getLatestClaudeUsage(),
     tokenStats: getTodayTokenStats(),
     readOnly: readOnlyMode,
+    thoughts: thoughtHistoryStore?.list(THOUGHT_HISTORY_LIMIT) ?? [],
   };
 }
 
@@ -2617,7 +2746,7 @@ function appendConversationTurn(turn: ConversationTurn): void {
   const existing = conversationHistoryByGroup.get(groupKey) ?? [];
   const next = mergeConversationTurns([...existing, normalizedTurn], turn.timestamp);
   conversationHistoryByGroup.set(groupKey, next);
-  globalContextDirty = true;
+  dirtyGroupKeys.add(groupKey);
   conversationHistoryPersistDirty = true;
   broadcastMonitorEvent({
     type: "turn",
@@ -2661,24 +2790,71 @@ function buildConversationMessages(context: ModelRequestContext, currentMessages
   return turns.map(formatConversationTurnForModel);
 }
 
-// Merge every group's history into one chronological timeline of turns. The
-// current pending batch is NOT filtered out: incoming messages are appended to
-// history on arrival, so the timeline already contains them in their permanent
-// format — the volatile tail instruction only names the group to scan.
-// That keeps the rendered prefix byte-identical to the one the next request
-// (and the cache warmer, and Gate B) renders, so the prompt cache accrues
-// incrementally instead of re-reading history on every scan.
-function buildGlobalConversationTurns(context: ModelRequestContext): ConversationTurn[] {
-  const allTurns: ConversationTurn[] = [];
-  for (const turns of conversationHistoryByGroup.values()) {
-    for (const turn of turns) {
-      allTurns.push(turn);
+// Single-group focus (Kagami-style "current conversation"): only the group
+// that triggered this call gets its own history in the cached prefix. The
+// previous implementation merged every group into one globally-sorted
+// timeline; a late-arriving turn (day-history bootstrap, backfill after a
+// reconnect) could land in the *middle* of that merged array by timestamp
+// instead of at the tail, silently reordering everything after it and busting
+// the cache for every group at once. A group's own array is already
+// chronological by construction (appendConversationTurn only ever appends to
+// it), so scoping to one group removes that reordering risk entirely. The
+// current pending batch still doesn't need filtering out, for the same reason
+// the old comment gave: it's already appended to this same array on arrival.
+function buildFocusedConversationTurns(context: ModelRequestContext): ConversationTurn[] {
+  const groupKey = normalizeConversationGroupKey(context.groupId);
+  if (!groupKey) {
+    return [];
+  }
+  return pruneConversationTurns(conversationHistoryByGroup.get(groupKey) ?? [], context.receivedAt);
+}
+
+// How far back another group's activity is still worth a mention. This is a
+// passive awareness banner (mirrors Kagami's NotificationCenter: a headline
+// per source, not the source's full content) that rides in the volatile tail,
+// never in the cached prefix — so it can change every request without ever
+// touching the cache.
+const OTHER_GROUPS_SUMMARY_LOOKBACK_MS = 30 * 60 * 1000;
+const OTHER_GROUPS_SUMMARY_PREVIEW_TOKENS = 40;
+
+function buildOtherGroupsActivitySummary(context: ModelRequestContext): string {
+  const focusedGroupKey = normalizeConversationGroupKey(context.groupId);
+  const referenceTs = parseIsoTimestamp(context.receivedAt);
+  if (referenceTs === null) {
+    return "";
+  }
+  const cutoffTs = referenceTs - OTHER_GROUPS_SUMMARY_LOOKBACK_MS;
+
+  const lines: string[] = [];
+  for (const [groupKey, turns] of conversationHistoryByGroup) {
+    if (groupKey === focusedGroupKey) {
+      continue;
     }
+    const recent = turns.filter((turn) => {
+      const ts = parseIsoTimestamp(turn.timestamp);
+      return ts !== null && ts > cutoffTs && ts <= referenceTs;
+    });
+    if (recent.length === 0) {
+      continue;
+    }
+    const latest = recent[recent.length - 1];
+    const label = latest.role === "assistant"
+      ? "[Holly]"
+      : (formatConversationSenderLabel(latest.senderName, latest.userId) ?? "[?]");
+    const preview = compactTextToTokenBudget(
+      compactSameGroupConversationContent(latest.content),
+      OTHER_GROUPS_SUMMARY_PREVIEW_TOKENS,
+    );
+    lines.push(`[群${groupKey}] 最近${recent.length}条新消息,最新 ${label} ${preview}`);
   }
 
-  // mergeConversationTurns dedupes (by group-aware key), sorts by timestamp, and
-  // prunes anything newer than the message being processed.
-  return mergeConversationTurns(allTurns, context.receivedAt);
+  if (lines.length === 0) {
+    return "";
+  }
+  return [
+    "[其它群近期动态,仅供参考,不代表需要回应——想看全文等它自己被扫描到]",
+    ...lines,
+  ].join("\n");
 }
 
 function hasConversationContextForGroup(groupId: string | null, referenceTime: string): boolean {
@@ -2730,6 +2906,9 @@ async function restoreConversationContext(store: ConversationContextStore): Prom
     if (merged.length > 0) {
       conversationHistoryByGroup.set(groupKey, merged);
       restoredTurns += merged.length;
+      // Mirror the old "assume dirty at boot" default, scoped per group: warm
+      // every group that actually came back with history on the first pass.
+      dirtyGroupKeys.add(groupKey);
     }
   }
 
@@ -2898,33 +3077,16 @@ function formatSameGroupUserContent(
 }
 
 function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
+  const sentAtMs = parseIsoTimestamp(turn.timestamp);
+  const timeTag = sentAtMs === null ? "" : `[${formatTopicTimestamp(sentAtMs)}] `;
   const content = turn.role === "user"
     ? formatSameGroupUserContent(turn.content, turn.senderName, turn.userId)
     : normalizeMessageContent(turn.content);
 
   return {
     role: turn.role,
-    content,
+    content: `${timeTag}${content}`,
   };
-}
-
-// Like formatConversationTurnForModel but preserves group labeling so a merged
-// cross-group log stays unambiguous about which group each line belongs to.
-// Each turn is prefixed with its send time so the model can compare any
-// message against the tail's current_time (message age, conversation pace).
-// A turn's send time is immutable, so the rendered prefix stays byte-stable
-// across requests and the prompt cache keeps accruing.
-function formatGlobalConversationTurnForModel(turn: ConversationTurn): LlmMessage {
-  const sentAtMs = parseIsoTimestamp(turn.timestamp);
-  const timeTag = sentAtMs === null ? "" : `[${formatTopicTimestamp(sentAtMs)}] `;
-  if (turn.role === "user") {
-    // Keep the raw "群聊 [群名(群号)] [发送人(编号)] 内容" prefix intact.
-    return { role: "user", content: `${timeTag}${normalizeMessageContent(turn.content)}` };
-  }
-
-  // Assistant turns carry only Holly's reply text; tag the group she spoke in.
-  const groupTag = turn.groupId ? `[群${turn.groupId}] ` : "";
-  return { role: "assistant", content: `${timeTag}${groupTag}${normalizeMessageContent(turn.content)}` };
 }
 
 function getCurrentMessageLagMs(context: ModelRequestContext): number {
@@ -2944,10 +3106,10 @@ function formatLocalDateTimeForModel(date = new Date()): string {
 }
 
 function formatUnreadMessagesForModel(messages: readonly PendingModelMessage[]): string {
-  // The full merged timeline (including these messages, in their permanent
+  // This group's own timeline (including these messages, in their permanent
   // format) is already in the cached prefix above. This volatile tail only
   // carries the per-request metadata (current time, group_id for per-group
-  // rules) and points the model at the group's latest timeline activity. It
+  // rules) and points the model at the timeline's latest activity. It
   // deliberately does NOT re-list the pending messages as an "unread" batch:
   // an explicit unread list made the model judge whatever was listed even when
   // the timeline showed Holly had already handled it, producing duplicate
@@ -2957,8 +3119,6 @@ function formatUnreadMessagesForModel(messages: readonly PendingModelMessage[]):
     "Scheduled reply scan for this group:",
     `- current_time: ${formatLocalDateTimeForModel()}`,
     ...(groupId ? [`- group_id: ${groupId}`] : []),
-    "- 上方全局时间线已包含全部消息。请只根据该群位于时间线末尾的最新动态决定是否回复,最多发一条。",
-    "- 时间线里 Holly 已经回复过的内容,以及该群中 Holly 最后一条发言之前的消息,都视为已处理:不要再回复,仅作上下文。",
   ].join("\n");
 }
 
@@ -3508,10 +3668,10 @@ function handleWsActionResponse(content: string): boolean {
 // assistant turn we record can share its dedup key with the same message if it
 // later re-enters context via the day-history bootstrap. null when unavailable.
 async function sendGroupMessage(groupId: number, message: string): Promise<string | null> {
-  // Defense in depth: every send path checks read-only mode before getting
-  // here, so this firing means a gate was missed — fail loudly, never send.
-  if (readOnlyMode) {
-    throw new Error("Read-only mode is enabled; group message suppressed.");
+  // Defense in depth: only active mode may send. Observe still connects and
+  // persists QQ activity, while offline never opens the socket.
+  if (!isQqParticipationEnabled()) {
+    throw new Error(`QQ sending is suppressed (${qqSuppressionDetail().replace(/\n/g, ", ")}).`);
   }
   const response = await sendWsAction("send_group_msg", {
       group_id: groupId,
@@ -3562,6 +3722,7 @@ async function applyLookupIfRequested(
     client: LlmClient;
     memoryPrompt: string;
     conversationTurns: readonly ConversationTurn[];
+    otherGroupsSummary: string;
     batchMessage: string;
     startedAt: number;
   },
@@ -3571,11 +3732,11 @@ async function applyLookupIfRequested(
     return firstReply;
   }
 
-  if (!searchConfig.enabled || !process.env.SERPER_API_KEY) {
+  if (!searchConfig.enabled) {
     pushMonitorEntry(
       "status",
       "Web Search Unavailable",
-      `query=${lookup.searchQuery}(搜索未启用或缺 SERPER_API_KEY,保持沉默)`,
+      `query=${lookup.searchQuery}(搜索未启用,保持沉默)`,
     );
     return JSON.stringify({
       should_reply: false,
@@ -3603,6 +3764,7 @@ async function applyLookupIfRequested(
     ctx.memoryPrompt,
     ctx.conversationTurns,
     augmentedMessage,
+    ctx.otherGroupsSummary,
   );
 
   pushMonitorEntry("status", "Search-Augmented Model Request", `${results.length} 条结果\n${resultsBlock}`);
@@ -3664,12 +3826,14 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     batchMessage,
     messages.map((item) => item.message),
   );
-  const conversationTurns = buildGlobalConversationTurns(effectiveContext);
+  const conversationTurns = buildFocusedConversationTurns(effectiveContext);
+  const otherGroupsSummary = buildOtherGroupsActivitySummary(effectiveContext);
   const preparedRequest = prepareModelRequest(
     client.systemPrompt,
     memoryPrompt,
     conversationTurns,
     batchMessage,
+    otherGroupsSummary,
   );
 
   updateConversationPreview({
@@ -3739,6 +3903,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       client,
       memoryPrompt,
       conversationTurns,
+      otherGroupsSummary,
       batchMessage,
       startedAt,
     });
@@ -3785,6 +3950,17 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     return;
   }
 
+  await recordMonitorThought({
+    kind: "reactive",
+    title: `群消息判断 · ${messages.length} 条未读`,
+    summary: decision.thinkingProcess || "模型未提供思考摘要。",
+    groupId: effectiveContext.groupId,
+    outcome: decision.shouldReply && decision.finalAnswer ? "reply" : "silent",
+    finalAnswer: decision.finalAnswer,
+    model: client.model,
+    durationMs: Math.max(0, Date.now() - startedAt),
+  });
+
   const content = formatModelReplyEntry(decision);
   await appendChatLog("assistant", content);
   pushMonitorEntry(
@@ -3814,11 +3990,11 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
 
   // A batch already on the model queue when read-only was switched on still
   // reaches here; suppress it cleanly instead of tripping the send guard.
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     pushMonitorEntry(
       "status",
       "Reply Suppressed",
-      `read_only=true\ngroup_id=${replyGroupId}\n${decision.finalAnswer}`,
+      `${qqSuppressionDetail()}\ngroup_id=${replyGroupId}\n${decision.finalAnswer}`,
     );
     return;
   }
@@ -3859,11 +4035,7 @@ function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
     });
 }
 
-async function warmGlobalContext(): Promise<void> {
-  if (!globalContextDirty) {
-    return;
-  }
-
+async function warmGroupContext(groupKey: string): Promise<void> {
   const client = activeLlmClient;
   if (!client || client.provider !== "claude") {
     // Only Anthropic prompt caching benefits from warming.
@@ -3871,7 +4043,7 @@ async function warmGlobalContext(): Promise<void> {
   }
 
   const warmRequestContext: ModelRequestContext = {
-    groupId: null,
+    groupId: groupKey,
     userId: null,
     senderName: null,
     rawMessage: null,
@@ -3879,22 +4051,20 @@ async function warmGlobalContext(): Promise<void> {
     messageLagMs: null,
   };
 
-  const conversationTurns = buildGlobalConversationTurns(warmRequestContext);
+  const conversationTurns = buildFocusedConversationTurns(warmRequestContext);
   if (conversationTurns.length === 0) {
-    globalContextDirty = false;
     return;
   }
 
-  // Build the same system + history prefix a real reply uses (empty current
-  // message, no memory) so the warmed cache is the one the next reply reads.
+  // Build the same system + history prefix a real reply for this group uses
+  // (empty current message, no memory, no other-groups summary — that summary
+  // is volatile-tail-only and never part of what gets cached) so the warmed
+  // cache is the one the next reply for this group reads.
   const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, "");
   if (prepared.messages.length === 0) {
-    globalContextDirty = false;
     return;
   }
 
-  // Clear before awaiting so messages arriving during the call re-arm the flag.
-  globalContextDirty = false;
   const startedAt = Date.now();
   await client.warmContext({
     systemPrompt: prepared.systemPrompt,
@@ -3911,14 +4081,38 @@ async function warmGlobalContext(): Promise<void> {
   pushMonitorEntry(
     "status",
     `Context Warmed - ${formatElapsedDuration(startedAt, Date.now())}`,
-    `Refreshed prompt cache with ${prepared.messages.length} messages (~${prepared.estimatedTokens} tokens).`,
+    `group_id=${groupKey}\nRefreshed prompt cache with ${prepared.messages.length} messages (~${prepared.estimatedTokens} tokens).`,
   );
 }
 
-function scheduleGlobalContextWarm(): void {
+// Single-group focus means each group carries its own cache-stable prefix (see
+// buildFocusedConversationTurns), so warming is per-group too: dirtyGroupKeys
+// tracks which groups' histories grew since the last warm pass.
+async function warmDirtyGroupContexts(): Promise<void> {
+  if (dirtyGroupKeys.size === 0) {
+    return;
+  }
+
+  const groupKeys = [...dirtyGroupKeys];
+  for (const groupKey of groupKeys) {
+    // Clear before awaiting so messages arriving during this group's warm call
+    // re-arm it for the next pass instead of being silently swallowed.
+    dirtyGroupKeys.delete(groupKey);
+    try {
+      await warmGroupContext(groupKey);
+    } catch (error) {
+      // One group's warm failure must not stop the rest of the batch from warming.
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Context Warm Error", `group_id=${groupKey}\n${detail}`);
+      console.error(`Context warm failed for group ${groupKey}:`, error);
+    }
+  }
+}
+
+function scheduleContextWarm(): void {
   // The warm cache only serves group replies; in read-only mode none happen,
   // so warming would burn tokens for nothing.
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     return;
   }
 
@@ -3929,7 +4123,7 @@ function scheduleGlobalContextWarm(): void {
       // Keep the queue alive after a previous failure.
     })
     .then(async () => {
-      await warmGlobalContext();
+      await warmDirtyGroupContexts();
     })
     .catch((error) => {
       const detail = error instanceof Error ? error.message : String(error);
@@ -3995,6 +4189,8 @@ function appendProactiveShadowLog(record: Record<string, unknown>): void {
 
 const WORLD_OBSERVATION_LOG_PATH = join(LOG_DIR, "world-observations.jsonl");
 const HOLLY_MEMORY_LOG_PATH = join(LOG_DIR, "holly-memories.jsonl");
+const BOOT_THOUGHT_LOG_PATH = join(LOG_DIR, "boot-thoughts.jsonl");
+const THOUGHT_HISTORY_LOG_PATH = join(LOG_DIR, "thought-history.jsonl");
 const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
 const MEMORY_REFLECTION_WORLD_LIMIT = 6;
 const MEMORY_REFLECTION_INTERNAL_LIMIT = 6;
@@ -4067,6 +4263,17 @@ function appendHollyMemoryLog(record: Record<string, unknown>): void {
     })
     .catch((error) => {
       console.error("Failed to write Holly memory log:", error);
+    });
+}
+
+function appendBootThoughtLog(record: Record<string, unknown>): void {
+  proactiveShadowQueue = proactiveShadowQueue
+    .then(async () => {
+      await mkdir(LOG_DIR, { recursive: true });
+      await appendFile(BOOT_THOUGHT_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
+    })
+    .catch((error) => {
+      console.error("Failed to write Holly boot thought log:", error);
     });
 }
 
@@ -4320,11 +4527,11 @@ async function observeWorldForAutonomy(
   request: AutonomyWorldObservationRequest,
 ): Promise<ProactiveWorldObservation | null> {
   if (!browserAgentConfig.enabled) return null;
-  if (!searchConfig.enabled || !process.env.SERPER_API_KEY) {
+  if (!searchConfig.enabled) {
     pushMonitorEntry(
       "status",
       "Browser Agent Skipped",
-      `topic=${request.topic}\nsearch disabled or SERPER_API_KEY missing.`,
+      `topic=${request.topic}\nsearch disabled.`,
     );
     return null;
   }
@@ -4386,7 +4593,7 @@ async function observeWorldForAutonomy(
       cached: worldObservation.cached === true,
     });
   } catch (error) {
-    const detail = error instanceof Error ? error.message : String(error);
+    const detail = describeErrorChain(error);
     pushMonitorEntry("error", "Qdrant World Observation Store Error", detail);
     console.error("Failed to store world observation:", error);
   }
@@ -4452,24 +4659,45 @@ function containsChineseText(text: string): boolean {
   return /[\u3400-\u9fff]/.test(text);
 }
 
-function buildWorldObservationBroadcastPrompt(topic: string, observation: ProactiveWorldObservation): string {
-  return [
-    "Translate and condense this browser world observation into Simplified Chinese for a QQ group.",
-    "Keep the factual content. Do not mention that it was translated.",
-    "If the observation contains MULTIPLE distinct news items, pick AT MOST 5 of the most informative ones (drop the rest) and put each on its own line numbered like 1. 2. 3. — one short sentence per item; an optional short intro line before the list is fine.",
-    "If there is only ONE item, use 2-4 short conversational sentences instead (no numbering).",
-    "Append a link at the end of each item (same line). Prefer the item's own detail-page link: pick the entry under 'Detail links' (below the matching source) whose text matches that item. Fall back to the page-level Source URL only when no detail link matches — never use a site homepage when a matching detail link exists.",
-    "Copy URLs EXACTLY from the observation below — never invent, shorten or rewrite URLs. Skip the link only if nothing matches the item.",
-    "No markdown bullets or headings (plain URLs, not [text](url)), no @ mentions, and stay under 500 Chinese characters of prose (URLs not counted).",
-    "If the source text is noisy, keep only the most useful concrete points.",
-    "",
-    `topic: ${topic}`,
-    `query: ${observation.query}`,
-    `urls: ${observation.urls.slice(0, 3).join(" ") || "(none)"}`,
-    "",
-    "world observation:",
-    observation.summary,
-  ].join("\n");
+// Pulled from the "Detail links:" section formatObservationSummary (in
+// browser-agent.ts) embeds per source page — the only place a specific
+// article/detail URL (as opposed to the page's own listing/homepage URL)
+// survives past toProactiveWorldObservation's lossy summary+urls shape.
+function parseDetailLinkCandidates(summary: string): Array<{ text: string; url: string }> {
+  const candidates: Array<{ text: string; url: string }> = [];
+  for (const match of summary.matchAll(/^- (.+): (https?:\/\/\S+)$/gm)) {
+    candidates.push({ text: match[1].trim(), url: match[2] });
+  }
+  return candidates;
+}
+
+// The url enum forces the model to cite a URL it actually observed — it
+// physically cannot invent, shorten, or rewrite one, which free-text URL
+// copying was prone to.
+function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["intro", "items"],
+    properties: {
+      intro: { type: "string" },
+      items: {
+        type: "array",
+        // maxItems is rejected by Claude's structured-output validator
+        // ("not supported" for array schemas); the cap is enforced by the
+        // prompt instruction plus the .slice(0, 5) after parsing below.
+        items: {
+          type: "object",
+          additionalProperties: false,
+          required: ["text", "url"],
+          properties: {
+            text: { type: "string" },
+            url: candidateUrls.length > 0 ? { type: "string", enum: candidateUrls } : { type: "string" },
+          },
+        },
+      },
+    },
+  };
 }
 
 async function translateWorldObservationForBroadcast(
@@ -4482,29 +4710,97 @@ async function translateWorldObservationForBroadcast(
     return null;
   }
 
-  let reply: string;
-  try {
-    reply = await client.generateText({
-      systemPrompt: "You turn browser observations into concise Simplified Chinese QQ group updates.",
-      messages: [{
-        role: "user",
-        content: buildWorldObservationBroadcastPrompt(topic, observation),
-      }],
-    });
-  } catch (error) {
-    pushMonitorEntry(
-      "error",
-      "World Observation Translate Failed",
-      error instanceof Error ? error.message : String(error),
-    );
-    return null;
-  }
+  // Candidates = each page's own URL (labelled as a fallback) plus every
+  // specific detail link recovered from the page content, deduped by URL.
+  const candidates = [
+    ...observation.urls.map((url) => ({ text: "(page source — use only if no specific item link matches)", url })),
+    ...parseDetailLinkCandidates(observation.summary),
+  ].filter((candidate, index, all) => all.findIndex((other) => other.url === candidate.url) === index);
+  const candidateUrls = candidates.map((candidate) => candidate.url);
 
-  broadcastLatestLlmUsage();
+  let parsed: { intro?: unknown; items?: unknown } | null = null;
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    // A retry deliberately carries less page chrome and fewer detail links.
+    // This addresses the observed failure mode where 3 listing pages plus up
+    // to 30 links make the model return an empty items array despite concrete
+    // news being present near the start of the observation.
+    const attemptCandidates = attempt === 1 ? candidates : candidates.slice(0, 12);
+    const attemptUrls = attemptCandidates.map((candidate) => candidate.url);
+    const attemptObservation = attempt === 1
+      ? observation
+      : { ...observation, summary: observation.summary.slice(0, 3200) };
+    let reply: string;
+    try {
+      reply = await client.generateText({
+        systemPrompt: WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
+        messages: [{
+          role: "user",
+          content: buildWorldObservationBroadcastPrompt(topic, attemptObservation, attemptCandidates),
+        }],
+        jsonSchema: buildWorldObservationBroadcastSchema(attemptUrls),
+      });
+    } catch (error) {
+      pushMonitorEntry(
+        "error",
+        "World Observation Translate Failed",
+        `attempt=${attempt}\n${error instanceof Error ? error.message : String(error)}`,
+      );
+      if (attempt === 2) return null;
+      continue;
+    }
+
+    broadcastLatestLlmUsage();
+    try {
+      const candidate = JSON.parse(unwrapJsonBlock(reply)) as { intro?: unknown; items?: unknown };
+      if (Array.isArray(candidate.items) && candidate.items.length > 0) {
+        parsed = candidate;
+        break;
+      }
+      pushMonitorEntry(
+        "status",
+        "World Observation Translate Empty",
+        `attempt=${attempt}\ntopic=${topic}\nRetrying with reduced context.`,
+      );
+    } catch {
+      pushMonitorEntry(
+        "error",
+        "World Observation Translate Failed",
+        `attempt=${attempt}\nInvalid JSON: ${reply.slice(0, 200)}`,
+      );
+    }
+  }
+  if (!parsed) return null;
+
+  const intro = typeof parsed.intro === "string" ? parsed.intro.trim() : "";
+  const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
+  const items = rawItems
+    .map((item): { text: string; url: string } | null => {
+      if (!item || typeof item !== "object") return null;
+      const record = item as Record<string, unknown>;
+      const text = typeof record.text === "string" ? record.text.trim() : "";
+      const url = typeof record.url === "string" ? record.url : "";
+      // Belt-and-suspenders: even though the schema enum should guarantee this,
+      // never let an unrecognized URL (a provider that ignores enum, say) through.
+      if (!url || !candidateUrls.includes(url)) return null;
+      return { text, url };
+    })
+    .filter((item): item is { text: string; url: string } => item !== null)
+    .slice(0, 5);
+  if (items.length === 0) return null;
+
+  const lines: string[] = [];
+  if (intro) lines.push(intro);
+  if (items.length === 1) {
+    lines.push(`${items[0].text} ${items[0].url}`.trim());
+  } else {
+    items.forEach((item, index) => {
+      lines.push(`${index + 1}. ${item.text} ${item.url}`.trim());
+    });
+  }
 
   // 800 instead of 500: source URLs ride along and are long; the prose itself
   // is still prompted to stay under 500 Chinese characters.
-  let message = normalizeBroadcastMessage(reply, 800);
+  const message = normalizeBroadcastMessage(lines.join("\n"), 800);
   if (!message) return null;
   if (!containsChineseText(message)) {
     pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message did not contain Chinese text.\n${message}`);
@@ -4513,15 +4809,6 @@ async function translateWorldObservationForBroadcast(
   if (/\[CQ:at|@\d{5,}|@everyone|@all/i.test(message)) {
     pushMonitorEntry("status", "World Observation Broadcast Skipped", `Translated message contains an @ mention.\n${message}`);
     return null;
-  }
-
-  // Fallback: if the model dropped the links, append the observed page URLs so
-  // the broadcast always carries its sources.
-  if (!/https?:\/\//i.test(message)) {
-    const sourceLinks = observation.urls.slice(0, 2).join(" ");
-    if (sourceLinks) {
-      message = `${message}\n来源: ${sourceLinks}`;
-    }
   }
   return message;
 }
@@ -4532,11 +4819,11 @@ async function notifyWorldObservationFailure(topic: string, reason: string): Pro
   const targetGroupId = autonomyConfig.worldObservationFailureGroupId;
   if (!targetGroupId) return;
 
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     pushMonitorEntry(
       "status",
       "World Observation Failure Notice Skipped",
-      `read_only=true\ntopic=${topic}\n${reason}`,
+      `${qqSuppressionDetail()}\ntopic=${topic}\n${reason}`,
     );
     return;
   }
@@ -4579,11 +4866,11 @@ async function maybeBroadcastWorldObservation(
   const targetGroupId = autonomyConfig.worldObservationBroadcastGroupId;
   if (!targetGroupId) return;
 
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     pushMonitorEntry(
       "status",
       "World Observation Broadcast Skipped",
-      `read_only=true\ntopic=${topic}\nObservation kept; nothing sent to the group.`,
+      `${qqSuppressionDetail()}\ntopic=${topic}\nObservation kept; nothing sent to the group.`,
     );
     return;
   }
@@ -4599,11 +4886,9 @@ async function maybeBroadcastWorldObservation(
   if (pageErrors.length > 0) {
     pushMonitorEntry(
       "status",
-      "World Observation Broadcast Skipped",
-      `group_id=${groupKey}\ntopic=${topic}\nPage open failed; notifying failure group.\n${pageErrors.slice(0, 3).join("\n")}`,
+      "World Observation Partial Page Failure",
+      `group_id=${groupKey}\ntopic=${topic}\nContinuing with usable sources.\n${pageErrors.slice(0, 3).join("\n")}`,
     );
-    await notifyWorldObservationFailure(topic, `页面打开失败 ${pageErrors.slice(0, 2).join(" ; ")}`);
-    return;
   }
 
   // Success path only interrupts the broadcast group when the conversation
@@ -4736,11 +5021,11 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
   const targetGroupId = autonomyConfig.memoryReflectionBroadcastGroupId;
   if (!targetGroupId) return;
 
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     pushMonitorEntry(
       "status",
       "Memory Reflection Broadcast Skipped",
-      `read_only=true\ntopic=${request.topic}\nMemory kept; nothing sent to the group.`,
+      `${qqSuppressionDetail()}\ntopic=${request.topic}\nMemory kept; nothing sent to the group.`,
     );
     return;
   }
@@ -4898,25 +5183,12 @@ async function reflectMemoryForAutonomy(
   const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
   if (material.length === 0) return null;
 
-  const prompt = [
-    "You are Holly's private memory and reflection loop.",
-    "Decide whether there is one useful internal memory to write for Holly.",
-    "Good memories are compact, reusable, and about Holly's interests, observations, preferences, unfinished thoughts, or patterns in recent interactions.",
-    "Do not write a memory if the material is trivial, duplicate, or only a transient implementation detail.",
-    "Return JSON only with this shape:",
-    '{"should_write": true, "topic": "short topic", "memory": "one compact internal memory in Chinese or natural mixed Chinese/English", "reason": "short reason"}',
-    "If nothing is worth remembering, set should_write=false and leave topic/memory empty.",
-    "",
-    `now=${request.nowIso}`,
-    `reason=${request.reason}`,
-    "",
-    material.join("\n\n"),
-  ].join("\n");
+  const prompt = buildMemoryReflectionPrompt(request.nowIso, request.reason, material);
 
   let reply: string;
   try {
     reply = await client.generateText({
-      systemPrompt: "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.",
+      systemPrompt: MEMORY_REFLECTION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
     });
@@ -4969,6 +5241,302 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
     pushMonitorEntry("error", "Memory Reflection Broadcast Failed", detail);
     console.error("Failed to broadcast memory reflection:", error);
   }
+}
+
+function recordBootstrapLlmUsage(): void {
+  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  const callTokens = consumeLatestCallTokenUsage();
+  if (!callTokens) return;
+  recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+  broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+}
+
+function countRestoredConversationTurns(): number {
+  let count = 0;
+  for (const turns of conversationHistoryByGroup.values()) count += turns.length;
+  return count;
+}
+
+async function buildHollyBootstrapMaterial(): Promise<string[]> {
+  const now = Date.now();
+  let qdrantMemories: string[] = [];
+  try {
+    qdrantMemories = await formatInternalMemoriesForReflection();
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Holly Bootstrap Memory Read Failed",
+      `${error instanceof Error ? error.message : String(error)}\nContinuing with restored local memory.`,
+    );
+  }
+  const localMemories = qdrantMemories.length > 0
+    ? []
+    : hollyMemorySidebarRecords.slice(-6).map((memory, index) => [
+        `Internal memory ${index + 1}:`,
+        `- written_at: ${memory.ts}`,
+        `- topic: ${memory.topic}`,
+        `- content: ${compactReflectionText(memory.content, 600)}`,
+      ].join("\n"));
+  return [
+    ...formatWorldObservationsForReflection(now),
+    ...qdrantMemories,
+    ...localMemories,
+    ...formatRecentTurnsForReflection(),
+  ];
+}
+
+async function requestBootOrientation(
+  nowIso: string,
+  previousBootAt: number,
+  material: readonly string[],
+): Promise<BootOrientation | null> {
+  const client = activeLlmClient;
+  if (!client || !hollyBootstrapConfig.reflectionEnabled) return null;
+
+  const prompt = buildBootOrientationPrompt({
+    nowIso,
+    previousBootAtIso: previousBootAt > 0 ? new Date(previousBootAt).toISOString() : null,
+    restoredGroups: conversationHistoryByGroup.size,
+    restoredTurns: countRestoredConversationTurns(),
+    restoredMemories: hollyMemorySidebarRecords.length,
+    restoredWorldObservations: worldObservationMemory.length,
+    material,
+  });
+
+  try {
+    const reply = await client.generateText({
+      systemPrompt: BOOT_ORIENTATION_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: prompt }],
+      jsonSchema: BOOT_ORIENTATION_JSON_SCHEMA,
+    });
+    recordBootstrapLlmUsage();
+    return parseBootOrientation(reply);
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Holly Bootstrap Reflection Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return null;
+  }
+}
+
+async function persistBootOrientation(orientation: BootOrientation, nowIso: string): Promise<void> {
+  const state = hollyStateStore?.getLifecycleState();
+  if (state) {
+    state.lastBootThoughtAt = Date.parse(nowIso);
+    state.lastBootThought = orientation.thought;
+  }
+  appendBootThoughtLog({
+    ts: nowIso,
+    action: "boot_orientation",
+    thought: orientation.thought,
+    reason: orientation.reason,
+  });
+  await recordMonitorThought({
+    timestamp: nowIso,
+    kind: "bootstrap",
+    title: "启动后的内心定向",
+    summary: orientation.thought,
+    groupId: null,
+    outcome: orientation.shouldWriteMemory ? "memory_written" : "no_memory",
+    finalAnswer: "",
+    model: activeLlmClient?.model ?? "",
+    durationMs: null,
+  });
+  pushMonitorEntry(
+    "assistant",
+    "Holly Bootstrap Inner Thought",
+    `${orientation.thought}\nreason=${orientation.reason}`,
+  );
+
+  if (!orientation.shouldWriteMemory) return;
+  const record = {
+    ts: nowIso,
+    action: "boot_memory",
+    topic: orientation.memoryTopic,
+    reason: orientation.reason,
+    content: orientation.memory,
+    query: "",
+    urls: [],
+  };
+  appendHollyMemoryLog(record);
+  rememberHollyMemoryForSidebar(record);
+  broadcastAutonomySidebar();
+  try {
+    await persistInternalMemory({
+      receivedAt: nowIso,
+      content: orientation.memory,
+      topic: orientation.memoryTopic,
+      reason: orientation.reason,
+      urls: [],
+    });
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Holly Bootstrap Memory Persistence Failed",
+      `${error instanceof Error ? error.message : String(error)}\nThe local append-only memory log was still updated.`,
+    );
+  }
+  pushMonitorEntry(
+    "status",
+    "Holly Bootstrap Memory Written",
+    `topic=${orientation.memoryTopic}\n${orientation.memory}`,
+  );
+}
+
+async function requestQqModeDecision(
+  reason: string,
+  material: readonly string[],
+): Promise<QqModeDecision> {
+  const forced = forcedQqModeDecision(hollyBootstrapConfig);
+  if (forced) return forced;
+
+  const client = activeLlmClient;
+  const lifecycle = hollyStateStore?.getLifecycleState();
+  if (!client) return fallbackQqModeDecision(hollyBootstrapConfig, "LLM is unavailable during QQ mode decision.");
+
+  const prompt = buildQqModeDecisionPrompt({
+    nowIso: new Date().toISOString(),
+    bootThought: lifecycle?.lastBootThought ?? "",
+    readOnly: readOnlyMode,
+    fallbackMode: hollyBootstrapConfig.fallbackQqMode,
+    defaultReconsiderMinutes: Math.round(hollyBootstrapConfig.defaultReconsiderMs / 60_000),
+    material: [`decision_reason=${reason}`, ...material],
+  });
+
+  try {
+    const reply = await client.generateText({
+      systemPrompt: QQ_MODE_DECISION_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: prompt }],
+      jsonSchema: QQ_MODE_DECISION_JSON_SCHEMA,
+    });
+    recordBootstrapLlmUsage();
+    return parseQqModeDecision(reply, hollyBootstrapConfig, { readOnly: readOnlyMode })
+      ?? fallbackQqModeDecision(hollyBootstrapConfig, "The QQ mode response was malformed.");
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "QQ Mode Decision Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return fallbackQqModeDecision(hollyBootstrapConfig, "The QQ mode model call failed.");
+  }
+}
+
+function scheduleQqModeReconsideration(delayMs: number): void {
+  if (qqModeReconsiderTimer) {
+    clearTimeout(qqModeReconsiderTimer);
+    qqModeReconsiderTimer = null;
+  }
+  if (hollyBootstrapConfig.qqModePolicy !== "auto" || delayMs <= 0) return;
+
+  qqModeReconsiderTimer = setTimeout(() => {
+    qqModeReconsiderTimer = null;
+    modelQueue = modelQueue
+      .catch(() => undefined)
+      .then(async () => {
+        const material = await buildHollyBootstrapMaterial();
+        const decision = await requestQqModeDecision("scheduled reconsideration", material);
+        await applyQqModeDecision(decision);
+      })
+      .catch((error) => {
+        pushMonitorEntry(
+          "error",
+          "QQ Mode Reconsideration Failed",
+          error instanceof Error ? error.message : String(error),
+        );
+        scheduleQqModeReconsideration(hollyBootstrapConfig.defaultReconsiderMs);
+      });
+  }, delayMs);
+}
+
+async function applyQqModeDecision(decision: QqModeDecision): Promise<void> {
+  const previousMode = qqRuntimeMode;
+  qqRuntimeMode = decision.mode;
+  const decidedAt = Date.now();
+  const lifecycle = hollyStateStore?.getLifecycleState();
+  if (lifecycle) {
+    lifecycle.qqMode = decision.mode;
+    lifecycle.qqModeReason = decision.reason;
+    lifecycle.qqModeDecidedAt = decidedAt;
+    lifecycle.qqModeReconsiderAt = decision.reconsiderAfterMs > 0 ? decidedAt + decision.reconsiderAfterMs : 0;
+    await hollyStateStore?.save();
+  }
+
+  await recordMonitorThought({
+    kind: "qq_mode",
+    title: previousMode === "offline" ? "QQ 接入判断" : "QQ 模式复议",
+    summary: decision.reason,
+    groupId: null,
+    outcome: decision.mode,
+    finalAnswer: "",
+    model: decision.source === "model" ? activeLlmClient?.model ?? "" : decision.source,
+    durationMs: null,
+  });
+
+  if (!isQqParticipationEnabled()) {
+    unreadModelMessagesByGroup.clear();
+  }
+  pushMonitorEntry(
+    "status",
+    "QQ Runtime Mode Decided",
+    `previous=${previousMode}\nmode=${decision.mode}\nsource=${decision.source}\nreason=${decision.reason}` +
+      (decision.reconsiderAfterMs > 0
+        ? `\nreconsider_at=${new Date(decidedAt + decision.reconsiderAfterMs).toISOString()}`
+        : ""),
+  );
+
+  if (decision.mode === "offline") {
+    disconnectWebSocketClient("Holly chose QQ offline mode.");
+  } else {
+    connectWebSocketClient();
+  }
+  scheduleQqModeReconsideration(decision.reconsiderAfterMs);
+}
+
+async function runHollyBootstrap(): Promise<void> {
+  const store = hollyStateStore;
+  if (!store) throw new Error("Holly state is unavailable during bootstrap.");
+
+  const lifecycle = store.getLifecycleState();
+  const previousBootAt = lifecycle.lastBootStartedAt;
+  const nowIso = new Date().toISOString();
+  lifecycle.bootCount += 1;
+  lifecycle.lastBootStartedAt = Date.parse(nowIso);
+  await store.save();
+
+  pushMonitorEntry(
+    "status",
+    "Holly Bootstrap Started",
+    `boot=${lifecycle.bootCount}\nmemories=${hollyMemorySidebarRecords.length}\nworld_observations=${worldObservationMemory.length}\ngroups=${conversationHistoryByGroup.size}\nturns=${countRestoredConversationTurns()}`,
+  );
+
+  let material = await buildHollyBootstrapMaterial();
+  if (hollyBootstrapConfig.enabled && hollyBootstrapConfig.reflectionEnabled) {
+    const orientation = await requestBootOrientation(nowIso, previousBootAt, material);
+    if (orientation) {
+      await persistBootOrientation(orientation, nowIso);
+      if (orientation.shouldWriteMemory) {
+        material = [
+          ...material,
+          `New boot memory:\n- topic: ${orientation.memoryTopic}\n- content: ${orientation.memory}`,
+        ];
+      }
+    } else {
+      pushMonitorEntry("status", "Holly Bootstrap Reflection Skipped", "No valid startup thought was produced.");
+    }
+  }
+
+  const decision = await requestQqModeDecision("startup after memory restoration", material);
+  lifecycle.lastBootCompletedAt = Date.now();
+  await applyQqModeDecision(decision);
+  await store.save();
+  pushMonitorEntry(
+    "status",
+    "Holly Bootstrap Completed",
+    `qq_mode=${qqRuntimeMode}\nduration_ms=${Math.max(0, lifecycle.lastBootCompletedAt - lifecycle.lastBootStartedAt)}`,
+  );
 }
 
 const ARCHIVE_LOG_PATH = join(ARCHIVE_DIR, "archive.jsonl");
@@ -5139,27 +5707,12 @@ async function composeArchiveForAutonomy(
   const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
   if (material.length === 0) return null;
 
-  const prompt = [
-    "You are Holly's creative writing impulse.",
-    "Decide whether Holly genuinely feels like writing a short article (文章) or a poem (诗) right now, inspired by the material below.",
-    "Only write when something in the material truly sparks it; most of the time nothing does — then set should_write=false.",
-    "If you write: write the complete work, in Chinese or natural mixed Chinese/English, in Holly's own voice.",
-    "A poem should keep its line breaks. An article should be a few coherent paragraphs, not a news digest.",
-    "Do not repeat a recent work's theme.",
-    "Return JSON only with this shape:",
-    '{"should_write": true, "kind": "article" | "poem", "title": "short title", "content": "the full work", "reason": "short reason"}',
-    "",
-    `now=${request.nowIso}`,
-    `reason=${request.reason}`,
-    "",
-    recentTitles.length > 0 ? ["Recent works (avoid repeating):", ...recentTitles, ""].join("\n") : "",
-    material.join("\n\n"),
-  ].filter(Boolean).join("\n");
+  const prompt = buildArchiveCompositionPrompt(request.nowIso, request.reason, recentTitles, material);
 
   let reply: string;
   try {
     reply = await client.generateText({
-      systemPrompt: "You write Holly's private creative works. Be genuine and concrete; do not roleplay a public chat reply.",
+      systemPrompt: ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,
     });
@@ -5219,16 +5772,19 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
   );
 }
 
-// Gate B (6A): reuse the exact cached system + global-history prefix a reactive
-// reply uses; the proactive instruction rides only in the current-message slot,
-// so this call hits the 1h prompt cache instead of reprocessing the full context.
-// The timeline goes whole and unmarked; the instruction only names the group and
-// the current trigger cycle start, so the model tails the timeline itself.
+// Gate B (6A): reuse the exact cached system + this-group's-history prefix a
+// reactive reply uses; the proactive instruction rides only in the
+// current-message slot, so this call hits the 1h prompt cache instead of
+// reprocessing the full context. The timeline goes whole and unmarked; the
+// instruction only names the group and the current trigger cycle start, so
+// the model tails the timeline itself. Other groups' activity, if any, only
+// shows up as the same background summary a reactive reply gets.
 async function evaluateProactiveRevival(
   request: ProactiveRevivalRequest,
 ): Promise<ProactiveDecision | null> {
   const client = activeLlmClient;
   if (!client) return null;
+  const startedAt = Date.now();
 
   const context: ModelRequestContext = {
     groupId: request.groupKey,
@@ -5238,9 +5794,10 @@ async function evaluateProactiveRevival(
     receivedAt: new Date().toISOString(),
     messageLagMs: null,
   };
-  const conversationTurns = buildGlobalConversationTurns(context);
+  const conversationTurns = buildFocusedConversationTurns(context);
+  const otherGroupsSummary = buildOtherGroupsActivitySummary(context);
   const instruction = buildProactiveRevivePrompt(request);
-  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, instruction);
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, instruction, otherGroupsSummary);
   if (prepared.messages.length === 0) return null;
 
   let reply: string;
@@ -5264,6 +5821,16 @@ async function evaluateProactiveRevival(
 
   try {
     const decision = parseModelDecision(reply);
+    await recordMonitorThought({
+      kind: "proactive",
+      title: "主动开口判断",
+      summary: decision.thinkingProcess || "模型未提供思考摘要。",
+      groupId: request.groupKey,
+      outcome: decision.shouldReply && decision.finalAnswer ? "reply" : "silent",
+      finalAnswer: decision.finalAnswer,
+      model: client.model,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    });
     return {
       shouldReply: decision.shouldReply,
       finalAnswer: decision.finalAnswer,
@@ -5317,7 +5884,7 @@ function emptyProactiveResult(): ProactiveTickResult {
 // Only the group-message action enters modelQueue. Browser world observation is
 // driven by autonomyQueue so a slow page load cannot block reactive replies.
 function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
-  if (readOnlyMode) return Promise.resolve(emptyProactiveResult());
+  if (!isQqParticipationEnabled()) return Promise.resolve(emptyProactiveResult());
   const deps = buildProactiveDeps();
   if (!deps || !deps.config.enabled) return Promise.resolve(emptyProactiveResult());
 
@@ -5411,9 +5978,9 @@ function claimIncomingMessageId(messageId: string | null): boolean {
 }
 
 function queueUnreadMessageForModel(message: string, context: ModelRequestContext): number | null {
-  // Read-only: the message is already stored and in context; just never hand it
-  // to the reply model. The sidebar toggle makes the silence visible.
-  if (readOnlyMode) {
+  // Observe/read-only: the message is already stored and in context; just never
+  // hand it to the reply model.
+  if (!isQqParticipationEnabled()) {
     return null;
   }
 
@@ -5442,14 +6009,14 @@ function flushUnreadMessagesToModel(): void {
 
   // Messages queued just before read-only was switched on: drop them instead of
   // replying late after the mode is switched back off.
-  if (readOnlyMode) {
+  if (!isQqParticipationEnabled()) {
     const dropped = Array.from(unreadModelMessagesByGroup.values())
       .reduce((count, messages) => count + messages.length, 0);
     unreadModelMessagesByGroup.clear();
     pushMonitorEntry(
       "status",
-      "Read-Only Mode",
-      `Dropped ${dropped} queued unread message(s) without model processing.`,
+      "QQ Participation Suppressed",
+      `${qqSuppressionDetail()}\nDropped ${dropped} queued unread message(s) without model processing.`,
     );
     return;
   }
@@ -5492,7 +6059,7 @@ function handleMonitorStream(req: IncomingMessage, res: ServerResponse): void {
 }
 
 function scheduleWebSocketReconnect(reason: string): void {
-  if (wsReconnectTimer) {
+  if (!isQqConnectedMode() || wsReconnectTimer) {
     return;
   }
 
@@ -5503,7 +6070,30 @@ function scheduleWebSocketReconnect(reason: string): void {
   }, WS_RECONNECT_DELAY_MS);
 }
 
+function disconnectWebSocketClient(reason: string): void {
+  if (wsReconnectTimer) {
+    clearTimeout(wsReconnectTimer);
+    wsReconnectTimer = null;
+  }
+  const client = wsClient;
+  wsClient = null;
+  if (client && client.readyState !== WebSocket.CLOSED) {
+    client.removeAllListeners();
+    client.terminate();
+  }
+  rejectAllPendingWsActions("Upstream WebSocket disconnected by Holly's QQ runtime mode.");
+  updateMonitorStatus("closed", reason);
+  pushMonitorEntry("status", "QQ Connection Offline", reason);
+}
+
 function connectWebSocketClient(forceReconnect = false): void {
+  if (!isQqConnectedMode()) {
+    updateMonitorStatus("closed", `QQ mode is offline; not connecting to ${WS_TARGET_URL}`);
+    if (forceReconnect) {
+      pushMonitorEntry("status", "Reconnect Suppressed", `qq_mode=${qqRuntimeMode}`);
+    }
+    return;
+  }
   if (wsReconnectTimer) {
     clearTimeout(wsReconnectTimer);
     wsReconnectTimer = null;
@@ -5529,7 +6119,13 @@ function connectWebSocketClient(forceReconnect = false): void {
   updateMonitorStatus("connecting", `Connecting to ${WS_TARGET_URL}`);
   pushMonitorEntry("status", forceReconnect ? "Reconnect Requested" : "Connecting", WS_TARGET_URL);
 
-  const client = new WebSocket(WS_TARGET_URL);
+  // NapCat's forward-WS server authenticates the handshake via a Bearer token
+  // when one is configured; send it only if set so the tokenless local default
+  // still connects.
+  const client = new WebSocket(
+    WS_TARGET_URL,
+    WS_ACCESS_TOKEN ? { headers: { Authorization: `Bearer ${WS_ACCESS_TOKEN}` } } : undefined,
+  );
   wsClient = client;
 
   client.on("open", () => {
@@ -5556,6 +6152,13 @@ function connectWebSocketClient(forceReconnect = false): void {
 
     const parsedMessage = parseIncomingMessage(data, isBinary);
 
+    // NapCat transport heartbeats carry no conversation content. Discard them
+    // before OCR/URL enrichment and before they enter the serialized Qdrant
+    // write queue. saveMessage has the same check as a defensive boundary.
+    if (isNapCatHeartbeat(parsedMessage)) {
+      return;
+    }
+
     // Suppress duplicate deliveries (e.g. NapCat re-pushing after a reconnect) as
     // early as possible — before OCR/URL enrichment, the Qdrant write, and the
     // model queue — so a re-pushed message is neither re-stored nor re-judged.
@@ -5572,13 +6175,18 @@ function connectWebSocketClient(forceReconnect = false): void {
 
     const ocrMessage = await enrichMessageWithImageOcr(parsedMessage);
     const message = await enrichMessageWithUrlContent(ocrMessage);
-    try {
-      await persistIncomingMessage(message);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+    // Fire-and-forget: persistIncomingMessage serializes onto a shared write
+    // queue and retries internally for several seconds on a transient Qdrant
+    // failure. Awaiting it here would stall this message's reply (and, via the
+    // shared queue, every later message's) for as long as that retry runs — up
+    // to ~68s if the cluster/proxy path is having a sustained bad stretch, not
+    // just one dropped socket. Nothing downstream reads this message back from
+    // the store, so the reply path doesn't need to wait on it.
+    void persistIncomingMessage(message).catch((error) => {
+      const detail = describeErrorChain(error);
       pushMonitorEntry("error", "Qdrant Store Error", detail);
       console.error("Failed to store incoming message:", error);
-    }
+    });
 
     if (message.displayText === null) {
       return;
@@ -5806,6 +6414,22 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .reflect-links a:hover { text-decoration: underline; }
     .reflect-pill { border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; background: #e2e8f0; color: #334155; }
     .reflect-pill.on { background: #ccfbf1; color: #0f766e; }
+    .thought-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
+    .thought-toolbar select { width: auto; min-width: 160px; }
+    .thought-list { display: flex; flex-direction: column; gap: 12px; }
+    .thought-card { border: 1px solid var(--line); border-left: 4px solid #8b5cf6; border-radius: 11px; padding: 14px 16px; background: rgba(255,255,255,0.82); }
+    .thought-card.bootstrap { border-left-color: #0f766e; }
+    .thought-card.qq_mode { border-left-color: #0284c7; }
+    .thought-card.proactive { border-left-color: #d97706; }
+    .thought-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+    .thought-title { font-size: 14px; font-weight: 800; color: var(--ink); }
+    .thought-time { flex-shrink: 0; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .thought-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .thought-meta span { border-radius: 999px; padding: 3px 8px; background: #eef2f7; color: #475569; font-size: 11px; }
+    .thought-summary { white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.65; color: var(--ink); }
+    .thought-answer { margin-top: 11px; padding: 10px 12px; border-radius: 9px; background: #f5f3ff; border: 1px solid #ede9fe; }
+    .thought-answer-label { display: block; margin-bottom: 4px; color: #7c3aed; font-size: 10px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+    .thought-answer-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.55; }
     .archive-body { font-family: Georgia, "Noto Serif SC", serif; font-size: 14px; line-height: 1.85; max-height: 340px; overflow-y: auto; }
     .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
     label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
@@ -5877,6 +6501,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <path stroke-linecap="round" stroke-linejoin="round" d="M14 17.5h7M17.5 14v7"/>
         </svg>
         <span class="nav-label">Agent</span>
+      </li>
+      <li class="nav-item" :class="{active: tab === 'thoughts'}" @click="tab = 'thoughts'">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M9.5 4.5A3.5 3.5 0 006 8v1a3 3 0 00-2 2.8A3.2 3.2 0 006.8 15v1A3.5 3.5 0 0010 19.5"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M14.5 4.5A3.5 3.5 0 0118 8v1a3 3 0 012 2.8A3.2 3.2 0 0117.2 15v1a3.5 3.5 0 01-3.2 3.5M12 4v16M9 9h3M12 14h3"/>
+        </svg>
+        <span class="nav-label">Thoughts</span>
       </li>
       <li class="nav-item" :class="{active: tab === 'memory'}" @click="tab = 'memory'">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
@@ -5996,6 +6627,54 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
             </div>
           </div>
         </div>
+    </div>
+
+    <!-- Thoughts -->
+    <div v-else-if="tab === 'thoughts'">
+      <div class="ph">
+        <div class="ph-eye">Holly · Live</div>
+        <div class="ph-title">思考时间线</div>
+        <div class="ph-desc">实时展示 Holly 每轮模型判断主动返回的简短思考摘要；不包含模型供应商隐藏的推理链。</div>
+      </div>
+      <div class="panel">
+        <div class="ph2">
+          <span class="ph2-title">Thoughts <span style="color:var(--muted);font-weight:600;">&middot; {{ filteredThoughts.length }}/{{ thoughts.length }}</span></span>
+          <button class="sec sm" @click="loadThoughts">Refresh</button>
+        </div>
+        <div class="pb">
+          <div class="thought-toolbar" style="margin-bottom:14px;">
+            <p class="hint">包含启动定向、QQ 模式决策、群消息回复判断和主动开口判断，最新一轮排在最前。</p>
+            <select v-model="thoughtKindFilter" aria-label="筛选思考类型">
+              <option value="all">全部类型</option>
+              <option value="reactive">群消息判断</option>
+              <option value="proactive">主动开口判断</option>
+              <option value="bootstrap">启动定向</option>
+              <option value="qq_mode">QQ 模式判断</option>
+            </select>
+          </div>
+          <div v-if="!filteredThoughts.length" class="empty">还没有可展示的思考记录。</div>
+          <div v-else class="thought-list">
+            <article v-for="thought in filteredThoughts" :key="thought.id" class="thought-card" :class="thought.kind">
+              <div class="thought-head">
+                <span class="thought-title">{{ thought.title }}</span>
+                <span class="thought-time">{{ fmtDateTime(thought.timestamp) }}</span>
+              </div>
+              <div class="thought-meta">
+                <span>{{ thoughtKindLabel(thought.kind) }}</span>
+                <span v-if="thought.groupId">群 {{ thought.groupId }}</span>
+                <span v-if="thought.outcome">{{ thoughtOutcomeLabel(thought.outcome) }}</span>
+                <span v-if="thought.model">{{ thought.model }}</span>
+                <span v-if="typeof thought.durationMs === 'number' && thought.durationMs > 0">{{ fmtDuration(thought.durationMs) }}</span>
+              </div>
+              <div class="thought-summary">{{ thought.summary }}</div>
+              <div v-if="thought.finalAnswer" class="thought-answer">
+                <span class="thought-answer-label">拟回复</span>
+                <div class="thought-answer-body">{{ thought.finalAnswer }}</div>
+              </div>
+            </article>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- Memory -->
@@ -6333,7 +7012,7 @@ var watch = _Vue.watch;
 
 createApp({
   setup: function() {
-    var tab = ref('agent');
+    var tab = ref(window.location.pathname === '/thoughts' ? 'thoughts' : 'agent');
 
     // Agent state
     var wsTargetUrl = ref(_wsTarget);
@@ -6371,6 +7050,15 @@ createApp({
       var cmp = typeof p.compressThresholdTokens === 'number' ? p.compressThresholdTokens : '?';
       var msgs = (p.messages && p.messages.length) ? p.messages.length : 0;
       return 'Group: ' + g + '  |  Msgs: ' + msgs + '  |  Tokens: ~' + tok + '/' + lim + '  |  Compress@' + cmp + '  |  ' + (p.compressed ? 'Compressed' : 'Uncompressed') + '  |  ' + u;
+    });
+
+    // Thought timeline state
+    var thoughts = ref([]);
+    var thoughtIds = new Set();
+    var thoughtKindFilter = ref('all');
+    var filteredThoughts = computed(function() {
+      if (thoughtKindFilter.value === 'all') return thoughts.value;
+      return thoughts.value.filter(function(item) { return item.kind === thoughtKindFilter.value; });
     });
 
     // Memory state
@@ -6451,6 +7139,26 @@ createApp({
       try { return new Date(ts).toLocaleString(); } catch(e) { return String(ts); }
     }
 
+    function fmtDuration(ms) {
+      if (typeof ms !== 'number' || !isFinite(ms)) return '-';
+      return ms >= 1000 ? (ms / 1000).toFixed(2) + 's' : Math.round(ms) + 'ms';
+    }
+
+    function thoughtKindLabel(kind) {
+      if (kind === 'bootstrap') return '启动定向';
+      if (kind === 'qq_mode') return 'QQ 模式';
+      if (kind === 'proactive') return '主动判断';
+      return '群消息判断';
+    }
+
+    function thoughtOutcomeLabel(outcome) {
+      var labels = {
+        reply: '选择回复', silent: '保持沉默', active: '主动接入', observe: '仅观察', offline: '离线',
+        memory_written: '写入记忆', no_memory: '未写记忆'
+      };
+      return labels[outcome] || outcome;
+    }
+
     function fmtBody(body) {
       if (typeof body !== 'string') return JSON.stringify(body, null, 2);
       try { return JSON.stringify(JSON.parse(body), null, 2); } catch(e) { return body; }
@@ -6491,12 +7199,27 @@ createApp({
       if (entries.value.length > 120) entries.value.splice(120);
     }
 
+    function pushThought(thought) {
+      if (!thought || !thought.id || thoughtIds.has(thought.id)) return;
+      thoughtIds.add(thought.id);
+      thoughts.value.unshift(thought);
+      if (thoughts.value.length > 400) thoughts.value.splice(400);
+    }
+
+    function replaceThoughts(items) {
+      thoughtIds.clear();
+      thoughts.value = [];
+      var visible = Array.isArray(items) ? items : [];
+      for (var i = 0; i < visible.length; i++) pushThought(visible[i]);
+    }
+
     function renderSnapshot(payload) {
       renderedIds.clear();
       wsStatus.value = payload.status;
       convPreview.value = payload.conversationPreview;
       autonomySidebar.value = payload.autonomySidebar || null;
       readOnly.value = !!payload.readOnly;
+      replaceThoughts(payload.thoughts || []);
       if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
       if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
@@ -6514,6 +7237,7 @@ createApp({
       if (payload.type === 'archive') { applyArchiveWork(payload.work); return; }
       if (payload.type === 'mode') { readOnly.value = !!payload.readOnly; return; }
       if (payload.type === 'turn') { applyGroupTurn(payload.groupId, payload.turn); return; }
+      if (payload.type === 'thought') { pushThought(payload.thought); return; }
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
 
@@ -6609,6 +7333,17 @@ createApp({
       });
     }
 
+    function loadThoughts() {
+      fetch('/api/thoughts?limit=400').then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load thoughts');
+          replaceThoughts(d.items || []);
+        });
+      }).catch(function(e) {
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Thoughts Load Failed', body: e.message, timestamp: new Date().toISOString() });
+      });
+    }
+
     function loadArchive() {
       archiveLoading.value = true;
       archiveErr.value = '';
@@ -6692,6 +7427,7 @@ createApp({
     }
 
     watch(tab, function(t) {
+      if (t === 'thoughts') { loadThoughts(); }
       if (t === 'memory') { loadMemories(); loadGroups(); }
       if (t === 'group') { loadGroups(); }
       if (t === 'usage') { loadUsageHistory(); }
@@ -6732,6 +7468,7 @@ createApp({
     return {
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
       entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
+      thoughts, thoughtKindFilter, filteredThoughts,
       usageHistory, usageGrandTotal,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
@@ -6740,9 +7477,9 @@ createApp({
       readOnly, modeSwitching, toggleReadOnly,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtDateTime, fmtBody, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
+      fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
-      loadUsageHistory, loadArchive
+      loadThoughts, loadUsageHistory, loadArchive
     };
   }
 }).mount('#app');
@@ -6761,6 +7498,7 @@ async function bootstrap(): Promise<void> {
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  const loadedHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   readOnlyMode = await loadReadOnlyConfig(CONFIG_PATH);
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
@@ -6776,9 +7514,11 @@ async function bootstrap(): Promise<void> {
   proactiveConfig = loadedProactiveConfig;
   searchConfig = loadedSearchConfig;
   browserAgentConfig = loadedBrowserAgentConfig;
+  hollyBootstrapConfig = loadedHollyBootstrapConfig;
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
+  thoughtHistoryStore = await ThoughtHistoryStore.load(THOUGHT_HISTORY_LOG_PATH, THOUGHT_HISTORY_LIMIT);
   incomingMessageStore = store;
   // Restore the persisted merged timeline BEFORE the WS connects, so incoming
   // messages and the autonomy/proactive loops see the full context immediately.
@@ -6787,7 +7527,6 @@ async function bootstrap(): Promise<void> {
   await loadWorldObservationMemory();
   await loadHollyMemorySidebarRecords();
   await loadArchiveWorks();
-  startConfigWatcher();
   if (store) {
     pushMonitorEntry("status", "Qdrant Ready", store.description);
   }
@@ -6809,18 +7548,26 @@ async function bootstrap(): Promise<void> {
       : "read_only=false",
   );
 
-  connectWebSocketClient();
+  // Holly comes online as herself first. Only after memory restoration and a
+  // private startup orientation does she decide whether QQ should be offline,
+  // observe-only, or active.
+  await runHollyBootstrap();
+  startConfigWatcher();
 
   // Review unread group activity in batches so Holly responds to a conversation,
   // rather than reacting immediately to each incoming message.
   setInterval(flushUnreadMessagesToModel, UNREAD_MODEL_FLUSH_INTERVAL_MS);
 
   // Keep the merged global context's 1h prompt cache warm; skips when idle.
-  setInterval(scheduleGlobalContextWarm, CONTEXT_WARM_INTERVAL_MS);
+  setInterval(scheduleContextWarm, CONTEXT_WARM_INTERVAL_MS);
 
   // Snapshot the merged timeline to disk so a restart keeps the whole context.
   setInterval(persistConversationContext, CONVERSATION_CONTEXT_PERSIST_INTERVAL_MS);
   const flushContextAndExit = () => {
+    if (qqModeReconsiderTimer) {
+      clearTimeout(qqModeReconsiderTimer);
+      qqModeReconsiderTimer = null;
+    }
     const contextStore = conversationContextStore;
     const flush = contextStore && conversationHistoryPersistDirty
       ? contextStore.save(conversationHistoryByGroup)
@@ -6870,13 +7617,25 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
-      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/ws" || url.pathname === "/memories")) {
+      if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/ws" || url.pathname === "/thoughts" || url.pathname === "/memories")) {
         sendHtml(res, UNIFIED_PAGE);
         return;
       }
 
       if (req.method === "GET" && url.pathname === "/api/ws/events") {
         handleMonitorStream(req, res);
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/thoughts") {
+        const limitValue = Number(url.searchParams.get("limit") || "200");
+        const limit = Number.isFinite(limitValue)
+          ? Math.max(1, Math.min(THOUGHT_HISTORY_LIMIT, Math.floor(limitValue)))
+          : 200;
+        sendJson(res, 200, {
+          items: thoughtHistoryStore?.list(limit) ?? [],
+          limit,
+        });
         return;
       }
 
@@ -6948,8 +7707,12 @@ async function bootstrap(): Promise<void> {
       }
 
       if (req.method === "POST" && url.pathname === "/api/ws/reconnect") {
+        if (!isQqConnectedMode()) {
+          sendJson(res, 409, { error: "QQ mode is offline; reconnect is suppressed.", qqMode: qqRuntimeMode });
+          return;
+        }
         connectWebSocketClient(true);
-        sendJson(res, 200, { message: `Reconnecting to ${WS_TARGET_URL}` });
+        sendJson(res, 200, { message: `Reconnecting to ${WS_TARGET_URL}`, qqMode: qqRuntimeMode });
         return;
       }
 
@@ -6982,7 +7745,13 @@ async function bootstrap(): Promise<void> {
       }
 
       if (req.method === "GET" && url.pathname === "/api/mode") {
-        sendJson(res, 200, { readOnly: readOnlyMode });
+        const lifecycle = hollyStateStore?.getLifecycleState();
+        sendJson(res, 200, {
+          readOnly: readOnlyMode,
+          qqMode: qqRuntimeMode,
+          qqModeReason: lifecycle?.qqModeReason ?? "",
+          qqModeReconsiderAt: isoFromMs(lifecycle?.qqModeReconsiderAt ?? 0),
+        });
         return;
       }
 
@@ -6995,7 +7764,7 @@ async function bootstrap(): Promise<void> {
         }
         applyReadOnlyMode(flag, "monitor ui");
         await persistReadOnlyMode(flag);
-        sendJson(res, 200, { readOnly: readOnlyMode });
+        sendJson(res, 200, { readOnly: readOnlyMode, qqMode: qqRuntimeMode });
         return;
       }
 

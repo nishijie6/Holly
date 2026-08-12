@@ -100,18 +100,41 @@ type ResolvedQdrantConfig = {
 
 const DEFAULT_COLLECTION_NAME = "ws_incoming_messages";
 const DEFAULT_TIMEOUT_MS = 10000;
-const STORAGE_VECTOR = [0];
+// This collection is currently used as an ordered/filterable document store,
+// not for nearest-neighbour search. Qdrant accepts points with no vectors; the
+// empty vector map avoids allocating a meaningless `[0]` dense vector per row
+// while keeping the existing collection compatible with future real vectors.
+const NO_STORAGE_VECTOR: Record<string, never> = {};
 const PAYLOAD_INDEXES: Array<{
   fieldName: string;
   fieldSchema: "keyword" | "integer" | "datetime";
 }> = [
-  { fieldName: "session_id", fieldSchema: "keyword" },
   { fieldName: "received_at", fieldSchema: "datetime" },
   { fieldName: "message_type", fieldSchema: "keyword" },
   { fieldName: "group_id", fieldSchema: "keyword" },
   { fieldName: "user_id", fieldSchema: "keyword" },
-  { fieldName: "sequence", fieldSchema: "integer" },
 ];
+
+const STORED_MEMORY_PAYLOAD_FIELDS = [
+  "content",
+  "session_id",
+  "session_started_at",
+  "source",
+  "sequence",
+  "received_at",
+  "display_text",
+  "message_type",
+  "group_id",
+  "group_name",
+  "user_id",
+  "sender_name",
+  "raw_message",
+  "memory_topic",
+  "memory_reason",
+  "memory_query",
+  "memory_urls",
+  "world_observation_page_errors",
+] as const;
 
 async function loadConfig(configPath: string): Promise<AppConfig> {
   if (!existsSync(configPath)) {
@@ -144,7 +167,10 @@ async function resolveQdrantConfig(configPath: string): Promise<ResolvedQdrantCo
   return {
     enabled,
     url,
-    apiKey: section.api_key?.trim() || undefined,
+    // config.yaml is committed, so the cluster key must NOT live there. Prefer
+    // QDRANT_API_KEY from the environment (like SERPER_API_KEY); fall back to the
+    // config value only for a purely local, keyless instance.
+    apiKey: process.env.QDRANT_API_KEY?.trim() || section.api_key?.trim() || undefined,
     collectionName,
     timeoutMs,
     onDiskPayload: section.on_disk_payload ?? true,
@@ -168,26 +194,27 @@ function asOptionalNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;
 }
 
-function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemoryRecord {
+export function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemoryRecord {
   const memoryUrls = Array.isArray(payload.memory_urls)
     ? payload.memory_urls.filter((item): item is string => typeof item === "string")
     : [];
   const worldObservationPageErrors = Array.isArray(payload.world_observation_page_errors)
     ? payload.world_observation_page_errors.filter((item): item is string => typeof item === "string")
     : [];
+  const canonicalContent = asOptionalString(payload.content);
   return {
     sessionId: asOptionalString(payload.session_id),
     sessionStartedAt: asOptionalString(payload.session_started_at),
     source: asOptionalString(payload.source),
     sequence: asOptionalNumber(payload.sequence),
     receivedAt: asOptionalString(payload.received_at),
-    displayText: asOptionalString(payload.display_text),
+    displayText: asOptionalString(payload.display_text) ?? canonicalContent,
     messageType: asOptionalString(payload.message_type),
     groupId: asOptionalString(payload.group_id),
     groupName: asOptionalString(payload.group_name),
     userId: asOptionalString(payload.user_id),
     senderName: asOptionalString(payload.sender_name),
-    rawMessage: asOptionalString(payload.raw_message),
+    rawMessage: asOptionalString(payload.raw_message) ?? canonicalContent,
     memoryTopic: asOptionalString(payload.memory_topic),
     memoryReason: asOptionalString(payload.memory_reason),
     memoryQuery: asOptionalString(payload.memory_query),
@@ -196,8 +223,23 @@ function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemory
   };
 }
 
+export function isNapCatHeartbeat(
+  record: Pick<IncomingMessageRecord, "isBinary" | "rawEncoding" | "rawContent">,
+): boolean {
+  if (record.isBinary || record.rawEncoding !== "utf8") return false;
+  try {
+    const parsed = JSON.parse(record.rawContent) as Record<string, unknown> | null;
+    return parsed?.post_type === "meta_event" && parsed.meta_event_type === "heartbeat";
+  } catch {
+    return false;
+  }
+}
+
 async function ensurePayloadIndexes(client: QdrantClient, collectionName: string): Promise<void> {
+  const info = await client.getCollection(collectionName);
+  const existingIndexes = new Set(Object.keys(info.payload_schema ?? {}));
   for (const index of PAYLOAD_INDEXES) {
+    if (existingIndexes.has(index.fieldName)) continue;
     try {
       await client.createPayloadIndex(collectionName, {
         field_name: index.fieldName,
@@ -234,15 +276,32 @@ async function ensureCollection(
 // A stale undici keep-alive socket against Qdrant surfaces as
 // `TypeError: fetch failed` with cause `UND_ERR_SOCKET` / "other side closed":
 // the pooled connection was closed by the server (or the local proxy's
-// connection tracker) but undici reused it before noticing. One retry runs on a
-// fresh connection. Mirrors the existing "retry Codex fetch failures once".
+// connection tracker) but undici reused it before noticing. The same fetch
+// failure can also show up as a hung connect/headers/body phase instead of an
+// outright reset — confirmed on this network, where the proxy path to the
+// Cloud cluster intermittently stalls for seconds rather than closing —
+// which undici reports as UND_ERR_CONNECT_TIMEOUT / UND_ERR_HEADERS_TIMEOUT /
+// UND_ERR_BODY_TIMEOUT. Retries run on a fresh connection each time.
 function isTransientConnectionError(error: unknown, depth = 0): boolean {
   if (!error || typeof error !== "object" || depth > 4) return false;
-  const e = error as { code?: unknown; message?: unknown; cause?: unknown };
-  if (typeof e.code === "string" && (e.code === "UND_ERR_SOCKET" || e.code === "ECONNRESET" || e.code === "EPIPE")) {
+  const e = error as { code?: unknown; name?: unknown; message?: unknown; cause?: unknown };
+  const transientCodes = new Set([
+    "UND_ERR_SOCKET",
+    "ECONNRESET",
+    "EPIPE",
+    "UND_ERR_CONNECT_TIMEOUT",
+    "UND_ERR_HEADERS_TIMEOUT",
+    "UND_ERR_BODY_TIMEOUT",
+    "ETIMEDOUT",
+  ]);
+  if (typeof e.code === "string" && transientCodes.has(e.code)) return true;
+  if (
+    typeof e.name === "string" &&
+    (e.name === "ConnectTimeoutError" || e.name === "HeadersTimeoutError" || e.name === "BodyTimeoutError")
+  ) {
     return true;
   }
-  if (typeof e.message === "string" && /other side closed|socket hang up|ECONNRESET/i.test(e.message)) {
+  if (typeof e.message === "string" && /other side closed|socket hang up|ECONNRESET|connect timeout/i.test(e.message)) {
     return true;
   }
   return isTransientConnectionError(e.cause, depth + 1);
@@ -262,14 +321,79 @@ function isTransientTimeoutError(error: unknown): boolean {
   return name === "QdrantClientTimeoutError" || name === "AbortError";
 }
 
+// Direct (non-proxied) connections to a Cloud cluster are intermittently RST
+// mid-handshake on this network — a single request can succeed or fail on any
+// given try, seemingly at random, and the bad stretches can run a few seconds
+// (not just one dropped socket). `ensureCollection` alone is ~7 sequential
+// requests, so even a low per-request failure rate makes a short retry budget
+// land on a bad connection often. Retry with backoff long enough to ride out
+// a multi-second blip.
+const QDRANT_RETRY_DELAYS_MS = [200, 500, 1000, 2000, 4000];
+
 async function withQdrantRetry<T>(operation: () => Promise<T>): Promise<T> {
-  try {
-    return await operation();
-  } catch (error) {
-    if (!isTransientConnectionError(error) && !isTransientTimeoutError(error)) throw error;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-    return operation();
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= QDRANT_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (!isTransientConnectionError(error) && !isTransientTimeoutError(error)) throw error;
+      if (attempt === QDRANT_RETRY_DELAYS_MS.length) break;
+      await new Promise((resolve) => setTimeout(resolve, QDRANT_RETRY_DELAYS_MS[attempt]));
+    }
   }
+  throw lastError;
+}
+
+// Pull an HTTP status off the error (or its nested response/cause) so a rejected
+// key (401/403) can be told apart from a network failure.
+function statusFromError(error: unknown, depth = 0): number | null {
+  if (!error || typeof error !== "object" || depth > 4) return null;
+  const e = error as { status?: unknown; statusCode?: unknown; response?: unknown; cause?: unknown };
+  if (typeof e.status === "number") return e.status;
+  if (typeof e.statusCode === "number") return e.statusCode;
+  const resp = e.response as { status?: unknown } | undefined;
+  if (resp && typeof resp.status === "number") return resp.status;
+  return statusFromError(e.cause, depth + 1);
+}
+
+// Flatten the error's code + message across the cause chain into one string so a
+// single regex can classify the failure. Also exported for monitor logging: the
+// top-level `error.message` on a `TypeError: fetch failed` is just that literal
+// string, and the actual reason (ECONNRESET, a timeout code, ...) lives in
+// `error.cause`, which this walks.
+export function describeErrorChain(error: unknown, depth = 0): string {
+  if (!error || typeof error !== "object" || depth > 5) {
+    return error === undefined || error === null ? "" : String(error);
+  }
+  const e = error as { code?: unknown; message?: unknown; name?: unknown; cause?: unknown };
+  const parts: string[] = [];
+  if (typeof e.code === "string") parts.push(e.code);
+  if (typeof e.name === "string") parts.push(e.name);
+  if (typeof e.message === "string") parts.push(e.message);
+  const causeText = describeErrorChain(e.cause, depth + 1);
+  if (causeText) parts.push(causeText);
+  return parts.join(" | ");
+}
+
+// Turn a startup connection failure into an actionable message that names the
+// likely config culprit — auth (key) vs network/proxy vs address — instead of
+// the old generic "Ensure Qdrant is running", which is useless once the store is
+// a remote cloud cluster reached through a proxy.
+function diagnoseQdrantStartupError(error: unknown, config: ResolvedQdrantConfig): string {
+  const base = `Unable to initialize Qdrant store at ${config.url}: ${describeError(error)}.`;
+  const status = statusFromError(error);
+  const chain = describeErrorChain(error);
+  if (status === 401 || status === 403 || /\b(401|403)\b|unauthorized|forbidden|invalid api|api[- ]?key/i.test(chain)) {
+    return `${base} Authentication rejected — check the QDRANT_API_KEY env var (or qdrant.api_key) and that the key has access to this cluster.`;
+  }
+  if (
+    isTransientTimeoutError(error) ||
+    /ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ETIMEDOUT|ECONNRESET|EPIPE|UND_ERR|other side closed|socket hang up|fetch failed|aborted|timeout/i.test(chain)
+  ) {
+    return `${base} Cannot reach the cluster — check fetch.proxy_url is reachable, NODE_USE_ENV_PROXY is set, and the URL/port are right (Qdrant Cloud REST is usually :6333; the proxy must allow CONNECT to that port).`;
+  }
+  return `${base} Check qdrant.url points at the cluster's REST endpoint.`;
 }
 
 export async function createIncomingMessageStore(
@@ -297,11 +421,12 @@ export async function createIncomingMessageStore(
   });
 
   try {
-    await ensureCollection(client, config);
+    // Same one-shot retry as runtime reads/writes: a remote cloud cluster reached
+    // through a proxy is more prone to a transient socket drop on the very first
+    // call, and without this a single blip aborts startup.
+    await withQdrantRetry(() => ensureCollection(client, config));
   } catch (error) {
-    throw new Error(
-      `Unable to initialize Qdrant store at ${config.url}: ${describeError(error)}. Ensure Qdrant is running and reachable.`,
-    );
+    throw new Error(diagnoseQdrantStartupError(error, config));
   }
 
   const sessionId = options.sessionId?.trim() || randomUUID();
@@ -314,6 +439,11 @@ export async function createIncomingMessageStore(
     collectionName: config.collectionName,
     description,
     async saveMessage(record): Promise<void> {
+      // NapCat emits a heartbeat roughly every 30 seconds. It has no message
+      // content and is never read back by Holly, so do not turn transport
+      // liveness noise into the overwhelming majority of database rows.
+      if (isNapCatHeartbeat(record)) return;
+
       // Generate the point id once, OUTSIDE the retry closure: if withQdrantRetry
       // fires because the first attempt's response was lost after Qdrant already
       // applied the write, reusing the same id makes the retry an idempotent
@@ -324,9 +454,9 @@ export async function createIncomingMessageStore(
         points: [
           {
             id: pointId,
-            vector: STORAGE_VECTOR,
+            vector: NO_STORAGE_VECTOR,
             payload: {
-              schema_version: 1,
+              schema_version: 2,
               session_id: sessionId,
               session_started_at: sessionStartedAt,
               ws_target_url: options.wsTargetUrl ?? null,
@@ -358,26 +488,17 @@ export async function createIncomingMessageStore(
         points: [
           {
             id: pointId,
-            vector: STORAGE_VECTOR,
+            vector: NO_STORAGE_VECTOR,
             payload: {
-              schema_version: 1,
+              schema_version: 2,
               session_id: sessionId,
               session_started_at: sessionStartedAt,
-              ws_target_url: options.wsTargetUrl ?? null,
               source: "holly_internal",
-              sequence: null,
               received_at: record.receivedAt,
-              is_binary: false,
-              raw_encoding: "utf8",
-              raw_content: record.content,
-              binary_size: null,
-              display_text: record.content,
+              content: record.content,
               message_type: "internal_memory",
-              group_id: null,
-              group_name: null,
               user_id: "holly",
               sender_name: "Holly",
-              raw_message: record.content,
               memory_topic: record.topic ?? null,
               memory_reason: record.reason ?? null,
               memory_urls: record.urls ?? [],
@@ -393,26 +514,17 @@ export async function createIncomingMessageStore(
         points: [
           {
             id: pointId,
-            vector: STORAGE_VECTOR,
+            vector: NO_STORAGE_VECTOR,
             payload: {
-              schema_version: 1,
+              schema_version: 2,
               session_id: sessionId,
               session_started_at: sessionStartedAt,
-              ws_target_url: options.wsTargetUrl ?? null,
               source: "holly_world_observation",
-              sequence: null,
               received_at: record.observedAt,
-              is_binary: false,
-              raw_encoding: "utf8",
-              raw_content: record.summary,
-              binary_size: null,
-              display_text: record.summary,
+              content: record.summary,
               message_type: "world_observation",
-              group_id: null,
-              group_name: null,
               user_id: "holly",
               sender_name: "Holly",
-              raw_message: record.summary,
               memory_topic: record.topic,
               memory_reason: record.reason ?? null,
               memory_query: record.query,
@@ -453,7 +565,7 @@ export async function createIncomingMessageStore(
 
       const result = await withQdrantRetry(() => client.scroll(config.collectionName, {
         limit: input.limit,
-        with_payload: true,
+        with_payload: { include: [...STORED_MEMORY_PAYLOAD_FIELDS] },
         with_vector: false,
         order_by: {
           key: "received_at",

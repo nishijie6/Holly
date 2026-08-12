@@ -118,14 +118,24 @@ After startup, open:
 
 ## Configuration
 
-`config.yaml` contains two main sections:
+Relevant `config.yaml` sections include:
 
 - `llm`: active profile, provider, model, and prompt configuration
 - `qdrant`: memory store settings such as URL, collection, and timeout
+- `holly_bootstrap`: startup reflection and QQ lifecycle policy
 
 A minimal example shape:
 
 ```yaml
+holly_bootstrap:
+  enabled: true
+  reflection_enabled: true
+  # auto asks Holly after memory restoration; a fixed offline/observe/active
+  # value acts as an operator override.
+  qq_mode: auto
+  fallback_qq_mode: observe
+  reconsider_minutes: 60
+
 llm:
   active: default
   profiles:
@@ -139,6 +149,10 @@ qdrant:
   collection: ws_incoming_messages
   timeout_ms: 10000
 ```
+
+QQ runtime modes are `offline` (no connection), `observe` (connect and persist
+messages without replying), and `active` (normal participation). Bootstrap model
+or storage failures fall back to the configured mode instead of blocking startup.
 
 ## Notes
 

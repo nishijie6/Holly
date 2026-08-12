@@ -467,8 +467,22 @@ async function readPageWithBrowser(
   }
 }
 
+// A non-empty excerpt isn't the same as usable article content: a CAPTCHA
+// wall ("安全验证，确认你是人类…") still extracts a few words of body text.
+// Below this length it's almost certainly a bot-check/stub page rather than
+// an article — real Chinese news copy runs well past this even summarized.
+const MIN_ARTICLE_CONTENT_CHARS = 150;
+const BOT_WALL_PHRASE_PATTERN =
+  /安全验证|请完成验证|人机验证|验证后继续访问|verify you are human|access denied|403 forbidden|enable javascript/i;
+
+function isUsableArticleExcerpt(excerpt: string): boolean {
+  const trimmed = excerpt.trim();
+  if (trimmed.length < MIN_ARTICLE_CONTENT_CHARS) return false;
+  return !BOT_WALL_PHRASE_PATTERN.test(trimmed);
+}
+
 function formatObservationSummary(query: string, pages: BrowserPageObservation[]): string {
-  const readable = pages.filter((page) => page.excerpt);
+  const readable = pages.filter((page) => isUsableArticleExcerpt(page.excerpt));
   if (readable.length === 0) {
     return "";
   }
@@ -492,6 +506,51 @@ function formatObservationSummary(query: string, pages: BrowserPageObservation[]
   ].join("\n\n");
 }
 
+// Domains that repeatedly turn up as SEO/dictionary noise rather than actual
+// article content for world-observation queries — Baidu's baike/zhidao/tieba
+// results, dictionary/translation lookups that hijack a single English word
+// out of a mixed-language query, a bank's branch locator, and Sina's
+// real-time topic-tag feed (tags.news.sina.com.cn/<topic> — a wall of
+// one-line rolling headlines, long enough to pass the length gate but never
+// a real article; confirmed hitting this twice for the "人工智能" topic).
+// Scoped to the "tags." subdomain only — regular news.sina.com.cn articles
+// are fine sources and stay unblocked.
+const EXCLUDED_SEARCH_DOMAIN_PATTERNS: readonly RegExp[] = [
+  /(^|\.)baidu\.com$/i,
+  /^global\.bing\.com$/i,
+  /(^|\.)dictionary\.cambridge\.org$/i,
+  /(^|\.)iciba\.com$/i,
+  /(^|\.)youdao\.com$/i,
+  /(^|\.)bankofamerica\.com$/i,
+  /^tags\.news\.sina\.com\.cn$/i,
+];
+
+function isExcludedSearchDomain(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname;
+    return EXCLUDED_SEARCH_DOMAIN_PATTERNS.some((pattern) => pattern.test(hostname));
+  } catch {
+    return false;
+  }
+}
+
+// Chrome's Page.navigate is the wrong ingestion path for PDFs: depending on
+// the built-in PDF viewer it either hangs until the CDP timeout or extracts no
+// article text. Skip them here so they cannot consume a browser candidate or
+// turn an otherwise healthy multi-source observation into a reported failure.
+function isUnsupportedBrowserDocument(url: string): boolean {
+  try {
+    return /\.pdf$/i.test(new URL(url).pathname);
+  } catch {
+    return false;
+  }
+}
+
+// net::ERR_CONNECTION_CLOSED/RESET and friends are proxy/network blips, not a
+// permanent block — worth one retry before burning the URL's slot.
+const TRANSIENT_NETWORK_ERROR_PATTERN =
+  /ERR_CONNECTION_(CLOSED|RESET|REFUSED)|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_TIMED_OUT/i;
+
 export async function browseTopicWithBrowserAgent(
   query: string,
   config: BrowserAgentConfig,
@@ -507,12 +566,17 @@ export async function browseTopicWithBrowserAgent(
   const urls = results
     .map((result: SearchResult) => result.url.trim())
     .filter(Boolean)
-    .slice(0, config.maxPages);
+    .filter((url) => !isExcludedSearchDomain(url))
+    .filter((url) => !isUnsupportedBrowserDocument(url));
   if (urls.length === 0) return null;
 
   return browseUrlsWithBrowserAgent(cleanQuery, urls, config, logger);
 }
 
+// Walks candidate URLs (a superset of maxPages, typically all of
+// searchTopK) until maxPages of them yield real content, instead of
+// visiting exactly the first maxPages and giving up if those happen to be
+// noise. One retry on a transient network error before moving on.
 export async function browseUrlsWithBrowserAgent(
   query: string,
   urls: readonly string[],
@@ -520,25 +584,31 @@ export async function browseUrlsWithBrowserAgent(
   logger?: BrowserAgentLogger,
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
-  const targetUrls = urls
-    .map((url) => url.trim())
-    .filter(Boolean)
-    .slice(0, config.maxPages);
-  if (!config.enabled || !cleanQuery || targetUrls.length === 0) return null;
+  const candidateUrls = urls.map((url) => url.trim()).filter(Boolean);
+  if (!config.enabled || !cleanQuery || candidateUrls.length === 0) return null;
 
   let launched: Awaited<ReturnType<typeof launchBrowser>> | null = null;
   try {
     launched = await launchBrowser(config);
     const pages: BrowserPageObservation[] = [];
-    for (const url of targetUrls) {
-      const page = await readPageWithBrowser(launched.httpOrigin, url, config);
+    let readableCount = 0;
+    for (const url of candidateUrls) {
+      if (readableCount >= config.maxPages) break;
+      let page = await readPageWithBrowser(launched.httpOrigin, url, config);
+      if (page.error && TRANSIENT_NETWORK_ERROR_PATTERN.test(page.error)) {
+        page = await readPageWithBrowser(launched.httpOrigin, url, config);
+      }
       pages.push(page);
-      if (logger) {
-        if (page.error) {
-          logger({ url, status: "error", detail: page.error });
-        } else if (!page.excerpt) {
-          logger({ url, status: "empty", detail: `title=${page.title || "(none)"} final=${page.url}` });
-        }
+      if (page.error) {
+        logger?.({ url, status: "error", detail: page.error });
+      } else if (!isUsableArticleExcerpt(page.excerpt)) {
+        logger?.({
+          url,
+          status: "empty",
+          detail: `title=${page.title || "(none)"} final=${page.url} chars=${page.excerpt.length}`,
+        });
+      } else {
+        readableCount += 1;
       }
     }
     const summary = formatObservationSummary(cleanQuery, pages);

@@ -146,18 +146,20 @@ function formatCycleStartForModel(ms: number): string {
 }
 
 // The gate-B decision instruction. It rides in the *current message* slot so the
-// cached system + global-history prefix is reused (6A) — only this tail differs
-// from a reactive call, so the proactive call hits the prompt cache. The timeline
-// is sent whole with no extra marking or re-quoted excerpt: this instruction only
-// names the group and the start of the current proactive trigger cycle, and the
-// model reads that group's tail straight from the timeline above. Kept here
-// (not in main.ts) so the eval harness can exercise the exact production prompt.
+// cached system + this-group's-history prefix is reused (6A) — only this tail
+// differs from a reactive call, so the proactive call hits the prompt cache. The
+// timeline is sent whole with no extra marking or re-quoted excerpt: this
+// instruction only names the group and the start of the current proactive
+// trigger cycle, and the model reads that group's tail straight from the
+// timeline above. Kept here (not in main.ts) so the eval harness can exercise
+// the exact production prompt.
 export function buildProactiveRevivePrompt(request: ProactiveRevivalRequest): string {
   const lines = [
     "现在没有人 @ Holly，下面这个群已经冷场了一会儿：",
     `- group_id: ${request.groupKey}`,
     `- 本次主动触发周期起点: ${formatCycleStartForModel(request.cycleStartMs)}`,
-    "- 上方全局时间线已包含全部消息，每条消息开头的 [月-日 时:分] 是发送时间。只看该群位于时间线末尾、发送时间在本次周期起点之后的消息；更早的内容仅作背景，不要当作要捡的话题。",
+    "- 上方本群时间线的每条消息都以 [月-日 时:分] 标注发送时间。只看发送时间在本次周期起点之后的消息；更早的内容仅作背景，不要当作要捡的话题。",
+    "- 如果下方出现「其它群近期动态」，那只是背景参考，不是要捡的话题来源。",
   ];
   if (request.observationSummary) {
     lines.push(

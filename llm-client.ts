@@ -116,6 +116,11 @@ const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 
 const CLAUDE_CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
+// On macOS, Claude Code stores its OAuth blob in the login Keychain, not in the
+// .credentials.json file (which is the Linux/CI location). Service + account
+// match what the CLI writes: service "Claude Code-credentials", account = the
+// current username.
+const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -131,14 +136,6 @@ function claudeMaxOutputTokens(model: string): number {
 type ClaudeRequestOptions = {
   jsonSchema?: Record<string, unknown>;
   maxTokens?: number;
-  // Place a 1h cache_control breakpoint at the end of the STABLE conversation
-  // prefix so it is cached and reused across turns (and refreshed by warmContext).
-  cacheMessageTail?: boolean;
-  // How many trailing LlmMessages are per-request volatile (batch instructions,
-  // timestamps, retry nudges). The cache breakpoint is placed on the last block
-  // BEFORE these, so the cached prefix stays byte-identical across requests and
-  // the volatile tail never writes useless cache entries.
-  volatileTailMessages?: number;
 };
 
 function isFetchFailedError(error: unknown): boolean {
@@ -556,23 +553,26 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
   throw new Error("Codex request failed after retry.");
 }
 
+type ClaudeCredentialsSource = "file" | "keychain";
+
 type ClaudeCredentials = {
   accessToken: string;
   refreshToken: string | null;
   expiresAt: number | null;
   raw: Record<string, unknown>;
+  source: ClaudeCredentialsSource;
 };
 
 function asClaudeOauthRecord(file: Record<string, unknown>): Record<string, unknown> {
   const oauth = file.claudeAiOauth;
   if (!oauth || typeof oauth !== "object") {
-    throw new Error("claudeAiOauth not found in ~/.claude/.credentials.json");
+    throw new Error("claudeAiOauth not found in Claude credentials");
   }
   return oauth as Record<string, unknown>;
 }
 
-async function readClaudeCredentials(): Promise<ClaudeCredentials> {
-  const raw = JSON.parse(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8")) as Record<string, unknown>;
+function parseClaudeCredentials(rawJson: string, source: ClaudeCredentialsSource): ClaudeCredentials {
+  const raw = JSON.parse(rawJson) as Record<string, unknown>;
   const oauth = asClaudeOauthRecord(raw);
 
   const accessToken = oauth.accessToken;
@@ -585,7 +585,35 @@ async function readClaudeCredentials(): Promise<ClaudeCredentials> {
     refreshToken: typeof oauth.refreshToken === "string" ? oauth.refreshToken : null,
     expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
     raw,
+    source,
   };
+}
+
+function readClaudeKeychainRaw(): string {
+  const account = os.userInfo().username;
+  return execSync(
+    `security find-generic-password -s "${CLAUDE_KEYCHAIN_SERVICE}" -a "${account}" -w`,
+    { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] },
+  ).trim();
+}
+
+async function readClaudeCredentials(): Promise<ClaudeCredentials> {
+  // Prefer the on-disk file (Linux/CI, and where token refreshes are persisted);
+  // fall back to the macOS Keychain, which is where the Claude Code CLI stores
+  // credentials by default.
+  try {
+    return parseClaudeCredentials(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8"), "file");
+  } catch (fileError) {
+    if (process.platform === "darwin") {
+      try {
+        return parseClaudeCredentials(readClaudeKeychainRaw(), "keychain");
+      } catch {
+        // Keychain miss too — surface the original file error below, which names
+        // the primary credentials path.
+      }
+    }
+    throw fileError;
+  }
 }
 
 async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<ClaudeCredentials | null> {
@@ -625,6 +653,11 @@ async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<Claud
   };
   const nextRaw = { ...creds.raw, claudeAiOauth: oauth };
 
+  // Persist the refreshed token to the file rather than back to the Keychain:
+  // readClaudeCredentials() reads the file first, so the next read picks it up,
+  // and this avoids a `security add-generic-password` write that can trigger a
+  // GUI Keychain-authorization prompt this headless service can't answer.
+  await mkdir(path.dirname(CLAUDE_CREDENTIALS_PATH), { recursive: true });
   await writeFile(CLAUDE_CREDENTIALS_PATH, JSON.stringify(nextRaw), { encoding: "utf-8", mode: 0o600 });
 
   return {
@@ -632,6 +665,7 @@ async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<Claud
     refreshToken,
     expiresAt,
     raw: nextRaw,
+    source: "file",
   };
 }
 
@@ -654,30 +688,25 @@ function buildClaudeHeaders(accessToken: string): Record<string, string> {
   };
 }
 
-type ClaudeMessageBlock = { text: string; volatile: boolean };
-type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: ClaudeMessageBlock[] };
+type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: string[] };
 
 // One text block per source LlmMessage (conversation turn). Consecutive
-// same-role turns merge into one API message but keep their block boundaries,
-// so a cache breakpoint can sit exactly at the end of the stable prefix and
-// that boundary recurs byte-identically in later requests as history grows.
-function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): ClaudeMergedMessage[] {
-  const volatileFrom = messages.length - Math.max(0, volatileTailMessages);
+// same-role turns merge into one API message but keep their block boundaries.
+function buildClaudeMessages(messages: LlmMessage[]): ClaudeMergedMessage[] {
   const merged: ClaudeMergedMessage[] = [];
 
-  for (const [index, message] of messages.entries()) {
+  for (const message of messages) {
     const content = message.content.trim();
     if (!content) {
       continue;
     }
 
     const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
-    const block: ClaudeMessageBlock = { text: content, volatile: index >= volatileFrom };
     const last = merged[merged.length - 1];
     if (last && last.role === role) {
-      last.blocks.push(block);
+      last.blocks.push(content);
     } else {
-      merged.push({ role, blocks: [block] });
+      merged.push({ role, blocks: [content] });
     }
   }
 
@@ -698,35 +727,11 @@ function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): 
   return merged;
 }
 
-function buildClaudeMessagesWithCacheTail(
-  messages: LlmMessage[],
-  cacheTail: boolean,
-  volatileTailMessages = 0,
-): Array<Record<string, unknown>> {
-  const merged = buildClaudeMessages(messages, volatileTailMessages);
-  const apiMessages = merged.map((message): Record<string, unknown> => ({
+function buildClaudeMessagesBody(messages: LlmMessage[]): Array<Record<string, unknown>> {
+  return buildClaudeMessages(messages).map((message) => ({
     role: message.role,
-    content: message.blocks.map((block): Record<string, unknown> => ({ type: "text", text: block.text })),
+    content: message.blocks.map((text) => ({ type: "text", text })),
   }));
-
-  if (cacheTail) {
-    // Breakpoint on the last STABLE block ("shared prefix, varying suffix"
-    // pattern): the volatile tail after it changes every request, so caching
-    // it would write entries that are never read. The stable prefix before the
-    // breakpoint is byte-identical across requests and accrues cache hits.
-    outer: for (let i = merged.length - 1; i >= 0; i -= 1) {
-      const blocks = merged[i].blocks;
-      for (let j = blocks.length - 1; j >= 0; j -= 1) {
-        if (!blocks[j].volatile) {
-          const content = apiMessages[i].content as Array<Record<string, unknown>>;
-          content[j].cache_control = { type: "ephemeral", ttl: "1h" };
-          break outer;
-        }
-      }
-    }
-  }
-
-  return apiMessages;
 }
 
 function buildClaudeRequestBody(
@@ -749,12 +754,14 @@ function buildClaudeRequestBody(
   const body: Record<string, unknown> = {
     model,
     max_tokens: options.maxTokens ?? claudeMaxOutputTokens(model),
+    // Top-level automatic caching (kagami parity, see claude-code-request.ts
+    // there): the breakpoint follows the last cacheable block and moves
+    // forward each request, incrementally caching the growing conversation
+    // history without having to track which trailing messages are volatile.
+    // Complements the system-block pin above (2 of the 4 breakpoint budget).
+    cache_control: { type: "ephemeral", ttl: "1h" },
     system,
-    messages: buildClaudeMessagesWithCacheTail(
-      messages,
-      options.cacheMessageTail ?? false,
-      options.volatileTailMessages ?? 0,
-    ),
+    messages: buildClaudeMessagesBody(messages),
   };
 
   if (options.jsonSchema) {
@@ -1130,11 +1137,6 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
       if (profile.provider === "claude") {
         return requestClaudeText(profile.model, systemPrompt, contents, {
           jsonSchema: input.jsonSchema,
-          cacheMessageTail: true,
-          // Convention: the last message is the per-request volatile input
-          // (batch instructions / current prompt); the breakpoint goes on the
-          // stable history right before it.
-          volatileTailMessages: 1,
         });
       }
 
@@ -1154,13 +1156,10 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
       }
 
       // max_tokens=1: the reply is discarded; the request exists only to write
-      // the 1h prompt cache so the next real reply reads the warmed prefix.
-      // volatileTailMessages=0: the warm request is history-only, so its last
-      // block IS the stable prefix end a real request will hit.
+      // the 1h prompt cache (top-level cache_control, automatic breakpoint) so
+      // the next real reply reads the warmed prefix.
       await requestClaudeText(profile.model, systemPrompt, contents, {
         maxTokens: 1,
-        cacheMessageTail: true,
-        volatileTailMessages: 0,
       });
     },
   };

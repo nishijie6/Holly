@@ -20,6 +20,7 @@ test("load: missing file → defaults, does not throw", async () => {
   assert.equal(g.dailyCount, 0);
   assert.equal(g.backoffLevel, 0);
   assert.equal(g.pendingObservation, null);
+  assert.equal(store.getLifecycleState().qqMode, "offline");
 });
 
 test("load: corrupt JSON → defaults, does not crash", async () => {
@@ -27,6 +28,7 @@ test("load: corrupt JSON → defaults, does not crash", async () => {
   await writeFile(path, "{ this is not valid json ]]", "utf-8");
   const store = await HollyStateStore.load(path, TTL);
   assert.equal(store.globalDailyCount(), 0);
+  assert.equal(store.getLifecycleState().bootCount, 0);
   await rm(path, { force: true });
 });
 
@@ -90,6 +92,26 @@ test("autonomy state: persists world observation cadence", async () => {
   assert.equal(persisted.lastArchiveWritingAt, 1100);
   assert.equal(persisted.lastArchiveWritingAttemptAt, 1200);
   assert.equal(persisted.archiveWritingDailyCount, 1);
+  await rm(path, { force: true });
+});
+
+test("lifecycle state: persists boot thought and QQ mode decision", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  const lifecycle = store.getLifecycleState();
+  lifecycle.bootCount = 2;
+  lifecycle.lastBootStartedAt = 100;
+  lifecycle.lastBootCompletedAt = 200;
+  lifecycle.lastBootThoughtAt = 150;
+  lifecycle.lastBootThought = "先安静看看";
+  lifecycle.qqMode = "observe";
+  lifecycle.qqModeReason = "暂时只观察";
+  lifecycle.qqModeDecidedAt = 180;
+  lifecycle.qqModeReconsiderAt = 360;
+  await store.save();
+
+  const restored = await HollyStateStore.load(path, TTL);
+  assert.deepEqual(restored.getLifecycleState(), lifecycle);
   await rm(path, { force: true });
 });
 
