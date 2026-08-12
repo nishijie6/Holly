@@ -1,6 +1,7 @@
 node_modules/
 dist/
 logs/
+data/
 # Runtime-generated creative works (served from the monitor's archive view)
 archive/
 __pycache__/

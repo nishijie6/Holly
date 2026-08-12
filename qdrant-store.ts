@@ -6,7 +6,26 @@ import { dirname, join } from "node:path";
 import { QdrantClient } from "@qdrant/js-client-rest";
 import YAML from "yaml";
 
+import {
+  isNapCatHeartbeat,
+  parseStoredMemoryRecord,
+  type IncomingMessageRecord,
+  type IncomingMessageStore,
+  type InternalMemoryRecord,
+  type StoredMemoryRecord,
+  type WorldObservationMemoryRecord,
+} from "./memory-store-types.js";
 import { DurableOutbox } from "./qdrant-outbox.js";
+
+export {
+  isNapCatHeartbeat,
+  parseStoredMemoryRecord,
+  type IncomingMessageRecord,
+  type IncomingMessageStore,
+  type InternalMemoryRecord,
+  type StoredMemoryRecord,
+  type WorldObservationMemoryRecord,
+} from "./memory-store-types.js";
 
 type QdrantConfig = {
   enabled?: boolean;
@@ -19,77 +38,6 @@ type QdrantConfig = {
 
 type AppConfig = {
   qdrant?: QdrantConfig;
-};
-
-export type IncomingMessageRecord = {
-  sequence: number;
-  receivedAt: string;
-  isBinary: boolean;
-  rawEncoding: "utf8" | "base64";
-  rawContent: string;
-  binarySize: number | null;
-  displayText: string | null;
-  messageType: string | null;
-  groupId: string | null;
-  groupName: string | null;
-  userId: string | null;
-  senderName: string | null;
-  rawMessage: string | null;
-};
-
-export type IncomingMessageStore = {
-  sessionId: string;
-  sessionStartedAt: string;
-  collectionName: string;
-  description: string;
-  saveMessage(record: IncomingMessageRecord): Promise<void>;
-  saveInternalMemory(record: InternalMemoryRecord): Promise<void>;
-  saveWorldObservation(record: WorldObservationMemoryRecord): Promise<void>;
-  listRecentMemories(input: {
-    groupId?: string | null;
-    userId?: string | null;
-    messageType?: string | null;
-    limit: number;
-  }): Promise<StoredMemoryRecord[]>;
-};
-
-export type InternalMemoryRecord = {
-  receivedAt: string;
-  content: string;
-  topic?: string | null;
-  reason?: string | null;
-  urls?: string[];
-};
-
-export type WorldObservationMemoryRecord = {
-  observedAt: string;
-  topic: string;
-  query: string;
-  summary: string;
-  reason?: string | null;
-  urls?: string[];
-  pageErrors?: string[];
-  cached?: boolean;
-};
-
-export type StoredMemoryRecord = {
-  sessionId: string | null;
-  sessionStartedAt: string | null;
-  source: string | null;
-  sequence: number | null;
-  receivedAt: string | null;
-  displayText: string | null;
-  messageType: string | null;
-  groupId: string | null;
-  groupName: string | null;
-  userId: string | null;
-  senderName: string | null;
-  rawMessage: string | null;
-  memoryTopic: string | null;
-  memoryReason: string | null;
-  memoryQuery: string | null;
-  memoryUrls: string[];
-  worldObservationPageErrors: string[];
 };
 
 type ResolvedQdrantConfig = {
@@ -194,55 +142,6 @@ function isAlreadyExistsError(error: unknown): boolean {
 
 function describeError(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function asOptionalString(value: unknown): string | null {
-  return typeof value === "string" ? value : null;
-}
-
-function asOptionalNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
-}
-
-export function parseStoredMemoryRecord(payload: Record<string, unknown>): StoredMemoryRecord {
-  const memoryUrls = Array.isArray(payload.memory_urls)
-    ? payload.memory_urls.filter((item): item is string => typeof item === "string")
-    : [];
-  const worldObservationPageErrors = Array.isArray(payload.world_observation_page_errors)
-    ? payload.world_observation_page_errors.filter((item): item is string => typeof item === "string")
-    : [];
-  const canonicalContent = asOptionalString(payload.content);
-  return {
-    sessionId: asOptionalString(payload.session_id),
-    sessionStartedAt: asOptionalString(payload.session_started_at),
-    source: asOptionalString(payload.source),
-    sequence: asOptionalNumber(payload.sequence),
-    receivedAt: asOptionalString(payload.received_at),
-    displayText: asOptionalString(payload.display_text) ?? canonicalContent,
-    messageType: asOptionalString(payload.message_type),
-    groupId: asOptionalString(payload.group_id),
-    groupName: asOptionalString(payload.group_name),
-    userId: asOptionalString(payload.user_id),
-    senderName: asOptionalString(payload.sender_name),
-    rawMessage: asOptionalString(payload.raw_message) ?? canonicalContent,
-    memoryTopic: asOptionalString(payload.memory_topic),
-    memoryReason: asOptionalString(payload.memory_reason),
-    memoryQuery: asOptionalString(payload.memory_query),
-    memoryUrls,
-    worldObservationPageErrors,
-  };
-}
-
-export function isNapCatHeartbeat(
-  record: Pick<IncomingMessageRecord, "isBinary" | "rawEncoding" | "rawContent">,
-): boolean {
-  if (record.isBinary || record.rawEncoding !== "utf8") return false;
-  try {
-    const parsed = JSON.parse(record.rawContent) as Record<string, unknown> | null;
-    return parsed?.post_type === "meta_event" && parsed.meta_event_type === "heartbeat";
-  } catch {
-    return false;
-  }
 }
 
 async function ensurePayloadIndexes(client: QdrantClient, collectionName: string): Promise<void> {
@@ -355,6 +254,45 @@ async function withQdrantRetry<T>(operation: () => Promise<T>): Promise<T> {
   throw lastError;
 }
 
+export async function copyQdrantPayloads(
+  configPath: string,
+  writeBatch: (
+    records: ReadonlyArray<{ id: string; payload: Record<string, unknown> }>,
+  ) => Promise<void> | void,
+): Promise<number> {
+  const config = await resolveQdrantConfig(configPath);
+  const client = new QdrantClient({
+    url: config.url,
+    apiKey: config.apiKey,
+    timeout: config.timeoutMs,
+    checkCompatibility: false,
+    maxConnections: 1,
+  });
+  let offset: string | number | Record<string, unknown> | undefined;
+  let copied = 0;
+
+  do {
+    const result = await withQdrantRetry(() => client.scroll(config.collectionName, {
+      limit: 256,
+      offset,
+      with_payload: true,
+      with_vector: false,
+    }));
+    const records = result.points.flatMap((point) => {
+      if (!point.payload || Array.isArray(point.payload)) return [];
+      return [{
+        id: String(point.id),
+        payload: point.payload as Record<string, unknown>,
+      }];
+    });
+    await writeBatch(records);
+    copied += records.length;
+    offset = result.next_page_offset ?? undefined;
+  } while (offset !== undefined && offset !== null);
+
+  return copied;
+}
+
 // Pull an HTTP status off the error (or its nested response/cause) so a rejected
 // key (401/403) can be told apart from a network failure.
 function statusFromError(error: unknown, depth = 0): number | null {
@@ -406,7 +344,7 @@ function diagnoseQdrantStartupError(error: unknown, config: ResolvedQdrantConfig
   return `${base} Check qdrant.url points at the cluster's REST endpoint.`;
 }
 
-export async function createIncomingMessageStore(
+export async function createQdrantIncomingMessageStore(
   configPath: string,
   options: {
     sessionId?: string;

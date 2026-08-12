@@ -27,7 +27,7 @@ import {
   type IncomingMessageStore,
   type StoredMemoryRecord,
   type WorldObservationMemoryRecord,
-} from "./qdrant-store.js";
+} from "./memory-store.js";
 import { HollyStateStore } from "./holly-state.js";
 import { ConversationContextStore } from "./context-store.js";
 import {
