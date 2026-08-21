@@ -9,6 +9,7 @@
     "dev": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx main.ts",
     "llm:test": "NODE_USE_ENV_PROXY=1 tsx test.ts",
     "test": "node --import tsx --test \"test/*.test.ts\"",
+    "test:integration": "node --import tsx --test \"test/integration/*.test.ts\"",
     "eval:proactive": "NODE_USE_ENV_PROXY=1 tsx proactive-eval.ts",
     "search:test": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx web-search.ts",
     "search-flow:test": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx search-flow-eval.ts",

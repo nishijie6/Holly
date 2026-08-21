@@ -152,6 +152,7 @@ function parseChangedPaths(status: string): string[] {
 function isProtectedPath(path: string): boolean {
   const normalized = path.replaceAll("\\", "/").replace(/^\.\//u, "");
   return PROTECTED_PATHS.has(normalized)
+    || normalized.startsWith("test/integration/")
     || normalized.startsWith(".codex/")
     || normalized.startsWith(".git/")
     || normalized.startsWith("logs/")
@@ -179,7 +180,7 @@ function buildAgentPrompt(request: string): string {
     "- Read and follow repository AGENTS.md/CLAUDE.md instructions.",
     "- Preserve existing behavior unrelated to the request and keep the change narrowly scoped.",
     "- Do not read or expose credentials, authentication material, environment files, or files outside this worktree.",
-    "- Do not edit admin-policy.ts, admin-code-worker.ts, test/admin-policy.test.ts, test/admin-code-worker.test.ts, config.yaml, package manifests, tsconfig.json, .gitignore, .env files, .codex, .git, or logs.",
+    "- Do not edit admin-policy.ts, admin-code-worker.ts, test/admin-policy.test.ts, test/admin-code-worker.test.ts, test/integration, config.yaml, package manifests, tsconfig.json, .gitignore, .env files, .codex, .git, or logs.",
     "- Do not weaken administrator authentication, mandatory administrator replies, safety controls, auditing, sandboxing, or test gates.",
     "- Do not commit, deploy, restart services, send messages, or access unrelated network services.",
     "- Add or update focused tests, then run npm test and npm run build.",
