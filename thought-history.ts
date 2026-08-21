@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { appendFile, mkdir, readFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-export type ThoughtKind = "bootstrap" | "qq_mode" | "reactive" | "proactive";
+export type ThoughtKind = "bootstrap" | "qq_mode" | "reactive" | "proactive" | "autonomy";
 
 export type ThoughtEntry = {
   id: string;
@@ -22,7 +22,7 @@ export type ThoughtEntryInput = Omit<ThoughtEntry, "id" | "timestamp"> & {
   timestamp?: string;
 };
 
-const THOUGHT_KINDS = new Set<ThoughtKind>(["bootstrap", "qq_mode", "reactive", "proactive"]);
+const THOUGHT_KINDS = new Set<ThoughtKind>(["bootstrap", "qq_mode", "reactive", "proactive", "autonomy"]);
 
 function cleanText(value: unknown, maxChars: number): string {
   if (typeof value !== "string") return "";

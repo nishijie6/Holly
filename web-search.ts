@@ -32,8 +32,49 @@ export type SearchOptions = {
 type SearxngResult = { title?: unknown; url?: unknown; content?: unknown };
 type SearxngResponse = { results?: SearxngResult[] };
 
+const OBITUARY_TERMS = /(?:逝世|去世|病逝|讣告|死亡)/u;
+
 function asText(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function parseSearxngResults(data: SearxngResponse, topK: number): SearchResult[] {
+  return (data.results ?? [])
+    .slice(0, topK)
+    .map((item) => ({
+      title: asText(item.title),
+      url: asText(item.url),
+      snippet: asText(item.content),
+    }))
+    .filter((result) => result.url);
+}
+
+function needsAuthoritativeObituaryFallback(query: string, results: readonly SearchResult[]): boolean {
+  return OBITUARY_TERMS.test(query)
+    && !/^!(?:360so|bd)\b/iu.test(query)
+    && !results.some((result) => OBITUARY_TERMS.test(`${result.title} ${result.snippet}`));
+}
+
+function prioritizeObituaryResults(results: readonly SearchResult[]): SearchResult[] {
+  const strongTerms = /(?:逝世|去世|病逝|讣告)/u;
+  return [...results].sort((left, right) => {
+    const leftStrong = strongTerms.test(`${left.title} ${left.snippet}`) ? 1 : 0;
+    const rightStrong = strongTerms.test(`${right.title} ${right.snippet}`) ? 1 : 0;
+    return rightStrong - leftStrong;
+  });
+}
+
+function mergeSearchResults(
+  preferred: readonly SearchResult[],
+  fallback: readonly SearchResult[],
+  topK: number,
+): SearchResult[] {
+  const merged = new Map<string, SearchResult>();
+  for (const result of [...preferred, ...fallback]) {
+    if (!merged.has(result.url)) merged.set(result.url, result);
+    if (merged.size >= topK) break;
+  }
+  return Array.from(merged.values());
 }
 
 // Run a web search against the local SearXNG instance and return the top
@@ -49,27 +90,42 @@ export async function searchWeb(query: string, options: SearchOptions = {}): Pro
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
   try {
-    const url = new URL(`${baseUrl}/search`);
-    url.searchParams.set("q", cleanQuery);
-    url.searchParams.set("format", "json");
-    url.searchParams.set("language", options.hl ?? "zh-CN");
+    const request = async (query: string): Promise<SearchResult[]> => {
+      const url = new URL(`${baseUrl}/search`);
+      url.searchParams.set("q", query);
+      url.searchParams.set("format", "json");
+      url.searchParams.set("language", options.hl ?? "zh-CN");
 
-    const response = await fetch(url, { signal: controller.signal });
+      const response = await fetch(url, { signal: controller.signal });
+      if (!response.ok) {
+        const detail = await response.text().catch(() => "");
+        throw new Error(`SearXNG ${response.status}: ${detail.slice(0, 200)}`);
+      }
+      return parseSearxngResults((await response.json()) as SearxngResponse, topK);
+    };
 
-    if (!response.ok) {
-      const detail = await response.text().catch(() => "");
-      throw new Error(`SearXNG ${response.status}: ${detail.slice(0, 200)}`);
+    const primary = await request(cleanQuery);
+    if (!needsAuthoritativeObituaryFallback(cleanQuery, primary)) return primary;
+
+    // Broad Chinese obituary wording can be swamped by generic date pages in
+    // Bing. SearXNG bang shortcuts let us explicitly ask its alternate Chinese
+    // engines even though they are disabled from the default aggregate. Query
+    // both concurrently, prioritize real obituary wording, and retain the
+    // primary results as a tail fallback. Alternate-engine failures must not
+    // discard a successful primary search.
+    try {
+      const fallbackTerms = cleanQuery.replace(/["“”]/gu, " ").replace(/\s+/gu, " ").trim();
+      const alternateAttempts = await Promise.allSettled([
+        request(`!360so ${fallbackTerms}`),
+        request(`!bd ${fallbackTerms}`),
+      ]);
+      const alternate = prioritizeObituaryResults(
+        alternateAttempts.flatMap((attempt) => attempt.status === "fulfilled" ? attempt.value : []),
+      );
+      return mergeSearchResults(alternate, primary, topK);
+    } catch {
+      return primary;
     }
-
-    const data = (await response.json()) as SearxngResponse;
-    return (data.results ?? [])
-      .slice(0, topK)
-      .map((item) => ({
-        title: asText(item.title),
-        url: asText(item.url),
-        snippet: asText(item.content),
-      }))
-      .filter((result) => result.url);
   } finally {
     clearTimeout(timer);
   }

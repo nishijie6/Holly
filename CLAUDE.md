@@ -1,12 +1,13 @@
-## gstack (recommended)
+## Agent skills
 
-This project uses [gstack](https://github.com/garrytan/gstack) for AI-assisted workflows.
-Install it for the best experience:
+### Issue tracker
 
-```bash
-git clone --depth 1 https://github.com/garrytan/gstack.git ~/.claude/skills/gstack
-cd ~/.claude/skills/gstack && ./setup --team
-```
+Issues are tracked as GitHub Issues in this repo (`nishijie6/Holly`), via the `gh` CLI. See `docs/agents/issue-tracker.md`.
 
-Skills like /qa, /ship, /review, /investigate, and /browse become available after install.
-Use /browse for all web browsing. Use ~/.claude/skills/gstack/... for gstack file paths.
+### Triage labels
+
+Default label vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context layout — `CONTEXT.md` + `docs/adr/` at the repo root (created lazily by domain-modeling skills). See `docs/agents/domain.md`.

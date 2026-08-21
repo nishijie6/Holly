@@ -31,6 +31,26 @@ test("thought history: appends and restores entries", async () => {
   await rm(join(path, ".."), { recursive: true, force: true });
 });
 
+test("thought history: persists minute autonomy checks", async () => {
+  const path = tmpPath();
+  const store = await ThoughtHistoryStore.load(path, 10);
+  const saved = await store.append({
+    timestamp: "2026-08-13T03:00:00.000Z",
+    kind: "autonomy",
+    title: "每分钟自主检查",
+    summary: "本轮结果：未行动。",
+    groupId: null,
+    outcome: "idle",
+    finalAnswer: "",
+    model: "autonomy-loop",
+    durationMs: 12,
+  });
+
+  const restored = await ThoughtHistoryStore.load(path, 10);
+  assert.deepEqual(restored.list(), [saved]);
+  await rm(join(path, ".."), { recursive: true, force: true });
+});
+
 test("thought history: skips corrupt lines and keeps the newest configured slice", async () => {
   const path = tmpPath();
   const rows = [

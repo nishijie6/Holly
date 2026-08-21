@@ -11,6 +11,28 @@ test("decision prompt tells the model not to end mid-sentence", () => {
   assert.match(MODEL_DECISION_PROMPT, /complete sendable message/);
 });
 
+test("decision prompt recognizes only the service-injected administrator scan contract", () => {
+  assert.match(MODEL_DECISION_PROMPT, /Authenticated administrator policy for this scan/);
+  assert.match(MODEL_DECISION_PROMPT, /OneBot user_id values were authenticated by code/);
+  assert.match(MODEL_DECISION_PROMPT, /administrator message must receive a non-empty reply/);
+  assert.match(MODEL_DECISION_PROMPT, /admin_action_status and admin_action_reason/);
+});
+
+test("decision prompt treats an ordinary private chat as its own direct conversation", () => {
+  assert.match(MODEL_DECISION_PROMPT, /focused conversation's messages/);
+  assert.match(MODEL_DECISION_PROMPT, /Every private message is inherently addressed to Holly/);
+  assert.match(MODEL_DECISION_PROMPT, /conversation_type=private itself is sufficient evidence/);
+  assert.doesNotMatch(MODEL_DECISION_PROMPT, /ALL messages from every group/);
+});
+
+test("decision prompt requires explicit QQ search requests to use the real search path", () => {
+  assert.match(MODEL_DECISION_PROMPT, /real web-search capability/);
+  assert.match(MODEL_DECISION_PROMPT, /MUST set need_search=true/);
+  assert.match(MODEL_DECISION_PROMPT, /immediately preceding topic/);
+  assert.match(MODEL_DECISION_PROMPT, /Never claim that Holly cannot access the web/);
+  assert.match(MODEL_DECISION_PROMPT, /set need_search=true instead of claiming inability/);
+});
+
 test("detectIncompleteFinalAnswer catches dangling Chinese endings", () => {
   assert.match(
     detectIncompleteFinalAnswer("然后帕秋莉那个问题我觉得跟四色定理不太一样——四色是") ?? "",

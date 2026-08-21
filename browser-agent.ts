@@ -8,6 +8,7 @@ import type { Readable } from "node:stream";
 import { WebSocket } from "ws";
 
 import { searchWeb, type SearchResult } from "./web-search.js";
+import { rankUrlsByDomainReputation, type DomainReputationTracker } from "./domain-reputation.js";
 
 export type BrowserAgentConfig = {
   enabled: boolean;
@@ -555,6 +556,7 @@ export async function browseTopicWithBrowserAgent(
   query: string,
   config: BrowserAgentConfig,
   logger?: BrowserAgentLogger,
+  reputation?: DomainReputationTracker,
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   if (!config.enabled || !cleanQuery) return null;
@@ -569,8 +571,10 @@ export async function browseTopicWithBrowserAgent(
     .filter((url) => !isExcludedSearchDomain(url))
     .filter((url) => !isUnsupportedBrowserDocument(url));
   if (urls.length === 0) return null;
+  const ranked = reputation ? rankUrlsByDomainReputation(urls, reputation.snapshot()) : urls;
+  if (ranked.length === 0) return null;
 
-  return browseUrlsWithBrowserAgent(cleanQuery, urls, config, logger);
+  return browseUrlsWithBrowserAgent(cleanQuery, ranked, config, logger, reputation);
 }
 
 // Walks candidate URLs (a superset of maxPages, typically all of
@@ -582,6 +586,7 @@ export async function browseUrlsWithBrowserAgent(
   urls: readonly string[],
   config: BrowserAgentConfig,
   logger?: BrowserAgentLogger,
+  reputation?: DomainReputationTracker,
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   const candidateUrls = urls.map((url) => url.trim()).filter(Boolean);
@@ -601,14 +606,17 @@ export async function browseUrlsWithBrowserAgent(
       pages.push(page);
       if (page.error) {
         logger?.({ url, status: "error", detail: page.error });
+        reputation?.record(url, "failure");
       } else if (!isUsableArticleExcerpt(page.excerpt)) {
         logger?.({
           url,
           status: "empty",
           detail: `title=${page.title || "(none)"} final=${page.url} chars=${page.excerpt.length}`,
         });
+        reputation?.record(url, "failure");
       } else {
         readableCount += 1;
+        reputation?.record(url, "success");
       }
     }
     const summary = formatObservationSummary(cleanQuery, pages);

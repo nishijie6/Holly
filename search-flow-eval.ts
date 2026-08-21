@@ -9,7 +9,7 @@
 //       npm run search-flow:test -- claude_haiku
 //
 // Spends real tokens (1 call per non-search scenario, 2 per search scenario) and
-// a few Serper queries. Needs the proxy + SERPER_API_KEY (.env).
+// a few local SearXNG queries.
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -19,6 +19,7 @@ import YAML from "yaml";
 
 import { createLlmClient } from "./llm-client.js";
 import { MODEL_DECISION_JSON_SCHEMA, buildModelSystemPrompt } from "./decision-prompt.js";
+import { normalizeSearchQuery } from "./search-intent.js";
 import { searchWeb, type SearchResult } from "./web-search.js";
 
 const __filename = fileURLToPath(import.meta.url);
@@ -63,6 +64,11 @@ type Scenario = { name: string; expectSearch: boolean; message: string };
 
 // Group format mirrors the bot's: 群聊 [群名(群号)] [发送人(编号)] 内容
 const SCENARIOS: Scenario[] = [
+  {
+    name: "模糊但可查的昨日新闻(应查)",
+    expectSearch: true,
+    message: "群聊 [示例群(20000002)] [小明(10000001)] @Holly 昨天有个大人物去世了，你知道吗",
+  },
   {
     name: "需要时效信息(应查)",
     expectSearch: true,
@@ -116,7 +122,7 @@ async function main(): Promise<void> {
     }
 
     const needSearch = first.need_search === true;
-    const query = String(first.search_query ?? "").trim();
+    const query = normalizeSearchQuery(String(first.search_query ?? ""), new Date());
     const match = needSearch === scenario.expectSearch;
     if (!match) mismatches += 1;
     console.log(`${match ? "✓" : "≈"} ${scenario.name}`);
