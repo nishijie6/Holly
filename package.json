@@ -3,8 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
   "scripts": {
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "start": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env dist/main.js",
     "dev": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx main.ts",
     "llm:test": "NODE_USE_ENV_PROXY=1 tsx test.ts",
