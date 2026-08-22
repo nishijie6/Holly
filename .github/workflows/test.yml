@@ -1,9 +1,12 @@
 name: test
 
-on:
-  push:
-    branches: [main]
-  pull_request:
+# Every branch, not just main: the point is to catch a break the moment it
+# is pushed, including on branches an agent is working on.
+on: push
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   test:
