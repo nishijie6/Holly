@@ -9,7 +9,6 @@ import { WebSocket, type RawData } from "ws";
 import YAML from "yaml";
 import {
   createLlmClient,
-  consumeLatestCallTokenUsage,
   getLatestClaudeUsage,
   probeClaudeUsage,
   listLlmProfiles,
@@ -18,6 +17,21 @@ import {
   type LlmClient,
   type LlmMessage,
 } from "./llm-client.js";
+import {
+  ConnectionWatchdog,
+  shouldCountTowardConnectionWatchdog,
+  shouldRetryLlmCall,
+} from "./connection-watchdog.js";
+import {
+  addCallTokenUsage,
+  buildDailyTokenStats,
+  normalizeStoredTokenCounts,
+  summarizePromptCacheCall,
+  type CallTokenUsage,
+  type DailyTokenStats,
+  type ModelTokenCounts,
+} from "./token-usage.js";
+import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
 import {
   createIncomingMessageStore,
   describeErrorChain,
@@ -376,19 +390,6 @@ type AutonomySidebarSnapshot = {
   recentWorldObservations: AutonomySidebarObservation[];
 };
 
-type ModelTokenStat = {
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  totalTokens: number;
-};
-
-type DailyTokenStats = {
-  date: string;
-  models: ModelTokenStat[];
-  totalTokens: number;
-};
-
 type ArchiveWorkRecord = {
   id: string;
   ts: string;
@@ -474,8 +475,8 @@ const MODEL_DECISION_MAX_ATTEMPTS = 2;
 // Short pause before an in-place retry of a transient (network/timeout) failure,
 // to ride out a brief blip. Invalid-JSON retries re-roll immediately (no delay).
 const MODEL_DECISION_RETRY_DELAY_MS = 2000;
-// Re-send the merged global context with max_tokens=1 on this cadence to keep the
-// 1h prompt cache warm. 20min < the 1h cache TTL, so the cache never goes cold.
+// Re-send dirty per-conversation history with max_tokens=0 on this cadence so
+// the high-frequency decision model gets a stable 1h prompt-cache prefix.
 const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
 // How often the merged timeline is snapshotted to disk (when dirty). Hourly:
 // a clean shutdown flushes on SIGINT/SIGTERM regardless, and a crash loses at
@@ -484,7 +485,7 @@ const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
 // risk.
 const CONVERSATION_CONTEXT_PERSIST_INTERVAL_MS = 60 * 60 * 1000;
 // Memory-safety ceiling on retained per-group turns. The context_limit_tokens
-// budget (190K) binds well before this many short group turns, so in practice
+// budget binds well before this many short group turns, so in practice
 // history is "keep everything that fits in the window", not capped by count.
 const CONVERSATION_HISTORY_LIMIT = 50000;
 // The monitor only needs a recent slice; shipping the whole global context over
@@ -596,7 +597,12 @@ let wsReconnectTimer: NodeJS.Timeout | null = null;
 let qqModeReconsiderTimer: NodeJS.Timeout | null = null;
 let monitorHistory: MonitorEntry[] = [];
 let activeLlmClient: LlmClient | null = null;
+let decisionLlmClient: LlmClient | null = null;
 let activeLlmLabel = "Assistant";
+// Shared across every profile/provider: the failure mode this guards against
+// (a stale outbound connection in an otherwise-alive process) is a property
+// of the process, not of any one LLM profile. See connection-watchdog.ts.
+const connectionWatchdog = new ConnectionWatchdog();
 let incomingMessageStore: IncomingMessageStore | null = null;
 let incomingMessageStoreQueue: Promise<void> = Promise.resolve();
 let incomingMessageSequence = 0;
@@ -681,6 +687,10 @@ function getActiveLlmClient(): LlmClient {
   }
 
   return activeLlmClient;
+}
+
+function getDecisionLlmClient(): LlmClient {
+  return decisionLlmClient ?? getActiveLlmClient();
 }
 
 function normalizePositiveInteger(value: unknown): number | null {
@@ -1309,6 +1319,7 @@ function prepareModelRequest(
   conversationTurns: readonly ConversationTurn[],
   currentMessage: string,
   otherGroupsSummary = "",
+  modelForBudget = activeLlmClient?.model ?? "",
 ): PreparedModelRequest {
   // System prompt = persona + decision protocol ONLY. The retrieved memory
   // block and the per-request batch instruction ride in the volatile tail
@@ -1331,7 +1342,7 @@ function prepareModelRequest(
 
   // Clamp the configured budget to the active model's input window so an 800K
   // global context can't overflow a smaller window (e.g. Haiku's 200K).
-  const modelWindowTokens = modelContextWindowTokens(activeLlmClient?.model ?? "");
+  const modelWindowTokens = modelContextWindowTokens(modelForBudget);
   const limitTokens = Math.min(
     contextBudgetConfig.limitTokens,
     Math.max(MIN_CONTEXT_LIMIT_TOKENS, modelWindowTokens - CONTEXT_MODEL_WINDOW_MARGIN_TOKENS),
@@ -1405,6 +1416,70 @@ function prepareModelRequest(
   };
 }
 
+// Fires once when connectionWatchdog reports a stuck streak (see
+// connection-watchdog.ts for the incident this guards against). PM2's
+// autorestart only triggers on process exit, so the fix is to make the
+// otherwise-invisible "every call fails the same way" state visible as a
+// crash: log it clearly, then exit non-zero so the supervisor restarts a
+// fresh process (which — per the 2026-08-24 incident — reliably works
+// again immediately). Never call this directly from the LLM client wrapper
+// itself; always go through connectionWatchdog.recordFailure() first so the
+// edge-triggering (fire once per streak) is preserved.
+function handleConnectionWatchdogStuck(context: { lastError: unknown }): void {
+  const detail = context.lastError instanceof Error
+    ? context.lastError.message
+    : String(context.lastError);
+  const message = `${connectionWatchdog.getConsecutiveFailures()} 次连续 LLM 调用失败，判定进程处于卡死状态，主动退出等待进程管理器重启。最近一次错误：${detail}`;
+  pushMonitorEntry("error", "Connection Watchdog: Restarting", message);
+  console.error(`[connection-watchdog] ${message}`);
+  process.exit(1);
+}
+
+// Wraps generateText/warmContext so every LLM call (any provider, any
+// profile) reports its outcome to the shared connectionWatchdog, regardless
+// of which call site triggered it (reply generation, cache warming,
+// proactive revival, ...). Data fields (profileName/provider/model/...) pass
+// through untouched; only the two network-calling methods are intercepted.
+function watchLlmClient(client: LlmClient): LlmClient {
+  return {
+    ...client,
+    generateText: async (input) => {
+      try {
+        const result = await client.generateText(input);
+        connectionWatchdog.recordSuccess();
+        return result;
+      } catch (error) {
+        if (!shouldCountTowardConnectionWatchdog(error)) {
+          connectionWatchdog.recordSuccess();
+        } else if (connectionWatchdog.recordFailure()) {
+          handleConnectionWatchdogStuck({ lastError: error });
+        }
+        throw error;
+      }
+    },
+    warmContext: async (input) => {
+      try {
+        await client.warmContext(input);
+        connectionWatchdog.recordSuccess();
+      } catch (error) {
+        if (!shouldCountTowardConnectionWatchdog(error)) {
+          connectionWatchdog.recordSuccess();
+        } else if (connectionWatchdog.recordFailure()) {
+          handleConnectionWatchdogStuck({ lastError: error });
+        }
+        throw error;
+      }
+    },
+  };
+}
+
+async function createWatchedLlmClient(
+  configPath: string,
+  requestedProfileName?: string,
+): Promise<LlmClient> {
+  return watchLlmClient(await createLlmClient(configPath, requestedProfileName));
+}
+
 async function switchActiveProfile(profileName: string): Promise<LlmClient> {
   const target = profileName.trim();
   if (!target) {
@@ -1416,7 +1491,7 @@ async function switchActiveProfile(profileName: string): Promise<LlmClient> {
     // Keep the switch queue alive after a previous failure.
   }).then(async () => {
     await setActiveLlmProfile(CONFIG_PATH, target);
-    nextClient = await createLlmClient(CONFIG_PATH, target);
+    nextClient = await createWatchedLlmClient(CONFIG_PATH, target);
     activeLlmClient = nextClient;
     activeLlmLabel = nextClient.displayName;
   });
@@ -1436,7 +1511,12 @@ async function switchActiveProfile(profileName: string): Promise<LlmClient> {
 async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const envProfile = process.env.LLM_PROFILE?.trim();
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
-  const nextClient = await createLlmClient(CONFIG_PATH, currentProfile);
+  const nextClient = await createWatchedLlmClient(CONFIG_PATH, currentProfile);
+  const catalog = await listLlmProfiles(CONFIG_PATH);
+  const decisionProfile = process.env.LLM_DECISION_PROFILE?.trim() || catalog.decision;
+  const nextDecisionClient = decisionProfile === nextClient.profileName
+    ? nextClient
+    : await createWatchedLlmClient(CONFIG_PATH, decisionProfile);
   const nextContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const nextAutonomyConfig = await loadAutonomyConfig(CONFIG_PATH);
   const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
@@ -1449,6 +1529,7 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   const nextReadOnly = await loadReadOnlyConfig(CONFIG_PATH);
   activeLlmClient = nextClient;
+  decisionLlmClient = nextDecisionClient;
   activeLlmLabel = nextClient.displayName;
   contextBudgetConfig = nextContextBudgetConfig;
   autonomyConfig = nextAutonomyConfig;
@@ -1474,7 +1555,7 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   pushMonitorEntry(
     "status",
     "Config Reloaded",
-    `${reason}\nActive profile: ${nextClient.profileName}\nModel: ${nextClient.model}\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens} to ${contextBudgetConfig.compressTargetTokens})\nAdministrators: ${adminPolicyConfig.userIds.length}\nPrivate chat: ${privateChatConfig.enabled ? (privateChatConfig.friendsOnly ? "friends only" : "enabled") : "disabled"}`,
+    `${reason}\nResponse profile: ${nextClient.profileName} (${nextClient.model})\nDecision profile: ${nextDecisionClient.profileName} (${nextDecisionClient.model})\nContext budget: ${contextBudgetConfig.limitTokens} tokens (compress at ${contextBudgetConfig.compressThresholdTokens} to ${contextBudgetConfig.compressTargetTokens})\nAdministrators: ${adminPolicyConfig.userIds.length}\nPrivate chat: ${privateChatConfig.enabled ? (privateChatConfig.friendsOnly ? "friends only" : "enabled") : "disabled"}`,
   );
 }
 
@@ -1533,14 +1614,18 @@ async function getSessionLogPath(): Promise<string> {
   return sessionLogPath;
 }
 
-async function appendChatLog(role: "user" | "assistant", text: string): Promise<void> {
+async function appendChatLog(
+  role: "user" | "assistant",
+  text: string,
+  assistantLabel?: string,
+): Promise<void> {
   const cleanText = text.trim();
   if (!cleanText) {
     return;
   }
 
   const logPath = await getSessionLogPath();
-  const speaker = role === "user" ? "User" : activeLlmLabel;
+  const speaker = role === "user" ? "User" : (assistantLabel || activeLlmLabel);
   await appendFile(logPath, `[${nowTimestamp()}] ${speaker}\n${cleanText}\n\n`, "utf-8");
 }
 
@@ -1556,8 +1641,6 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 
 const TOKEN_STATS_PATH = join(LOG_DIR, "token-usage.json");
 
-type ModelTokenCounts = { inputTokens: number; outputTokens: number };
-
 let tokenStatsByDate = new Map<string, Map<string, ModelTokenCounts>>();
 let tokenStatsSaveQueue: Promise<void> = Promise.resolve();
 
@@ -1571,15 +1654,12 @@ function localDateKey(date = new Date()): string {
 async function loadTokenStats(): Promise<void> {
   try {
     const raw = await readFile(TOKEN_STATS_PATH, "utf-8");
-    const parsed = JSON.parse(raw) as Record<string, Record<string, ModelTokenCounts>>;
+    const parsed = JSON.parse(raw) as Record<string, Record<string, unknown>>;
     const next = new Map<string, Map<string, ModelTokenCounts>>();
     for (const [date, models] of Object.entries(parsed)) {
       const modelMap = new Map<string, ModelTokenCounts>();
       for (const [model, counts] of Object.entries(models)) {
-        modelMap.set(model, {
-          inputTokens: Number(counts?.inputTokens) || 0,
-          outputTokens: Number(counts?.outputTokens) || 0,
-        });
+        modelMap.set(model, normalizeStoredTokenCounts(counts));
       }
       next.set(date, modelMap);
     }
@@ -1607,8 +1687,8 @@ function persistTokenStats(): void {
     });
 }
 
-function recordTokenUsage(model: string, inputTokens: number, outputTokens: number): void {
-  if (!model || (inputTokens <= 0 && outputTokens <= 0)) {
+function recordTokenUsage(usage: CallTokenUsage): void {
+  if (!usage.model || (usage.inputTokens <= 0 && usage.outputTokens <= 0)) {
     return;
   }
   const date = localDateKey();
@@ -1617,36 +1697,12 @@ function recordTokenUsage(model: string, inputTokens: number, outputTokens: numb
     models = new Map<string, ModelTokenCounts>();
     tokenStatsByDate.set(date, models);
   }
-  let counts = models.get(model);
+  let counts = models.get(usage.model);
   if (!counts) {
-    counts = { inputTokens: 0, outputTokens: 0 };
-    models.set(model, counts);
+    counts = normalizeStoredTokenCounts({});
   }
-  counts.inputTokens += inputTokens;
-  counts.outputTokens += outputTokens;
+  models.set(usage.model, addCallTokenUsage(counts, usage));
   persistTokenStats();
-}
-
-function buildDailyTokenStats(
-  date: string,
-  models: Map<string, ModelTokenCounts> | undefined,
-): DailyTokenStats {
-  const list: ModelTokenStat[] = [];
-  let totalTokens = 0;
-  if (models) {
-    for (const [model, counts] of models) {
-      const total = counts.inputTokens + counts.outputTokens;
-      totalTokens += total;
-      list.push({
-        model,
-        inputTokens: counts.inputTokens,
-        outputTokens: counts.outputTokens,
-        totalTokens: total,
-      });
-    }
-  }
-  list.sort((a, b) => b.totalTokens - a.totalTokens);
-  return { date, models: list, totalTokens };
 }
 
 function getTodayTokenStats(): DailyTokenStats {
@@ -3886,12 +3942,7 @@ async function applyLookupIfRequested(
     });
   }
 
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-  }
+  broadcastLatestLlmUsage(ctx.client);
   return secondReply;
 }
 
@@ -4026,7 +4077,8 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     ? ADMIN_MODEL_DECISION_JSON_SCHEMA
     : MODEL_DECISION_JSON_SCHEMA;
 
-  const client = getActiveLlmClient();
+  const client = getDecisionLlmClient();
+  const responseClient = getActiveLlmClient();
   const startedAt = Date.now();
   const latestMessage = messages[messages.length - 1];
   const batchMessage = formatUnreadMessagesForModel(messages);
@@ -4065,6 +4117,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     conversationTurns,
     batchMessage,
     otherGroupsSummary,
+    client.model,
   );
 
   updateConversationPreview({
@@ -4118,14 +4171,8 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
             "Return JSON only for the same scan. You must reply with a non-empty final_answer. If the request cannot be completed, use cannot_comply and give a concrete reason in both admin_action_reason and final_answer.",
           ]
         : null;
-    const messagesForAttempt: LlmMessage[] = retryFeedback
-      ? [
-          ...preparedRequest.messages,
-          {
-            role: "user",
-            content: retryFeedback.join("\n"),
-          },
-        ]
+    const messagesForAttempt = retryFeedback
+      ? appendRetryFeedbackToVolatileTail(preparedRequest.messages, retryFeedback)
       : preparedRequest.messages;
     try {
       reply = await client.generateText({
@@ -4135,7 +4182,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
-      if (attempt < MODEL_DECISION_MAX_ATTEMPTS) {
+      if (attempt < MODEL_DECISION_MAX_ATTEMPTS && shouldRetryLlmCall(error)) {
         pushMonitorEntry("status", "Model Request Retry", `attempt=${attempt}/${MODEL_DECISION_MAX_ATTEMPTS} (transient)\n${detail}`);
         await new Promise((resolve) => setTimeout(resolve, MODEL_DECISION_RETRY_DELAY_MS));
         continue;
@@ -4146,12 +4193,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       return;
     }
 
-    broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-    const callTokens = consumeLatestCallTokenUsage();
-    if (callTokens) {
-      recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-      broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-    }
+    broadcastLatestLlmUsage(client, "reply-decision");
 
     // "查一下再答": if the model asked to look something up, search and re-ask.
     reply = await applyLookupIfRequested(reply, {
@@ -4224,6 +4266,27 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     return;
   }
 
+  const routedReply = await refineDecisionReply({
+    decision,
+    decisionModel: client.model,
+    responseModel: responseClient.model,
+    generateFinalAnswer: (input) => responseClient.generateText(input),
+  });
+  if (decision.shouldReply && decision.finalAnswer && client.model !== responseClient.model) {
+    broadcastLatestLlmUsage(responseClient, "reply-response");
+  }
+  if (routedReply.usedFallback) {
+    pushMonitorEntry(
+      "error",
+      "Response Model Fallback",
+      `response_model=${responseClient.model}\ndecision_model=${client.model}\n${routedReply.error ?? "Unknown response-model failure"}`,
+    );
+  }
+  decision = routedReply.decision;
+  const routedModelLabel = routedReply.responseModel === client.model
+    ? client.model
+    : `${client.model} → ${routedReply.responseModel}`;
+
   await recordMonitorThought({
     kind: "reactive",
     title: `${context.replyTargetType === "private" ? (isAdminBatch ? "管理员私聊" : "私聊") : "群消息"}判断 · ${messages.length} 条未读`,
@@ -4231,17 +4294,17 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     groupId: effectiveContext.groupId,
     outcome: decision.shouldReply && decision.finalAnswer ? "reply" : "silent",
     finalAnswer: decision.finalAnswer,
-    model: client.model,
+    model: routedModelLabel,
     durationMs: Math.max(0, Date.now() - startedAt),
   });
 
   const content = formatModelReplyEntry(decision);
-  await appendChatLog("assistant", content);
+  await appendChatLog("assistant", content, routedModelLabel);
   pushMonitorEntry(
     "assistant",
     `Model Reply - ${formatElapsedDuration(startedAt, Date.now())}`,
     content,
-    client.model,
+    routedModelLabel,
   );
 
   if (!decision.shouldReply) {
@@ -4317,7 +4380,7 @@ function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
 }
 
 async function warmGroupContext(groupKey: string): Promise<void> {
-  const client = activeLlmClient;
+  const client = decisionLlmClient;
   if (!client || client.provider !== "claude") {
     // Only Anthropic prompt caching benefits from warming.
     return;
@@ -4341,7 +4404,7 @@ async function warmGroupContext(groupKey: string): Promise<void> {
   // (empty current message, no memory, no other-groups summary — that summary
   // is volatile-tail-only and never part of what gets cached) so the warmed
   // cache is the one the next reply for this group reads.
-  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, "");
+  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, "", "", client.model);
   if (prepared.messages.length === 0) {
     return;
   }
@@ -4352,12 +4415,7 @@ async function warmGroupContext(groupKey: string): Promise<void> {
     messages: prepared.messages,
   });
 
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-  }
+  broadcastLatestLlmUsage(client, "context-warm");
 
   pushMonitorEntry(
     "status",
@@ -4382,6 +4440,11 @@ async function warmDirtyGroupContexts(): Promise<void> {
     try {
       await warmGroupContext(groupKey);
     } catch (error) {
+      // The warm never landed, so this group's cache is exactly as stale as it
+      // was before the pass. Re-arm it instead of waiting for new traffic to
+      // mark it dirty again — otherwise one failed warm (an expired token, a
+      // rate-limit pause) silently parks a quiet group until someone speaks.
+      dirtyGroupKeys.add(groupKey);
       // One group's warm failure must not stop the rest of the batch from warming.
       const detail = error instanceof Error ? error.message : String(error);
       pushMonitorEntry("error", "Context Warm Error", `group_id=${groupKey}\n${detail}`);
@@ -4913,13 +4976,41 @@ function compactReflectionText(text: string, maxChars: number): string {
   return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
 }
 
-function broadcastLatestLlmUsage(): void {
+function broadcastLatestLlmUsage(client: LlmClient, purpose?: LlmCallPurpose): void {
   broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
+  const callTokens = client.consumeTokenUsage();
   if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
+    recordTokenUsage(callTokens);
     broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+    pushPromptCacheEntry(callTokens, purpose);
   }
+}
+
+// The daily totals say how many tokens were written to and read from the prompt
+// cache, but not which calls did which — and "is warming worth it" is exactly
+// that question: a warm call that writes 55k tokens only pays off if the reply
+// that follows reads them back.
+type LlmCallPurpose = "reply-decision" | "reply-response" | "context-warm";
+
+function pushPromptCacheEntry(usage: CallTokenUsage, purpose?: LlmCallPurpose): void {
+  const summary = summarizePromptCacheCall(usage);
+  // No breakdown reported (non-Anthropic providers, or a response shape without
+  // the cache fields) — stay silent rather than log a 0% hit that never happened.
+  if (!summary) {
+    return;
+  }
+
+  const count = (value: number) => value.toLocaleString("en-US");
+  pushMonitorEntry(
+    "status",
+    `Prompt Cache - ${Math.round(summary.hitRate * 100)}% hit`,
+    [
+      purpose ? `purpose=${purpose}` : null,
+      `cache_read=${count(summary.cacheReadInputTokens)} cache_write=${count(summary.cacheCreationInputTokens)} uncached=${count(summary.uncachedInputTokens)}`,
+      `input=${count(usage.inputTokens)} output=${count(usage.outputTokens)}`,
+    ].filter((line): line is string => line !== null).join("\n"),
+    usage.model,
+  );
 }
 
 // Keeps line breaks (collapsing blank lines) so multi-item broadcasts — one
@@ -5081,7 +5172,7 @@ async function translateWorldObservationForBroadcast(
       continue;
     }
 
-    broadcastLatestLlmUsage();
+    broadcastLatestLlmUsage(client);
     try {
       const candidate = JSON.parse(unwrapJsonBlock(reply)) as { intro?: unknown; items?: unknown };
       if (Array.isArray(candidate.items) && candidate.items.length > 0) {
@@ -5569,12 +5660,7 @@ async function reflectMemoryForAutonomy(
     return null;
   }
 
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-  }
+  broadcastLatestLlmUsage(client);
 
   const reflected = parseMemoryReflection(reply);
   if (!reflected) return null;
@@ -5615,12 +5701,8 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
   }
 }
 
-function recordBootstrapLlmUsage(): void {
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
-  if (!callTokens) return;
-  recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-  broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+function recordBootstrapLlmUsage(client: LlmClient): void {
+  broadcastLatestLlmUsage(client);
 }
 
 function countRestoredConversationTurns(): number {
@@ -5681,7 +5763,7 @@ async function requestBootOrientation(
       messages: [{ role: "user", content: prompt }],
       jsonSchema: BOOT_ORIENTATION_JSON_SCHEMA,
     });
-    recordBootstrapLlmUsage();
+    recordBootstrapLlmUsage(client);
     return parseBootOrientation(reply);
   } catch (error) {
     pushMonitorEntry(
@@ -5783,7 +5865,7 @@ async function requestQqModeDecision(
       messages: [{ role: "user", content: prompt }],
       jsonSchema: QQ_MODE_DECISION_JSON_SCHEMA,
     });
-    recordBootstrapLlmUsage();
+    recordBootstrapLlmUsage(client);
     return parseQqModeDecision(reply, hollyBootstrapConfig, { readOnly: readOnlyMode })
       ?? fallbackQqModeDecision(hollyBootstrapConfig, "The QQ mode response was malformed.");
   } catch (error) {
@@ -6093,7 +6175,7 @@ async function composeArchiveForAutonomy(
     return null;
   }
 
-  broadcastLatestLlmUsage();
+  broadcastLatestLlmUsage(client);
 
   return parseArchiveComposition(reply);
 }
@@ -6154,8 +6236,9 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
 async function evaluateProactiveRevival(
   request: ProactiveRevivalRequest,
 ): Promise<ProactiveDecision | null> {
-  const client = activeLlmClient;
-  if (!client) return null;
+  const client = decisionLlmClient;
+  const responseClient = activeLlmClient;
+  if (!client || !responseClient) return null;
   const startedAt = Date.now();
 
   const context: ModelRequestContext = {
@@ -6169,7 +6252,14 @@ async function evaluateProactiveRevival(
   const conversationTurns = buildFocusedConversationTurns(context);
   const otherGroupsSummary = buildOtherGroupsActivitySummary(context);
   const instruction = buildProactiveRevivePrompt(request);
-  const prepared = prepareModelRequest(client.systemPrompt, "", conversationTurns, instruction, otherGroupsSummary);
+  const prepared = prepareModelRequest(
+    client.systemPrompt,
+    "",
+    conversationTurns,
+    instruction,
+    otherGroupsSummary,
+    client.model,
+  );
   if (prepared.messages.length === 0) return null;
 
   let reply: string;
@@ -6184,15 +6274,35 @@ async function evaluateProactiveRevival(
     return null;
   }
 
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = consumeLatestCallTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-  }
+  broadcastLatestLlmUsage(client);
 
   try {
-    const decision = parseModelDecision(reply);
+    let decision = parseModelDecision(reply);
+    let routedModelLabel = client.model;
+    const isLiveForGroup = proactiveConfig.mode === "live"
+      && proactiveConfig.liveGroupAllowlist.includes(request.groupKey);
+    if (isLiveForGroup) {
+      const routed = await refineDecisionReply({
+        decision,
+        decisionModel: client.model,
+        responseModel: responseClient.model,
+        generateFinalAnswer: (input) => responseClient.generateText(input),
+      });
+      if (decision.shouldReply && decision.finalAnswer && client.model !== responseClient.model) {
+        broadcastLatestLlmUsage(responseClient);
+      }
+      if (routed.usedFallback) {
+        pushMonitorEntry(
+          "error",
+          "Proactive Response Model Fallback",
+          `group=${request.groupKey}\nresponse_model=${responseClient.model}\ndecision_model=${client.model}\n${routed.error ?? "Unknown response-model failure"}`,
+        );
+      }
+      decision = routed.decision;
+      routedModelLabel = routed.responseModel === client.model
+        ? client.model
+        : `${client.model} → ${routed.responseModel}`;
+    }
     await recordMonitorThought({
       kind: "proactive",
       title: "主动开口判断",
@@ -6200,7 +6310,7 @@ async function evaluateProactiveRevival(
       groupId: request.groupKey,
       outcome: decision.shouldReply && decision.finalAnswer ? "reply" : "silent",
       finalAnswer: decision.finalAnswer,
-      model: client.model,
+      model: routedModelLabel,
       durationMs: Math.max(0, Date.now() - startedAt),
     });
     return {
@@ -7477,7 +7587,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       <div class="ph">
         <div class="ph-eye">Token</div>
         <div class="ph-title">每日 Token 用量</div>
-        <div class="ph-desc">按日期与模型统计的 token 使用量（input + output），含每日合计。</div>
+        <div class="ph-desc">按日期与模型拆分普通输入、缓存写入、缓存读取及输出；历史聚合输入保留为 Unknown。</div>
       </div>
       <div class="panel">
         <div class="ph2">
@@ -7498,12 +7608,15 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
               </div>
               <table class="usage-table">
                 <thead>
-                  <tr><th>Model</th><th>Input</th><th>Output</th><th>Total</th></tr>
+                  <tr><th>Model</th><th>Uncached</th><th>Cache write</th><th>Cache read</th><th>Unknown</th><th>Output</th><th>Total</th></tr>
                 </thead>
                 <tbody>
                   <tr v-for="m in day.models" :key="m.model">
                     <td>{{ m.model }}</td>
-                    <td>{{ fmtNum(m.inputTokens) }}</td>
+                    <td>{{ fmtNum(m.uncachedInputTokens) }}</td>
+                    <td>{{ fmtNum(m.cacheCreationInputTokens) }}</td>
+                    <td>{{ fmtNum(m.cacheReadInputTokens) }}</td>
+                    <td>{{ fmtNum(m.unattributedInputTokens) }}</td>
                     <td>{{ fmtNum(m.outputTokens) }}</td>
                     <td>{{ fmtNum(m.totalTokens) }}</td>
                   </tr>
@@ -7784,10 +7897,9 @@ createApp({
       return fetch('/api/llm/profiles').then(function(r) {
         return r.json().then(function(d) {
           if (!r.ok) throw new Error(d.error || 'Failed to load profiles');
-          // Hide Haiku: its 200K window can't hold the 800K global context.
-          profiles.value = d.profiles.filter(function(p) { return !/haiku/i.test(p.model); });
+          profiles.value = d.profiles;
           selProfile.value = d.active;
-          profileMeta.value = 'Active model: ' + d.displayName;
+          profileMeta.value = 'Response: ' + d.displayName + ' · Decision: ' + d.decisionDisplayName;
         });
       }).catch(function(e) {
         profileMeta.value = 'Failed: ' + e.message;
@@ -8013,6 +8125,8 @@ async function bootstrap(): Promise<void> {
   await applyProxyConfig(CONFIG_PATH);
   await loadTokenStats();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
+  const profileCatalog = await listLlmProfiles(CONFIG_PATH);
+  const requestedDecisionProfile = process.env.LLM_DECISION_PROFILE?.trim() || profileCatalog.decision;
   const loadedContextBudgetConfig = await loadContextBudgetConfig(CONFIG_PATH);
   const loadedAutonomyConfig = await loadAutonomyConfig(CONFIG_PATH);
   const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
@@ -8023,7 +8137,10 @@ async function bootstrap(): Promise<void> {
   const loadedAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const loadedPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
   readOnlyMode = await loadReadOnlyConfig(CONFIG_PATH);
-  const client = await createLlmClient(CONFIG_PATH, requestedProfile);
+  const client = await createWatchedLlmClient(CONFIG_PATH, requestedProfile);
+  const decisionClient = requestedDecisionProfile === client.profileName
+    ? client
+    : await createWatchedLlmClient(CONFIG_PATH, requestedDecisionProfile);
   const store = await createIncomingMessageStore(CONFIG_PATH, {
     sessionId: APP_SESSION_ID,
     sessionStartedAt: APP_SESSION_STARTED_AT,
@@ -8031,6 +8148,7 @@ async function bootstrap(): Promise<void> {
   });
 
   activeLlmClient = client;
+  decisionLlmClient = decisionClient;
   activeLlmLabel = client.displayName;
   contextBudgetConfig = loadedContextBudgetConfig;
   autonomyConfig = loadedAutonomyConfig;
@@ -8217,8 +8335,13 @@ async function bootstrap(): Promise<void> {
       if (req.method === "GET" && url.pathname === "/api/llm/profiles") {
         const catalog = await listLlmProfiles(CONFIG_PATH);
         const current = getActiveLlmClient();
+        const decision = getDecisionLlmClient();
         sendJson(res, 200, {
           active: current.profileName,
+          decision: decision.profileName,
+          decisionDisplayName: decision.displayName,
+          decisionProvider: decision.provider,
+          decisionModel: decision.model,
           displayName: current.displayName,
           provider: current.provider,
           model: current.model,
@@ -8266,10 +8389,6 @@ async function bootstrap(): Promise<void> {
           const current = getActiveLlmClient();
           if (current.provider === "claude") {
             usage = await probeClaudeUsage(current.model);
-            const callTokens = consumeLatestCallTokenUsage();
-            if (callTokens) {
-              recordTokenUsage(callTokens.model, callTokens.inputTokens, callTokens.outputTokens);
-            }
             broadcastMonitorEvent({ type: "usage", claudeUsage: usage });
             broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
           }
@@ -8364,7 +8483,8 @@ async function bootstrap(): Promise<void> {
     console.log(`LLM Chat server is running at http://${HTTP_HOST}:${HTTP_PORT}`);
     console.log(`WebSocket monitor page is available at http://${HTTP_HOST}:${HTTP_PORT}/ws`);
     console.log(`WebSocket client target is ${WS_TARGET_URL}`);
-    console.log(`Active LLM profile: ${client.displayName}`);
+    console.log(`Response LLM profile: ${client.displayName}`);
+    console.log(`Decision LLM profile: ${decisionClient.displayName}`);
     if (store) {
       console.log(`Qdrant store: ${store.description}`);
     }

@@ -7,6 +7,9 @@ import path from "node:path";
 
 import YAML from "yaml";
 
+import { LlmHttpError, ProviderRateLimitGate } from "./connection-watchdog.js";
+import { TokenUsageQueue, type TokenUsageBreakdown } from "./token-usage.js";
+
 export type LlmMessageRole = "system" | "user" | "assistant";
 
 export type LlmMessage = {
@@ -32,6 +35,7 @@ export type LlmProfileConfig = CodexProfileConfig | ClaudeProfileConfig;
 
 type LlmSectionConfig = {
   active?: string;
+  decision_profile?: string;
   system_prompt?: string;
   profiles?: Record<string, LlmProfileConfig>;
 };
@@ -53,6 +57,7 @@ export type LlmClient = {
   model: string;
   systemPrompt: string;
   displayName: string;
+  consumeTokenUsage(): import("./token-usage.js").CallTokenUsage | null;
   generateText(input: {
     messages: LlmMessage[];
     systemPrompt?: string;
@@ -114,6 +119,7 @@ const REQUEST_TIMEOUT_MS = 30_000;
 const FETCH_FAILED_MAX_ATTEMPTS = 5;
 const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
+const codexRateLimitGate = new ProviderRateLimitGate({ provider: "Codex" });
 
 const CLAUDE_CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
 // On macOS, Claude Code stores its OAuth blob in the login Keychain, not in the
@@ -126,6 +132,8 @@ const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
 const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
 const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
+const claudeRateLimitGate = new ProviderRateLimitGate({ provider: "Claude" });
+const CLAUDE_CACHE_WARMUP_PLACEHOLDER = "warmup";
 // OAuth subscription tokens are only accepted when the first system block is this exact string.
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 // Opus 4.x supports 128K output tokens; Sonnet 4.6 / Haiku 4.5 cap at 64K.
@@ -136,6 +144,11 @@ function claudeMaxOutputTokens(model: string): number {
 type ClaudeRequestOptions = {
   jsonSchema?: Record<string, unknown>;
   maxTokens?: number;
+  // Put the cache breakpoint on the last byte-stable conversation block.
+  // The volatile request tail must remain after it so timestamps, retrieved
+  // memory, and the current scan never poison the reusable prefix hash.
+  cacheStablePrefix?: boolean;
+  volatileTailMessages?: number;
 };
 
 function isFetchFailedError(error: unknown): boolean {
@@ -400,7 +413,10 @@ function buildCodexRequest(model: string, systemPrompt: string, messages: LlmMes
   };
 }
 
-async function readCodexStreamText(res: Response, model: string): Promise<string> {
+async function readCodexStreamText(
+  res: Response,
+  recordUsage: (usage: TokenUsageBreakdown) => void,
+): Promise<string> {
   const body = res.body;
   if (!body) {
     return "";
@@ -435,7 +451,18 @@ async function readCodexStreamText(res: Response, model: string): Promise<string
         if (usage && typeof usage === "object") {
           const u = usage as Record<string, unknown>;
           const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-          recordCallTokenUsage(model, num(u.input_tokens), num(u.output_tokens));
+          const inputTokens = num(u.input_tokens);
+          const inputDetails = u.input_tokens_details && typeof u.input_tokens_details === "object"
+            ? u.input_tokens_details as Record<string, unknown>
+            : {};
+          const cacheReadInputTokens = Math.min(inputTokens, num(inputDetails.cached_tokens));
+          recordUsage({
+            inputTokens,
+            uncachedInputTokens: Math.max(0, inputTokens - cacheReadInputTokens),
+            cacheCreationInputTokens: 0,
+            cacheReadInputTokens,
+            outputTokens: num(u.output_tokens),
+          });
         }
       }
 
@@ -502,7 +529,13 @@ function extractCodexText(rawResult: unknown): string {
   return texts.join("").trim();
 }
 
-async function requestCodexText(model: string, systemPrompt: string, messages: LlmMessage[]): Promise<string> {
+async function requestCodexText(
+  model: string,
+  systemPrompt: string,
+  messages: LlmMessage[],
+  recordUsage: (usage: TokenUsageBreakdown) => void,
+): Promise<string> {
+  const rateLimitRevision = codexRateLimitGate.beginRequest();
   let creds = await getCodexCredentials();
   const body = buildCodexRequest(model, systemPrompt, messages);
   let fetchAttempts = 0;
@@ -532,6 +565,7 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
       throw error;
     }
     await logCodexResponse(res);
+    captureCodexUsage(res);
 
     if ((res.status === 401 || res.status === 403) && authAttempt === 0 && creds.refreshToken) {
       const refreshed = await refreshCodexCredentials(creds).catch(() => null);
@@ -544,10 +578,14 @@ async function requestCodexText(model: string, systemPrompt: string, messages: L
 
     if (!res.ok) {
       const errorText = await res.text().catch(() => "");
-      throw new Error(`Codex API error ${res.status}: ${errorText || "<empty>"}`);
+      const retryAt = res.status === 429
+        ? codexRateLimitGate.pauseUntil(parseUsageResetMs(res.headers.get("x-codex-primary-reset-at")))
+        : null;
+      throw new LlmHttpError("Codex", res.status, (errorText || "<empty>").slice(0, 2_000), retryAt);
     }
 
-    return readCodexStreamText(res, model);
+    codexRateLimitGate.recordSuccess(rateLimitRevision);
+    return readCodexStreamText(res, recordUsage);
   }
 
   throw new Error("Codex request failed after retry.");
@@ -597,23 +635,55 @@ function readClaudeKeychainRaw(): string {
   ).trim();
 }
 
-async function readClaudeCredentials(): Promise<ClaudeCredentials> {
-  // Prefer the on-disk file (Linux/CI, and where token refreshes are persisted);
-  // fall back to the macOS Keychain, which is where the Claude Code CLI stores
-  // credentials by default.
-  try {
-    return parseClaudeCredentials(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8"), "file");
-  } catch (fileError) {
-    if (process.platform === "darwin") {
-      try {
-        return parseClaudeCredentials(readClaudeKeychainRaw(), "keychain");
-      } catch {
-        // Keychain miss too — surface the original file error below, which names
-        // the primary credentials path.
-      }
-    }
-    throw fileError;
+// The file and the Keychain hold the same OAuth blob but drift apart: the CLI
+// rotates the Keychain copy, while refreshes here are persisted to the file. A
+// fixed precedence means 401s against a token the other store already replaced,
+// so rank the two by how usable each is right now. `preferred` wins ties.
+export function pickFresherClaudeCredentials<T extends { expiresAt: number | null }>(
+  preferred: T | null,
+  other: T | null,
+): T | null {
+  if (!preferred) return other;
+  if (!other) return preferred;
+
+  const usable = (creds: T): boolean => !isExpiringSoon(creds.expiresAt);
+  if (usable(preferred) !== usable(other)) {
+    return usable(preferred) ? preferred : other;
   }
+
+  // A null expiresAt keeps the meaning isExpiringSoon() gives it — not expiring
+  // — so it never loses to a dated token.
+  const rank = (creds: T): number => creds.expiresAt ?? Number.POSITIVE_INFINITY;
+  return rank(other) > rank(preferred) ? other : preferred;
+}
+
+async function readClaudeCredentials(): Promise<ClaudeCredentials> {
+  // The on-disk file is the Linux/CI location and where token refreshes are
+  // persisted; the macOS Keychain is where the Claude Code CLI stores
+  // credentials by default. Read both and take the fresher one.
+  let fileError: unknown = null;
+  let fileCreds: ClaudeCredentials | null = null;
+  try {
+    fileCreds = parseClaudeCredentials(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8"), "file");
+  } catch (error) {
+    fileError = error;
+  }
+
+  let keychainCreds: ClaudeCredentials | null = null;
+  if (process.platform === "darwin") {
+    try {
+      keychainCreds = parseClaudeCredentials(readClaudeKeychainRaw(), "keychain");
+    } catch {
+      // Keychain miss — fall back to whatever the file gave us.
+    }
+  }
+
+  const creds = pickFresherClaudeCredentials(fileCreds, keychainCreds);
+  if (!creds) {
+    // Surface the file error, which names the primary credentials path.
+    throw fileError ?? new Error(`Claude credentials not found at ${CLAUDE_CREDENTIALS_PATH}`);
+  }
+  return creds;
 }
 
 async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<ClaudeCredentials | null> {
@@ -675,7 +745,15 @@ async function getClaudeCredentials(): Promise<ClaudeCredentials> {
     return creds;
   }
 
-  const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
+  // A failed refresh leaves an expired token in play, which surfaces much later
+  // as an opaque 401 from the API — say so here instead.
+  const refreshed = await refreshClaudeCredentials(creds).catch((error: unknown) => {
+    console.warn(
+      `Claude token refresh failed (credentials source: ${creds.source}); continuing with the expired token.`,
+      error,
+    );
+    return null;
+  });
   return refreshed ?? creds;
 }
 
@@ -688,25 +766,29 @@ function buildClaudeHeaders(accessToken: string): Record<string, string> {
   };
 }
 
-type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: string[] };
+type ClaudeMessageBlock = { text: string; volatile: boolean };
+type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: ClaudeMessageBlock[] };
 
 // One text block per source LlmMessage (conversation turn). Consecutive
-// same-role turns merge into one API message but keep their block boundaries.
-function buildClaudeMessages(messages: LlmMessage[]): ClaudeMergedMessage[] {
+// same-role turns merge into one API message but keep their block boundaries,
+// allowing a cache marker to sit immediately before the volatile tail.
+function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): ClaudeMergedMessage[] {
   const merged: ClaudeMergedMessage[] = [];
+  const volatileFrom = messages.length - Math.max(0, volatileTailMessages);
 
-  for (const message of messages) {
+  for (const [index, message] of messages.entries()) {
     const content = message.content.trim();
     if (!content) {
       continue;
     }
 
     const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
+    const block: ClaudeMessageBlock = { text: content, volatile: index >= volatileFrom };
     const last = merged[merged.length - 1];
     if (last && last.role === role) {
-      last.blocks.push(content);
+      last.blocks.push(block);
     } else {
-      merged.push({ role, blocks: [content] });
+      merged.push({ role, blocks: [block] });
     }
   }
 
@@ -727,18 +809,37 @@ function buildClaudeMessages(messages: LlmMessage[]): ClaudeMergedMessage[] {
   return merged;
 }
 
-function buildClaudeMessagesBody(messages: LlmMessage[]): Array<Record<string, unknown>> {
-  return buildClaudeMessages(messages).map((message) => ({
+function buildClaudeMessagesBody(
+  messages: LlmMessage[],
+  cacheStablePrefix: boolean,
+  volatileTailMessages: number,
+): Array<Record<string, unknown>> {
+  const merged = buildClaudeMessages(messages, volatileTailMessages);
+  const apiMessages = merged.map((message): Record<string, unknown> => ({
     role: message.role,
-    content: message.blocks.map((text) => ({ type: "text", text })),
+    content: message.blocks.map((block) => ({ type: "text", text: block.text })),
   }));
+
+  if (cacheStablePrefix) {
+    outer: for (let i = merged.length - 1; i >= 0; i -= 1) {
+      for (let j = merged[i].blocks.length - 1; j >= 0; j -= 1) {
+        if (!merged[i].blocks[j].volatile) {
+          const content = apiMessages[i].content as Array<Record<string, unknown>>;
+          content[j].cache_control = { type: "ephemeral", ttl: "1h" };
+          break outer;
+        }
+      }
+    }
+  }
+
+  return apiMessages;
 }
 
-function buildClaudeRequestBody(
+export function buildClaudeRequestBody(
   model: string,
   systemPrompt: string,
   messages: LlmMessage[],
-  options: ClaudeRequestOptions = {},
+  options: ClaudeRequestOptions,
 ): Record<string, unknown> {
   const system: Array<Record<string, unknown>> = [
     { type: "text", text: CLAUDE_CODE_IDENTITY },
@@ -754,14 +855,12 @@ function buildClaudeRequestBody(
   const body: Record<string, unknown> = {
     model,
     max_tokens: options.maxTokens ?? claudeMaxOutputTokens(model),
-    // Top-level automatic caching (kagami parity, see claude-code-request.ts
-    // there): the breakpoint follows the last cacheable block and moves
-    // forward each request, incrementally caching the growing conversation
-    // history without having to track which trailing messages are volatile.
-    // Complements the system-block pin above (2 of the 4 breakpoint budget).
-    cache_control: { type: "ephemeral", ttl: "1h" },
     system,
-    messages: buildClaudeMessagesBody(messages),
+    messages: buildClaudeMessagesBody(
+      messages,
+      options.cacheStablePrefix ?? false,
+      options.volatileTailMessages ?? 0,
+    ),
   };
 
   if (options.jsonSchema) {
@@ -770,6 +869,20 @@ function buildClaudeRequestBody(
   }
 
   return body;
+}
+
+export function prepareClaudeCacheWarmRequest(messages: LlmMessage[]): {
+  messages: LlmMessage[];
+  options: ClaudeRequestOptions;
+} {
+  return {
+    messages: [...messages, { role: "user", content: CLAUDE_CACHE_WARMUP_PLACEHOLDER }],
+    options: {
+      maxTokens: 0,
+      cacheStablePrefix: true,
+      volatileTailMessages: 1,
+    },
+  };
 }
 
 function extractClaudeText(data: unknown): string {
@@ -811,43 +924,25 @@ export function getLatestClaudeUsage(): ClaudeUsage | null {
   return latestClaudeUsage;
 }
 
-export type CallTokenUsage = {
-  model: string;
-  inputTokens: number;
-  outputTokens: number;
-  capturedAt: number;
-};
-
-let latestCallTokenUsage: CallTokenUsage | null = null;
-
-// Consume the most recent call's token usage exactly once. The model queue is
-// serial, so each generateText() is followed by one consume with no races.
-export function consumeLatestCallTokenUsage(): CallTokenUsage | null {
-  const usage = latestCallTokenUsage;
-  latestCallTokenUsage = null;
-  return usage;
-}
-
-function recordCallTokenUsage(model: string, inputTokens: number, outputTokens: number): void {
-  latestCallTokenUsage = {
-    model,
-    inputTokens: Number.isFinite(inputTokens) ? Math.max(0, inputTokens) : 0,
-    outputTokens: Number.isFinite(outputTokens) ? Math.max(0, outputTokens) : 0,
-    capturedAt: Date.now(),
-  };
-}
-
-function readClaudeUsageTokens(data: unknown): { input: number; output: number } | null {
+export function readClaudeUsageTokens(data: unknown): TokenUsageBreakdown | null {
   if (!data || typeof data !== "object") return null;
   const usage = (data as Record<string, unknown>).usage;
   if (!usage || typeof usage !== "object") return null;
   const u = usage as Record<string, unknown>;
   const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-  // Count cache writes/reads as input too, so totals reflect real tokens processed.
-  const input = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
-  const output = num(u.output_tokens);
-  if (input === 0 && output === 0) return null;
-  return { input, output };
+  const uncachedInputTokens = num(u.input_tokens);
+  const cacheCreationInputTokens = num(u.cache_creation_input_tokens);
+  const cacheReadInputTokens = num(u.cache_read_input_tokens);
+  const outputTokens = num(u.output_tokens);
+  const inputTokens = uncachedInputTokens + cacheCreationInputTokens + cacheReadInputTokens;
+  if (inputTokens === 0 && outputTokens === 0) return null;
+  return {
+    inputTokens,
+    uncachedInputTokens,
+    cacheCreationInputTokens,
+    cacheReadInputTokens,
+    outputTokens,
+  };
 }
 
 function parseUsageUtilization(value: string | null): number | null {
@@ -925,7 +1020,9 @@ async function requestClaudeText(
   systemPrompt: string,
   messages: LlmMessage[],
   options: ClaudeRequestOptions = {},
+  recordUsage: (usage: TokenUsageBreakdown) => void,
 ): Promise<string> {
+  const rateLimitRevision = claudeRateLimitGate.beginRequest();
   let creds = await getClaudeCredentials();
   const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
   let fetchAttempts = 0;
@@ -952,6 +1049,10 @@ async function requestClaudeText(
       throw error;
     }
 
+    // Usage/reset headers can be present on 429 responses too. Capture them
+    // before any auth retry or error throw so the monitor retains the reset.
+    captureClaudeUsage(res);
+
     if ((res.status === 401 || res.status === 403) && authAttempt === 0) {
       // The OAuth credentials are shared with the Claude Code app, which uses
       // rotating refresh tokens: a concurrent rotation invalidates both the
@@ -977,14 +1078,19 @@ async function requestClaudeText(
 
     if (!res.ok) {
       const errorText = await res.text().catch(() => "");
-      throw new Error(`Claude API error ${res.status}: ${errorText || "<empty>"}`);
+      const retryAt = res.status === 429
+        ? claudeRateLimitGate.pauseUntil(
+            parseUsageResetMs(res.headers.get("anthropic-ratelimit-unified-5h-reset")),
+          )
+        : null;
+      throw new LlmHttpError("Claude", res.status, (errorText || "<empty>").slice(0, 2_000), retryAt);
     }
 
-    captureClaudeUsage(res);
+    claudeRateLimitGate.recordSuccess(rateLimitRevision);
     const data = await res.json();
     const tokens = readClaudeUsageTokens(data);
     if (tokens) {
-      recordCallTokenUsage(model, tokens.input, tokens.output);
+      recordUsage(tokens);
     }
     return extractClaudeText(data);
   }
@@ -996,6 +1102,7 @@ async function requestClaudeText(
 // usage panel can show data before the first real chat happens.
 export async function probeClaudeUsage(model: string): Promise<ClaudeUsage | null> {
   try {
+    const rateLimitRevision = claudeRateLimitGate.beginRequest();
     const creds = await getClaudeCredentials();
     const body = {
       model,
@@ -1013,12 +1120,14 @@ export async function probeClaudeUsage(model: string): Promise<ClaudeUsage | nul
     if (res.ok || res.status === 429) {
       captureClaudeUsage(res);
     }
+    if (res.status === 429) {
+      claudeRateLimitGate.pauseUntil(
+        parseUsageResetMs(res.headers.get("anthropic-ratelimit-unified-5h-reset")),
+      );
+    }
     if (res.ok) {
-      const data = await res.json().catch(() => null);
-      const tokens = readClaudeUsageTokens(data);
-      if (tokens) {
-        recordCallTokenUsage(model, tokens.input, tokens.output);
-      }
+      claudeRateLimitGate.recordSuccess(rateLimitRevision);
+      await res.json().catch(() => null);
     }
   } catch {
     // Best-effort probe; fall back to whatever is cached.
@@ -1062,6 +1171,7 @@ export async function resolveLlmProfile(configPath: string, requestedProfileName
 
 export async function listLlmProfiles(configPath: string): Promise<{
   active: string;
+  decision: string;
   profiles: LlmProfileSummary[];
 }> {
   const config = await loadConfig(configPath);
@@ -1073,6 +1183,10 @@ export async function listLlmProfiles(configPath: string): Promise<{
   const active = llm.active?.trim();
   if (!active) {
     throw new Error(`Missing 'llm.active' in ${configPath}.`);
+  }
+  const decision = llm.decision_profile?.trim() || active;
+  if (!llm.profiles[decision]) {
+    throw new Error(`LLM decision profile '${decision}' not found in ${configPath}.`);
   }
 
   const profiles = Object.entries(llm.profiles).map(([name, profile]) => {
@@ -1095,6 +1209,7 @@ export async function listLlmProfiles(configPath: string): Promise<{
 
   return {
     active,
+    decision,
     profiles,
   };
 }
@@ -1121,6 +1236,8 @@ export async function setActiveLlmProfile(configPath: string, profileName: strin
 
 export async function createLlmClient(configPath: string, requestedProfileName?: string): Promise<LlmClient> {
   const profile = await resolveLlmProfile(configPath, requestedProfileName);
+  const usageQueue = new TokenUsageQueue(profile.model);
+  const recordUsage = (usage: TokenUsageBreakdown): void => usageQueue.record(usage);
 
   return {
     profileName: profile.name,
@@ -1128,6 +1245,7 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
     model: profile.model,
     systemPrompt: profile.systemPrompt,
     displayName: `${profile.name} (${profile.model})`,
+    consumeTokenUsage: () => usageQueue.consume(),
     async generateText(input): Promise<string> {
       const { systemPrompt, contents } = splitSystemPrompt(
         input.messages,
@@ -1135,12 +1253,22 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
       );
 
       if (profile.provider === "claude") {
-        return requestClaudeText(profile.model, systemPrompt, contents, {
-          jsonSchema: input.jsonSchema,
-        });
+        return requestClaudeText(
+          profile.model,
+          systemPrompt,
+          contents,
+          {
+            jsonSchema: input.jsonSchema,
+            cacheStablePrefix: true,
+            // Every production generateText caller puts its per-request input in
+            // the final LlmMessage. Cache the stable history immediately before it.
+            volatileTailMessages: 1,
+          },
+          recordUsage,
+        );
       }
 
-      return requestCodexText(profile.model, systemPrompt, contents);
+      return requestCodexText(profile.model, systemPrompt, contents, recordUsage);
     },
     async warmContext(input): Promise<void> {
       if (profile.provider !== "claude") {
@@ -1155,12 +1283,16 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
         return;
       }
 
-      // max_tokens=1: the reply is discarded; the request exists only to write
-      // the 1h prompt cache (top-level cache_control, automatic breakpoint) so
-      // the next real reply reads the warmed prefix.
-      await requestClaudeText(profile.model, systemPrompt, contents, {
-        maxTokens: 1,
-      });
+      // A volatile placeholder keeps an assistant-ending history valid for the
+      // Messages API while leaving the breakpoint on the complete stable history.
+      const warm = prepareClaudeCacheWarmRequest(contents);
+      await requestClaudeText(
+        profile.model,
+        systemPrompt,
+        warm.messages,
+        warm.options,
+        recordUsage,
+      );
     },
   };
 }
