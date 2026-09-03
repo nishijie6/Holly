@@ -97,6 +97,8 @@ async function decide(
   message: string,
 ): Promise<Record<string, unknown>> {
   const raw = await client.generateText({
+    purpose: "eval-script",
+    cacheRoute: "eval-script",
     systemPrompt,
     messages: [{ role: "user", content: message }],
     jsonSchema: MODEL_DECISION_JSON_SCHEMA,

@@ -13,6 +13,7 @@ import {
   probeClaudeUsage,
   listLlmProfiles,
   setActiveLlmProfile,
+  type CachePrefixObserver,
   type ClaudeUsage,
   type LlmClient,
   type LlmMessage,
@@ -24,13 +25,27 @@ import {
 } from "./connection-watchdog.js";
 import {
   addCallTokenUsage,
+  addSummaryToPromptCacheCounts,
   buildDailyTokenStats,
+  buildPromptCachePurposeStats,
+  buildPromptCacheSeries,
+  emptyPromptCacheCounts,
+  listRecentHourKeys,
+  localHourKey,
+  normalizeStoredPromptCacheCounts,
   normalizeStoredTokenCounts,
   summarizePromptCacheCall,
   type CallTokenUsage,
   type DailyTokenStats,
   type ModelTokenCounts,
+  type PromptCacheCallSummary,
+  type PromptCacheCounts,
+  type PromptCachePurposeStat,
+  type PromptCacheSeriesPoint,
 } from "./token-usage.js";
+import { describeCachePrefixDrift } from "./cache-prefix.js";
+import { RouteQueue } from "./route-queue.js";
+import { AgentEventQueue, type AgentEvent } from "./agent-events.js";
 import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
 import {
   createIncomingMessageStore,
@@ -607,7 +622,27 @@ let incomingMessageStore: IncomingMessageStore | null = null;
 let incomingMessageStoreQueue: Promise<void> = Promise.resolve();
 let incomingMessageSequence = 0;
 let llmProfileSwitchQueue: Promise<void> = Promise.resolve();
-let modelQueue: Promise<void> = Promise.resolve();
+// L2: the concurrency primitives every reply/warm/proactive/qq-mode call
+// submits through (see route-queue.ts). Replaces the old hand-rolled
+// `modelQueue` global and the bespoke exclusive wrapper that used to live only
+// in runGroupProactiveOnModelQueue. Reply/warm/qq-mode work shares this
+// instance (routes never collide with each other: replyCacheRoute always
+// returns "reply:<group>", qq-mode decisions use the fixed "qq-mode-decision"
+// route); the proactive tick's submitExclusive call also runs on this
+// instance, since it needs to wait out and then block every one of those routes.
+const modelRouteQueue = new RouteQueue();
+// Autonomy ticks get their OWN instance, not a route on modelRouteQueue: a
+// tick's proactive branch calls modelRouteQueue.submitExclusive from inside
+// the task this queue is already running. submitExclusive snapshots every
+// route's tail on whichever instance it's called on, so calling it from
+// inside modelRouteQueue's own task would make it wait on itself — the tail
+// it's part of can't settle until the very submitExclusive call resolves.
+// A separate instance sidesteps this entirely: it never has that tail.
+const autonomyTickQueue = new RouteQueue();
+// L1: the one queue every timer/WS trigger pushes a typed event onto instead
+// of deciding and calling the model itself (see agent-events.ts). Dispatched
+// by dispatchAgentEvent, defined near enqueueUnreadBatchForModel below.
+const agentEvents = new AgentEventQueue();
 let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 // Upstream message ids we've already ingested from the live WS stream, with the
 // time we first saw them. NapCat can re-deliver the same message (notably after a
@@ -620,7 +655,6 @@ let thoughtHistoryStore: ThoughtHistoryStore | null = null;
 let conversationContextStore: ConversationContextStore | null = null;
 let conversationHistoryPersistDirty = false;
 let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
-let autonomyQueue: Promise<void> = Promise.resolve();
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
@@ -655,8 +689,8 @@ let aiToneShadowQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // Groups whose own history grew since the last warm pass (single-group focus:
 // each group now has its own cache-stable prefix, so warming is per-group —
-// see buildFocusedConversationTurns / warmDirtyGroupContexts). Quiet groups
-// stay out of this set so warming doesn't burn rate-limit budget on them.
+// see buildFocusedConversationTurns / scheduleContextWarm / dispatchContextWarmDue).
+// Quiet groups stay out of this set so warming doesn't burn rate-limit budget on them.
 let dirtyGroupKeys = new Set<string>();
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
 let conversationHistoryBootstrapDayByGroup = new Map<string, string>();
@@ -1473,12 +1507,43 @@ function watchLlmClient(client: LlmClient): LlmClient {
   };
 }
 
+// Every client is built with the prefix observer attached, so a call site
+// cannot opt out of the check by forgetting to ask for it.
 async function createWatchedLlmClient(
   configPath: string,
   requestedProfileName?: string,
 ): Promise<LlmClient> {
-  return watchLlmClient(await createLlmClient(configPath, requestedProfileName));
+  return watchLlmClient(
+    await createLlmClient(configPath, requestedProfileName, {
+      cachePrefixObserver: reportCachePrefixInspection,
+    }),
+  );
 }
+
+// Only rebuilds are worth an entry: "fresh" is the first call on a route,
+// "unchanged"/"extended" are the healthy paths and would drown the monitor.
+const reportCachePrefixInspection: CachePrefixObserver = (event) => {
+  if (event.status !== "rebuilt") {
+    return;
+  }
+
+  const detail = [
+    `route=${event.route} purpose=${event.purpose}`,
+    describeCachePrefixDrift(event),
+    `blocks ${event.previousBlocks} -> ${event.currentBlocks}`,
+  ].join("\n");
+
+  if (event.expectRebuild) {
+    // Context compression rewrote the timeline on purpose. Still worth a line:
+    // it dates the moment this route started paying full price again.
+    pushMonitorEntry("status", "Prompt Cache Prefix Rebuilt", detail, event.model);
+    return;
+  }
+
+  // Nobody asked for this one. Something volatile reached the cached prefix,
+  // and every request on this route pays full price until it is fixed.
+  pushMonitorEntry("error", "Prompt Cache Prefix Drift", detail, event.model);
+};
 
 async function switchActiveProfile(profileName: string): Promise<LlmClient> {
   const target = profileName.trim();
@@ -1640,15 +1705,129 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
 }
 
 const TOKEN_STATS_PATH = join(LOG_DIR, "token-usage.json");
+// The daily table answers "how many tokens", which is not the same question as
+// "is the cache working right now": a day that ends at 37% hides the hour the
+// prefix broke. These two series are the time axis and the per-purpose split
+// the daily totals cannot reconstruct.
+const PROMPT_CACHE_STATS_PATH = join(LOG_DIR, "prompt-cache.json");
+// Bounded on write so the file cannot grow without limit; 7 days of hours is
+// enough to see a regression and when it started.
+const PROMPT_CACHE_HOURS_KEPT = 24 * 7;
+const PROMPT_CACHE_PURPOSE_DAYS_KEPT = 30;
 
 let tokenStatsByDate = new Map<string, Map<string, ModelTokenCounts>>();
 let tokenStatsSaveQueue: Promise<void> = Promise.resolve();
+let promptCacheByHour = new Map<string, PromptCacheCounts>();
+let promptCacheByPurposeDate = new Map<string, Map<string, PromptCacheCounts>>();
+let promptCacheSaveQueue: Promise<void> = Promise.resolve();
 
 function localDateKey(date = new Date()): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, "0");
   const d = String(date.getDate()).padStart(2, "0");
   return `${y}-${m}-${d}`;
+}
+
+async function loadPromptCacheStats(): Promise<void> {
+  try {
+    const raw = await readFile(PROMPT_CACHE_STATS_PATH, "utf-8");
+    const parsed = JSON.parse(raw) as {
+      hourly?: Record<string, unknown>;
+      purposeDaily?: Record<string, Record<string, unknown>>;
+    };
+    const hourly = new Map<string, PromptCacheCounts>();
+    for (const [hour, counts] of Object.entries(parsed.hourly ?? {})) {
+      hourly.set(hour, normalizeStoredPromptCacheCounts(counts));
+    }
+    const purposeDaily = new Map<string, Map<string, PromptCacheCounts>>();
+    for (const [date, purposes] of Object.entries(parsed.purposeDaily ?? {})) {
+      const byPurpose = new Map<string, PromptCacheCounts>();
+      for (const [purpose, counts] of Object.entries(purposes)) {
+        byPurpose.set(purpose, normalizeStoredPromptCacheCounts(counts));
+      }
+      purposeDaily.set(date, byPurpose);
+    }
+    promptCacheByHour = hourly;
+    promptCacheByPurposeDate = purposeDaily;
+  } catch {
+    // No prompt-cache stats yet; start empty.
+  }
+}
+
+function persistPromptCacheStats(): void {
+  promptCacheSaveQueue = promptCacheSaveQueue
+    .then(async () => {
+      const hourly: Record<string, PromptCacheCounts> = {};
+      for (const hour of Array.from(promptCacheByHour.keys()).sort().slice(-PROMPT_CACHE_HOURS_KEPT)) {
+        const counts = promptCacheByHour.get(hour);
+        if (counts) hourly[hour] = counts;
+      }
+      const purposeDaily: Record<string, Record<string, PromptCacheCounts>> = {};
+      for (const date of Array.from(promptCacheByPurposeDate.keys()).sort().slice(-PROMPT_CACHE_PURPOSE_DAYS_KEPT)) {
+        const byPurpose = promptCacheByPurposeDate.get(date);
+        if (!byPurpose) continue;
+        purposeDaily[date] = {};
+        for (const [purpose, counts] of byPurpose) {
+          purposeDaily[date][purpose] = counts;
+        }
+      }
+      await mkdir(LOG_DIR, { recursive: true });
+      await writeFile(
+        PROMPT_CACHE_STATS_PATH,
+        JSON.stringify({ hourly, purposeDaily }, null, 2),
+        "utf-8",
+      );
+    })
+    .catch((error) => {
+      console.error("Failed to persist prompt cache stats:", error);
+    });
+}
+
+function recordPromptCacheSample(usage: CallTokenUsage, summary: PromptCacheCallSummary): void {
+  const hour = localHourKey(new Date());
+  promptCacheByHour.set(
+    hour,
+    addSummaryToPromptCacheCounts(
+      promptCacheByHour.get(hour) ?? emptyPromptCacheCounts(),
+      summary,
+      usage.outputTokens,
+    ),
+  );
+
+  const date = localDateKey();
+  let byPurpose = promptCacheByPurposeDate.get(date);
+  if (!byPurpose) {
+    byPurpose = new Map<string, PromptCacheCounts>();
+    promptCacheByPurposeDate.set(date, byPurpose);
+  }
+  byPurpose.set(
+    usage.purpose,
+    addSummaryToPromptCacheCounts(
+      byPurpose.get(usage.purpose) ?? emptyPromptCacheCounts(),
+      summary,
+      usage.outputTokens,
+    ),
+  );
+
+  persistPromptCacheStats();
+}
+
+export type PromptCacheReport = {
+  hours: PromptCacheSeriesPoint[];
+  purposes: PromptCachePurposeStat[];
+  date: string;
+};
+
+// Derived here, not in the browser: the hit-rate definition lives in
+// token-usage.ts and every surface reads the same number from it.
+function getPromptCacheReport(hours = 48): PromptCacheReport {
+  const span = Math.max(1, Math.min(PROMPT_CACHE_HOURS_KEPT, Math.floor(hours)));
+  const date = localDateKey();
+  return {
+    date,
+    hours: buildPromptCacheSeries(promptCacheByHour, listRecentHourKeys(new Date(), span)),
+    purposes: buildPromptCachePurposeStats(promptCacheByPurposeDate.get(date)),
+  };
 }
 
 async function loadTokenStats(): Promise<void> {
@@ -1687,7 +1866,7 @@ function persistTokenStats(): void {
     });
 }
 
-function recordTokenUsage(usage: CallTokenUsage): void {
+function recordTokenUsage(usage: CallTokenUsage, belowMinimum: boolean): void {
   if (!usage.model || (usage.inputTokens <= 0 && usage.outputTokens <= 0)) {
     return;
   }
@@ -1701,7 +1880,7 @@ function recordTokenUsage(usage: CallTokenUsage): void {
   if (!counts) {
     counts = normalizeStoredTokenCounts({});
   }
-  models.set(usage.model, addCallTokenUsage(counts, usage));
+  models.set(usage.model, addCallTokenUsage(counts, usage, belowMinimum));
   persistTokenStats();
 }
 
@@ -2756,6 +2935,21 @@ function formatElapsedDuration(startedAt: number, finishedAt: number): string {
 function normalizeConversationGroupKey(groupId: string | null): string | null {
   const normalized = groupId?.trim() || null;
   return normalized;
+}
+
+// A cache route names one prompt-cache lineage (see cache-prefix.ts). Reply
+// decision, search re-ask, and the warm pass all send the same group's system
+// prefix + timeline, so they share one route: that is exactly the entry the
+// warm pass is paying to keep alive. Different groups are different lineages.
+// The response model sees only the approved draft plus a fixed instruction, so
+// every group shares one lineage here. It is also far below the response
+// model's minimum cacheable prefix (see minimumCacheablePrefixTokens): this
+// route is expected to report no cache activity at all, and the accounting
+// classifies it as uncacheable rather than as a 0% miss.
+const FINAL_REPLY_CACHE_ROUTE = "final-reply";
+
+function replyCacheRoute(groupId: string | null): string {
+  return `reply:${normalizeConversationGroupKey(groupId) ?? "private"}`;
 }
 
 function parseReplyGroupId(groupId: string | null): number {
@@ -3846,6 +4040,7 @@ async function applyLookupIfRequested(
     conversationTurns: readonly ConversationTurn[];
     otherGroupsSummary: string;
     batchMessage: string;
+    cacheRoute: string;
     startedAt: number;
     isAdminBatch: boolean;
     jsonSchema: Record<string, unknown>;
@@ -3921,9 +4116,14 @@ async function applyLookupIfRequested(
   let secondReply: string;
   try {
     secondReply = await ctx.client.generateText({
+      purpose: "reply-search-reask",
       systemPrompt: prepared.systemPrompt,
       messages: prepared.messages,
       jsonSchema: ctx.jsonSchema,
+      // Same route as the first pass: the search results ride in the volatile
+      // tail, so the cached prefix is meant to be byte-identical to it.
+      cacheRoute: ctx.cacheRoute,
+      expectRebuild: prepared.usedCompression,
     });
   } catch (error) {
     pushMonitorEntry("error", "Search Re-ask Failed", error instanceof Error ? error.message : String(error));
@@ -4176,9 +4376,14 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       : preparedRequest.messages;
     try {
       reply = await client.generateText({
+        purpose: "reply-decision",
         systemPrompt: preparedRequest.systemPrompt,
         messages: messagesForAttempt,
         jsonSchema: decisionSchema,
+        cacheRoute: replyCacheRoute(effectiveContext.groupId),
+        // Compression rewrote this group's timeline on purpose; the prefix it
+        // replaces is expected to be dead.
+        expectRebuild: preparedRequest.usedCompression,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
@@ -4193,7 +4398,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       return;
     }
 
-    broadcastLatestLlmUsage(client, "reply-decision");
+    broadcastLatestLlmUsage(client);
 
     // "查一下再答": if the model asked to look something up, search and re-ask.
     reply = await applyLookupIfRequested(reply, {
@@ -4202,6 +4407,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       conversationTurns,
       otherGroupsSummary,
       batchMessage,
+      cacheRoute: replyCacheRoute(effectiveContext.groupId),
       startedAt,
       isAdminBatch,
       jsonSchema: decisionSchema,
@@ -4270,10 +4476,14 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     decision,
     decisionModel: client.model,
     responseModel: responseClient.model,
-    generateFinalAnswer: (input) => responseClient.generateText(input),
+    generateFinalAnswer: (input) => responseClient.generateText({
+      ...input,
+      purpose: "reply-response",
+      cacheRoute: FINAL_REPLY_CACHE_ROUTE,
+    }),
   });
   if (decision.shouldReply && decision.finalAnswer && client.model !== responseClient.model) {
-    broadcastLatestLlmUsage(responseClient, "reply-response");
+    broadcastLatestLlmUsage(responseClient);
   }
   if (routedReply.usedFallback) {
     pushMonitorEntry(
@@ -4363,11 +4573,11 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
 }
 
 function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
-  modelQueue = modelQueue
-    .catch(() => {
-      // Keep the queue alive after a previous failure.
-    })
-    .then(() => forwardUnreadMessagesToModel(messages))
+  // Every message in a batch was queued under the same group key (see
+  // queueUnreadMessageForModel), so the first is representative of them all.
+  const groupKey = messages[0]?.context.groupId ?? null;
+  void modelRouteQueue
+    .submit(replyCacheRoute(groupKey), () => forwardUnreadMessagesToModel(messages))
     .catch(async (error) => {
       // forwardUnreadMessagesToModel handles model/parse failures internally (it
       // retries in place, then drops). Anything reaching here is an unexpected
@@ -4413,9 +4623,11 @@ async function warmGroupContext(groupKey: string): Promise<void> {
   await client.warmContext({
     systemPrompt: prepared.systemPrompt,
     messages: prepared.messages,
+    cacheRoute: replyCacheRoute(groupKey),
+    expectRebuild: prepared.usedCompression,
   });
 
-  broadcastLatestLlmUsage(client, "context-warm");
+  broadcastLatestLlmUsage(client);
 
   pushMonitorEntry(
     "status",
@@ -4426,33 +4638,9 @@ async function warmGroupContext(groupKey: string): Promise<void> {
 
 // Single-group focus means each group carries its own cache-stable prefix (see
 // buildFocusedConversationTurns), so warming is per-group too: dirtyGroupKeys
-// tracks which groups' histories grew since the last warm pass.
-async function warmDirtyGroupContexts(): Promise<void> {
-  if (dirtyGroupKeys.size === 0) {
-    return;
-  }
-
-  const groupKeys = [...dirtyGroupKeys];
-  for (const groupKey of groupKeys) {
-    // Clear before awaiting so messages arriving during this group's warm call
-    // re-arm it for the next pass instead of being silently swallowed.
-    dirtyGroupKeys.delete(groupKey);
-    try {
-      await warmGroupContext(groupKey);
-    } catch (error) {
-      // The warm never landed, so this group's cache is exactly as stale as it
-      // was before the pass. Re-arm it instead of waiting for new traffic to
-      // mark it dirty again — otherwise one failed warm (an expired token, a
-      // rate-limit pause) silently parks a quiet group until someone speaks.
-      dirtyGroupKeys.add(groupKey);
-      // One group's warm failure must not stop the rest of the batch from warming.
-      const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Context Warm Error", `group_id=${groupKey}\n${detail}`);
-      console.error(`Context warm failed for group ${groupKey}:`, error);
-    }
-  }
-}
-
+// tracks which groups' histories grew since the last warm pass. This only
+// drains the dirty set into L1 events — see dispatchContextWarmDue for what
+// actually runs a warm and for the re-arm-on-failure behaviour.
 function scheduleContextWarm(): void {
   // The warm cache only serves group replies; in read-only mode none happen,
   // so warming would burn tokens for nothing.
@@ -4460,19 +4648,31 @@ function scheduleContextWarm(): void {
     return;
   }
 
-  // Serialize on the model queue so warming never races a real reply; concurrent
-  // requests sharing a prefix would all miss the cache.
-  modelQueue = modelQueue
-    .catch(() => {
-      // Keep the queue alive after a previous failure.
-    })
-    .then(async () => {
-      await warmDirtyGroupContexts();
-    })
+  const groupKeys = [...dirtyGroupKeys];
+  for (const groupKey of groupKeys) {
+    // Clear before dispatch so messages arriving during this group's warm call
+    // re-arm it for the next pass instead of being silently swallowed.
+    dirtyGroupKeys.delete(groupKey);
+    agentEvents.push({ type: "context_warm_due", groupKey });
+  }
+}
+
+// Runs one group's warm, on that group's reply route — so it never races a
+// real reply for the same group (concurrent requests sharing a prefix would
+// all miss the cache), while a different group's warm/reply now runs
+// concurrently instead of queuing behind it.
+function dispatchContextWarmDue(groupKey: string): void {
+  void modelRouteQueue
+    .submit(replyCacheRoute(groupKey), () => warmGroupContext(groupKey))
     .catch((error) => {
+      // The warm never landed, so this group's cache is exactly as stale as it
+      // was before the pass. Re-arm it instead of waiting for new traffic to
+      // mark it dirty again — otherwise one failed warm (an expired token, a
+      // rate-limit pause) silently parks a quiet group until someone speaks.
+      dirtyGroupKeys.add(groupKey);
       const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Context Warm Error", detail);
-      console.error("Context warm failed:", error);
+      pushMonitorEntry("error", "Context Warm Error", `group_id=${groupKey}\n${detail}`);
+      console.error(`Context warm failed for group ${groupKey}:`, error);
     });
 }
 
@@ -4976,41 +5176,53 @@ function compactReflectionText(text: string, maxChars: number): string {
   return `${normalized.slice(0, Math.max(0, maxChars - 3)).trim()}...`;
 }
 
-function broadcastLatestLlmUsage(client: LlmClient, purpose?: LlmCallPurpose): void {
+function broadcastLatestLlmUsage(client: LlmClient): void {
   broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
   const callTokens = client.consumeTokenUsage();
-  if (callTokens) {
-    recordTokenUsage(callTokens);
-    broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-    pushPromptCacheEntry(callTokens, purpose);
+  if (!callTokens) {
+    return;
+  }
+
+  // Classify once, then let every consumer (ledger, series, monitor entry) read
+  // the same verdict: a call cannot be a miss in one place and uncacheable in
+  // another.
+  const summary = summarizePromptCacheCall(callTokens, callTokens.model);
+  recordTokenUsage(callTokens, summary?.belowMinimum ?? false);
+  broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+  if (summary) {
+    recordPromptCacheSample(callTokens, summary);
+    pushPromptCacheEntry(callTokens, summary);
   }
 }
 
 // The daily totals say how many tokens were written to and read from the prompt
 // cache, but not which calls did which — and "is warming worth it" is exactly
 // that question: a warm call that writes 55k tokens only pays off if the reply
-// that follows reads them back.
-type LlmCallPurpose = "reply-decision" | "reply-response" | "context-warm";
-
-function pushPromptCacheEntry(usage: CallTokenUsage, purpose?: LlmCallPurpose): void {
-  const summary = summarizePromptCacheCall(usage);
-  // No breakdown reported (non-Anthropic providers, or a response shape without
-  // the cache fields) — stay silent rather than log a 0% hit that never happened.
-  if (!summary) {
-    return;
+// that follows reads them back. The purpose comes from the request itself (see
+// LlmCallPurpose), so it cannot drift from the call that earned the numbers.
+// A call whose whole request was shorter than the model's minimum cacheable
+// prefix reports no percentage at all. 0% would read as "the prefix broke" and
+// send someone hunting for drift that does not exist; the fix for these routes
+// is length or model choice, not prefix hygiene.
+function pushPromptCacheEntry(usage: CallTokenUsage, summary: PromptCacheCallSummary): void {
+  const count = (value: number) => value.toLocaleString("en-US");
+  const title = summary.belowMinimum
+    ? `Prompt Cache - n/a (< ${count(summary.minimumPrefixTokens ?? 0)} min)`
+    : `Prompt Cache - ${Math.round((summary.hitRate ?? 0) * 100)}% hit`;
+  const lines = [
+    `purpose=${usage.purpose}`,
+    `cache_read=${count(summary.cacheReadInputTokens)} cache_write=${count(summary.cacheCreationInputTokens)} uncached=${count(summary.uncachedInputTokens)}`,
+    `input=${count(usage.inputTokens)} output=${count(usage.outputTokens)}`,
+  ];
+  if (summary.belowMinimum) {
+    lines.push(
+      `This request (${count(summary.accountedInputTokens)} tokens) is below ${usage.model}'s `
+      + `${count(summary.minimumPrefixTokens ?? 0)}-token minimum cacheable prefix, so no cache entry `
+      + "could exist. Excluded from the hit rate.",
+    );
   }
 
-  const count = (value: number) => value.toLocaleString("en-US");
-  pushMonitorEntry(
-    "status",
-    `Prompt Cache - ${Math.round(summary.hitRate * 100)}% hit`,
-    [
-      purpose ? `purpose=${purpose}` : null,
-      `cache_read=${count(summary.cacheReadInputTokens)} cache_write=${count(summary.cacheCreationInputTokens)} uncached=${count(summary.uncachedInputTokens)}`,
-      `input=${count(usage.inputTokens)} output=${count(usage.outputTokens)}`,
-    ].filter((line): line is string => line !== null).join("\n"),
-    usage.model,
-  );
+  pushMonitorEntry("status", title, lines.join("\n"), usage.model);
 }
 
 // Keeps line breaks (collapsing blank lines) so multi-item broadcasts — one
@@ -5155,12 +5367,14 @@ async function translateWorldObservationForBroadcast(
     let reply: string;
     try {
       reply = await client.generateText({
+        purpose: "world-observation-broadcast",
         systemPrompt: WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
         messages: [{
           role: "user",
           content: buildWorldObservationBroadcastPrompt(topic, attemptObservation, attemptCandidates),
         }],
         jsonSchema: buildWorldObservationBroadcastSchema(attemptUrls),
+        cacheRoute: "world-observation-broadcast",
       });
     } catch (error) {
       pushMonitorEntry(
@@ -5651,9 +5865,11 @@ async function reflectMemoryForAutonomy(
   let reply: string;
   try {
     reply = await client.generateText({
+      purpose: "memory-reflection",
       systemPrompt: MEMORY_REFLECTION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
+      cacheRoute: "memory-reflection",
     });
   } catch (error) {
     pushMonitorEntry("error", "Autonomy Reflection Model Error", error instanceof Error ? error.message : String(error));
@@ -5759,9 +5975,11 @@ async function requestBootOrientation(
 
   try {
     const reply = await client.generateText({
+      purpose: "boot-orientation",
       systemPrompt: BOOT_ORIENTATION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: BOOT_ORIENTATION_JSON_SCHEMA,
+      cacheRoute: "boot-orientation",
     });
     recordBootstrapLlmUsage(client);
     return parseBootOrientation(reply);
@@ -5861,9 +6079,11 @@ async function requestQqModeDecision(
 
   try {
     const reply = await client.generateText({
+      purpose: "qq-mode-decision",
       systemPrompt: QQ_MODE_DECISION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: QQ_MODE_DECISION_JSON_SCHEMA,
+      cacheRoute: "qq-mode-decision",
     });
     recordBootstrapLlmUsage(client);
     return parseQqModeDecision(reply, hollyBootstrapConfig, { readOnly: readOnlyMode })
@@ -5887,14 +6107,16 @@ function scheduleQqModeReconsideration(delayMs: number): void {
 
   qqModeReconsiderTimer = setTimeout(() => {
     qqModeReconsiderTimer = null;
-    modelQueue = modelQueue
-      .catch(() => undefined)
-      .then(async () => {
+    // Own fixed route (matches the "qq-mode-decision" cacheRoute its LLM call
+    // already uses): never shares a route with any group's reply/warm work,
+    // so it neither waits on nor blocks them.
+    void modelRouteQueue
+      .submit("qq-mode-decision", async () => {
         const material = await buildHollyBootstrapMaterial();
         const decision = await requestQqModeDecision("scheduled reconsideration", material);
         await applyQqModeDecision(decision);
       })
-      .catch((error) => {
+      .catch((error: unknown) => {
         pushMonitorEntry(
           "error",
           "QQ Mode Reconsideration Failed",
@@ -6166,9 +6388,11 @@ async function composeArchiveForAutonomy(
   let reply: string;
   try {
     reply = await client.generateText({
+      purpose: "archive-composition",
       systemPrompt: ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
       messages: [{ role: "user", content: prompt }],
       jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,
+      cacheRoute: "archive-composition",
     });
   } catch (error) {
     pushMonitorEntry("error", "Autonomy Archive Model Error", error instanceof Error ? error.message : String(error));
@@ -6265,9 +6489,14 @@ async function evaluateProactiveRevival(
   let reply: string;
   try {
     reply = await client.generateText({
+      purpose: "proactive-decision",
       systemPrompt: prepared.systemPrompt,
       messages: prepared.messages,
       jsonSchema: MODEL_DECISION_JSON_SCHEMA,
+      // Deliberately the reply route: a proactive turn is meant to read back
+      // the very entry the reactive path warmed for this group.
+      cacheRoute: replyCacheRoute(request.groupKey),
+      expectRebuild: prepared.usedCompression,
     });
   } catch (error) {
     pushMonitorEntry("error", "Proactive Model Error", error instanceof Error ? error.message : String(error));
@@ -6286,7 +6515,11 @@ async function evaluateProactiveRevival(
         decision,
         decisionModel: client.model,
         responseModel: responseClient.model,
-        generateFinalAnswer: (input) => responseClient.generateText(input),
+        generateFinalAnswer: (input) => responseClient.generateText({
+          ...input,
+          purpose: "proactive-response",
+          cacheRoute: FINAL_REPLY_CACHE_ROUTE,
+        }),
       });
       if (decision.shouldReply && decision.finalAnswer && client.model !== responseClient.model) {
         broadcastLatestLlmUsage(responseClient);
@@ -6363,32 +6596,30 @@ function emptyProactiveResult(): ProactiveTickResult {
   return { actions: [] };
 }
 
-// Only the group-message action enters modelQueue. Browser world observation is
-// driven by autonomyQueue so a slow page load cannot block reactive replies.
+// A proactive tick doesn't know which groups it'll touch until it's already
+// iterating them (see runProactiveTick), so it can't submit on any one
+// group's reply route up front. submitExclusive waits out every route
+// already queued on modelRouteQueue (a real reply mid-flight for some group),
+// then holds the gate so no new reply/warm work can start until this tick is
+// done — matching the guarantee this function has always provided: a
+// proactive send never races a reactive reply for any group. Browser world
+// observation is a separate autonomy branch that never reaches this queue
+// (see buildAutonomyDeps), so a slow page load still can't block a reply.
 function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
   if (!isQqParticipationEnabled()) return Promise.resolve(emptyProactiveResult());
   const deps = buildProactiveDeps();
   if (!deps || !deps.config.enabled) return Promise.resolve(emptyProactiveResult());
 
-  const run = modelQueue
-    .catch(() => {
-      // Keep the queue alive after a previous failure.
-    })
-    .then(async () => {
-      try {
-        return await runProactiveTick(deps);
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        pushMonitorEntry("error", "Proactive Tick Error", detail);
-        console.error("Proactive tick failed:", error);
-        return emptyProactiveResult();
-      }
-    });
-  modelQueue = run.then(
-    () => undefined,
-    () => undefined,
-  );
-  return run;
+  return modelRouteQueue.submitExclusive(async () => {
+    try {
+      return await runProactiveTick(deps);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Proactive Tick Error", detail);
+      console.error("Proactive tick failed:", error);
+      return emptyProactiveResult();
+    }
+  });
 }
 
 function buildAutonomyDeps() {
@@ -6412,14 +6643,26 @@ function buildAutonomyDeps() {
   };
 }
 
+// Timer body: only pushes the event. Deciding what's due (world observation /
+// memory reflection / archive writing / proactive speaking, in that fixed
+// priority order) and running it stays entirely inside runAutonomyLoop,
+// unchanged — see dispatchAutonomyTickDue for where that decision actually runs.
 function scheduleAutonomyTick(): void {
+  agentEvents.push({ type: "autonomy_tick_due" });
+}
+
+// Runs on its own queue, not modelRouteQueue: a tick's proactive branch calls
+// modelRouteQueue.submitExclusive from inside runAutonomyLoop, which is the
+// task this call submits — nesting that on the same instance would make
+// submitExclusive wait on its own not-yet-settled tail (see the
+// autonomyTickQueue declaration for the full reasoning). This route ("tick")
+// still guarantees what autonomyQueue used to: tick i+1 never starts running
+// until tick i has fully finished.
+function dispatchAutonomyTickDue(): void {
   const deps = buildAutonomyDeps();
   if (!deps) return;
-  autonomyQueue = autonomyQueue
-    .catch(() => {
-      // Keep the autonomy queue alive after a previous failure.
-    })
-    .then(async () => {
+  void autonomyTickQueue
+    .submit("tick", async () => {
       const startedAt = Date.now();
       try {
         const result = await runAutonomyLoop(deps);
@@ -6546,14 +6789,34 @@ function flushUnreadMessagesToModel(): void {
     return;
   }
 
-  // Drain the whole queue: every group's pending messages are handed to the model
-  // exactly once. Failures are retried in place inside the batch, never re-queued,
-  // so a batch taken here never comes back to be re-judged in a later flush.
+  // Push one event per group with something pending; dispatchAgentEvent reads
+  // and clears unreadModelMessagesByGroup at dispatch time (flushUnreadGroupToModel,
+  // unchanged), so every group's pending messages are still handed to the
+  // model exactly once, never re-queued on failure.
   const groupKeys = Array.from(unreadModelMessagesByGroup.keys());
   for (const groupKey of groupKeys) {
-    flushUnreadGroupToModel(groupKey);
+    agentEvents.push({ type: "message_batch_ready", groupKey });
   }
 }
+
+// L2: the single place a dispatched event decides how it becomes a
+// (route-serialized) model call. Every trigger in the process — the 60s
+// unread-batch timer, the 20min context-warm timer, the forced-admin
+// immediate-reply path, the 60s autonomy timer — funnels through here.
+function dispatchAgentEvent(event: AgentEvent): void {
+  switch (event.type) {
+    case "message_batch_ready":
+      flushUnreadGroupToModel(event.groupKey);
+      break;
+    case "context_warm_due":
+      dispatchContextWarmDue(event.groupKey);
+      break;
+    case "autonomy_tick_due":
+      dispatchAutonomyTickDue();
+      break;
+  }
+}
+agentEvents.onEvent(dispatchAgentEvent);
 
 function handleMonitorStream(req: IncomingMessage, res: ServerResponse): void {
   res.writeHead(200, {
@@ -6863,7 +7126,9 @@ function connectWebSocketClient(forceReconnect = false): void {
       && adminPolicyConfig.immediateReply
       && unreadCount !== null
     ) {
-      if (conversationId) flushUnreadGroupToModel(conversationId);
+      // agentEvents dispatches synchronously, so this reaches
+      // flushUnreadGroupToModel just as immediately as calling it directly did.
+      if (conversationId) agentEvents.push({ type: "message_batch_ready", groupKey: conversationId });
     }
   });
 
@@ -7021,6 +7286,16 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .usage-table td { text-align: right; padding: 4px 6px; font-variant-numeric: tabular-nums; color: var(--ink); border-bottom: 1px solid rgba(226,232,240,0.5); }
     .usage-table td:first-child { text-align: left; font-family: Consolas,monospace; color: var(--muted); word-break: break-all; }
     .usage-table tr:last-child td { border-bottom: 0; }
+    .cache-bars { display: flex; align-items: flex-end; gap: 2px; height: 90px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,0.7); overflow-x: auto; }
+    .cache-bar { flex: 1 0 4px; min-width: 4px; display: flex; align-items: flex-end; height: 100%; border-radius: 2px; background: rgba(226,232,240,0.55); }
+    .cache-bar i { display: block; width: 100%; border-radius: 2px; background: var(--accent); }
+    .cache-bar.idle { background: repeating-linear-gradient(45deg, rgba(226,232,240,0.5) 0 3px, transparent 3px 6px); }
+    .cache-axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .cache-heads { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .cache-head { flex: 1 1 150px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: rgba(255,255,255,0.72); }
+    .cache-head span { display: block; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
+    .cache-head b { font-size: 19px; color: var(--ink); font-variant-numeric: tabular-nums; }
+    .cache-head small { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); }
     .reflect-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
     .reflect-stat { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(255,255,255,0.72); }
     .reflect-stat-label { display: block; margin-bottom: 5px; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
@@ -7585,6 +7860,66 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Usage -->
     <div v-else-if="tab === 'usage'">
       <div class="ph">
+        <div class="ph-eye">Cache</div>
+        <div class="ph-title">Prompt Cache 命中率</div>
+        <div class="ph-desc">命中率 = 缓存读取 ÷ (读取 + 写入 + 未命中)，由后端统一派生。低于模型最小可缓存长度的请求不进分母，单独计入 Too short。</div>
+      </div>
+      <div class="panel" style="margin-bottom:16px;">
+        <div class="ph2">
+          <span class="ph2-title">Hit Rate &middot; 最近 {{ cacheHours.length }} 小时</span>
+          <button class="sec sm" @click="loadPromptCache">Refresh</button>
+        </div>
+        <div class="pb">
+          <div v-if="!cacheHours.length" class="empty">No prompt cache samples yet.</div>
+          <template v-else>
+            <div class="cache-heads">
+              <div class="cache-head">
+                <span>Window hit rate</span>
+                <b>{{ fmtPct(cacheWindowHitRate) }}</b>
+                <small>{{ fmtNum(cacheWindowCalls) }} calls</small>
+              </div>
+              <div class="cache-head">
+                <span>Latest hour</span>
+                <b>{{ fmtPct(cacheLatestHitRate) }}</b>
+                <small>{{ cacheHours.length ? cacheHours[cacheHours.length - 1].bucket : '' }}</small>
+              </div>
+              <div class="cache-head">
+                <span>Uncacheable</span>
+                <b>{{ fmtNum(cacheWindowUncacheable) }}</b>
+                <small>tokens below the model minimum</small>
+              </div>
+            </div>
+            <div class="cache-bars">
+              <div v-for="h in cacheHours" :key="h.bucket"
+                   class="cache-bar" :class="{ idle: h.hitRate === null }"
+                   :title="h.bucket + ' &middot; ' + (h.hitRate === null ? 'no cache-eligible input' : Math.round(h.hitRate * 100) + '% hit') + ' &middot; ' + fmtNum(h.inputTokens) + ' input tokens'">
+                <i :style="{ height: (h.hitRate === null ? 0 : Math.max(2, h.hitRate * 100)) + '%' }"></i>
+              </div>
+            </div>
+            <div class="cache-axis">
+              <span>{{ cacheHours[0].bucket }}</span>
+              <span>{{ cacheHours[cacheHours.length - 1].bucket }}</span>
+            </div>
+            <table class="usage-table" style="margin-top:14px;" v-if="cachePurposes.length">
+              <thead>
+                <tr><th>Purpose &middot; {{ cacheDate }}</th><th>Read</th><th>Write</th><th>Miss</th><th>Too short</th><th>Calls</th><th>Hit</th></tr>
+              </thead>
+              <tbody>
+                <tr v-for="p in cachePurposes" :key="p.purpose">
+                  <td>{{ p.purpose }}</td>
+                  <td>{{ fmtNum(p.cacheReadInputTokens) }}</td>
+                  <td>{{ fmtNum(p.cacheCreationInputTokens) }}</td>
+                  <td>{{ fmtNum(p.uncachedInputTokens) }}</td>
+                  <td>{{ fmtNum(p.uncacheableInputTokens) }}</td>
+                  <td>{{ fmtNum(p.calls) }}</td>
+                  <td>{{ fmtPct(p.hitRate) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </template>
+        </div>
+      </div>
+      <div class="ph">
         <div class="ph-eye">Token</div>
         <div class="ph-title">每日 Token 用量</div>
         <div class="ph-desc">按日期与模型拆分普通输入、缓存写入、缓存读取及输出；历史聚合输入保留为 Unknown。</div>
@@ -7608,7 +7943,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
               </div>
               <table class="usage-table">
                 <thead>
-                  <tr><th>Model</th><th>Uncached</th><th>Cache write</th><th>Cache read</th><th>Unknown</th><th>Output</th><th>Total</th></tr>
+                  <tr><th>Model</th><th>Uncached</th><th>Cache write</th><th>Cache read</th><th>Too short</th><th>Unknown</th><th>Output</th><th>Total</th><th>Hit</th></tr>
                 </thead>
                 <tbody>
                   <tr v-for="m in day.models" :key="m.model">
@@ -7616,9 +7951,11 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
                     <td>{{ fmtNum(m.uncachedInputTokens) }}</td>
                     <td>{{ fmtNum(m.cacheCreationInputTokens) }}</td>
                     <td>{{ fmtNum(m.cacheReadInputTokens) }}</td>
+                    <td>{{ fmtNum(m.uncacheableInputTokens) }}</td>
                     <td>{{ fmtNum(m.unattributedInputTokens) }}</td>
                     <td>{{ fmtNum(m.outputTokens) }}</td>
                     <td>{{ fmtNum(m.totalTokens) }}</td>
+                    <td>{{ fmtPct(m.hitRate) }}</td>
                   </tr>
                 </tbody>
               </table>
@@ -7662,6 +7999,9 @@ createApp({
     var tokenStats = ref(null);
     var usageHistory = ref([]);
     var usageGrandTotal = ref(0);
+    var cacheHours = ref([]);
+    var cachePurposes = ref([]);
+    var cacheDate = ref('');
     var groupEntries = computed(function() {
       return entries.value.filter(function(e) {
         return e.kind === 'incoming' || e.kind === 'outgoing' || e.kind === 'assistant';
@@ -7866,7 +8206,7 @@ createApp({
       if (payload.type === 'status') { wsStatus.value = payload.status; return; }
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
       if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
-      if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); } return; }
+      if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); loadPromptCache(); } return; }
       if (payload.type === 'autonomy') { autonomySidebar.value = payload.autonomySidebar || null; return; }
       if (payload.type === 'archive') { applyArchiveWork(payload.work); return; }
       if (payload.type === 'mode') { readOnly.value = !!payload.readOnly; return; }
@@ -8063,7 +8403,7 @@ createApp({
       if (t === 'thoughts') { loadThoughts(); }
       if (t === 'memory') { loadMemories(); loadGroups(); }
       if (t === 'group') { loadGroups(); }
-      if (t === 'usage') { loadUsageHistory(); }
+      if (t === 'usage') { loadUsageHistory(); loadPromptCache(); }
       if (t === 'archive') { loadArchive(); }
     });
 
@@ -8072,11 +8412,53 @@ createApp({
       return n.toLocaleString('en-US');
     }
 
+    // null means "no cache-eligible input in this window", which is not 0%.
+    function fmtPct(rate) {
+      if (typeof rate !== 'number' || !isFinite(rate)) return '—';
+      return Math.round(rate * 100) + '%';
+    }
+
     function refreshUsage() {
       fetch('/api/usage/refresh', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
         if (d.claudeUsage) { claudeUsage.value = d.claudeUsage; }
         if (d.tokenStats) { tokenStats.value = d.tokenStats; }
       }).catch(function() {});
+    }
+
+    // The window figure is re-derived from the window's own totals, never
+    // averaged from the per-hour percentages: an hour with 12 calls must not
+    // weigh the same as an hour with 400.
+    function sumCacheWindow() {
+      return cacheHours.value.reduce(function(acc, point) {
+        acc.read += point.cacheReadInputTokens || 0;
+        acc.write += point.cacheCreationInputTokens || 0;
+        acc.miss += point.uncachedInputTokens || 0;
+        acc.uncacheable += point.uncacheableInputTokens || 0;
+        acc.calls += point.calls || 0;
+        return acc;
+      }, { read: 0, write: 0, miss: 0, uncacheable: 0, calls: 0 });
+    }
+
+    var cacheWindowHitRate = computed(function() {
+      var totals = sumCacheWindow();
+      var eligible = totals.read + totals.write + totals.miss;
+      return eligible === 0 ? null : totals.read / eligible;
+    });
+    var cacheWindowCalls = computed(function() { return sumCacheWindow().calls; });
+    var cacheWindowUncacheable = computed(function() { return sumCacheWindow().uncacheable; });
+    var cacheLatestHitRate = computed(function() {
+      var last = cacheHours.value[cacheHours.value.length - 1];
+      return last ? last.hitRate : null;
+    });
+
+    function loadPromptCache() {
+      fetch('/api/usage/cache?hours=48').then(function(r) {
+        return r.json().then(function(d) {
+          cacheHours.value = d.hours || [];
+          cachePurposes.value = d.purposes || [];
+          cacheDate.value = d.date || '';
+        });
+      }).catch(function() { cacheHours.value = []; cachePurposes.value = []; });
     }
 
     function loadUsageHistory() {
@@ -8103,6 +8485,9 @@ createApp({
       entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
       thoughts, thoughtKindFilter, filteredThoughts,
       usageHistory, usageGrandTotal,
+      cacheHours, cachePurposes, cacheDate,
+      cacheWindowHitRate, cacheWindowCalls, cacheWindowUncacheable, cacheLatestHitRate,
+      fmtPct, loadPromptCache,
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       autonomySidebar, reflectMemories, reflectWorldObservations,
@@ -8124,6 +8509,7 @@ createApp({
 async function bootstrap(): Promise<void> {
   await applyProxyConfig(CONFIG_PATH);
   await loadTokenStats();
+  await loadPromptCacheStats();
   const requestedProfile = process.env.LLM_PROFILE?.trim() || undefined;
   const profileCatalog = await listLlmProfiles(CONFIG_PATH);
   const requestedDecisionProfile = process.env.LLM_DECISION_PROFILE?.trim() || profileCatalog.decision;
@@ -8394,6 +8780,13 @@ async function bootstrap(): Promise<void> {
           }
         }
         sendJson(res, 200, { claudeUsage: usage, tokenStats: getTodayTokenStats() });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/usage/cache") {
+        const hoursParam = Number(url.searchParams.get("hours") || "48");
+        const hours = Number.isFinite(hoursParam) ? Math.floor(hoursParam) : 48;
+        sendJson(res, 200, getPromptCacheReport(hours));
         return;
       }
 

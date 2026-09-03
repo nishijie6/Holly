@@ -152,6 +152,8 @@ async function main(): Promise<void> {
     let raw: string;
     try {
       raw = await client.generateText({
+        purpose: "eval-script",
+        cacheRoute: "eval-script",
         systemPrompt: client.systemPrompt,
         messages,
         jsonSchema: DECISION_SCHEMA,

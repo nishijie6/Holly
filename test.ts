@@ -13,6 +13,8 @@ async function main(): Promise<void> {
   const requestedProfile = process.argv[2]?.trim() || process.env.LLM_PROFILE?.trim();
   const client = await createLlmClient(CONFIG_PATH, requestedProfile);
   const message = await client.generateText({
+    purpose: "eval-script",
+    cacheRoute: "eval-script",
     messages: [
       { role: "user", content: "你是谁？" },
     ],

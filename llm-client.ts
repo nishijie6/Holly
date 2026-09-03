@@ -8,7 +8,13 @@ import path from "node:path";
 import YAML from "yaml";
 
 import { LlmHttpError, ProviderRateLimitGate } from "./connection-watchdog.js";
-import { TokenUsageQueue, type TokenUsageBreakdown } from "./token-usage.js";
+import { TokenUsageQueue, type LlmCallPurpose, type TokenUsageBreakdown } from "./token-usage.js";
+import {
+  CachePrefixTracker,
+  buildCachePrefixDigest,
+  type CachePrefixDigest,
+  type CachePrefixInspection,
+} from "./cache-prefix.js";
 
 export type LlmMessageRole = "system" | "user" | "assistant";
 
@@ -58,18 +64,46 @@ export type LlmClient = {
   systemPrompt: string;
   displayName: string;
   consumeTokenUsage(): import("./token-usage.js").CallTokenUsage | null;
+  // purpose is required so a new call site cannot land unattributed: it is what
+  // the token ledger and the per-call prompt-cache entry are keyed by.
+  //
+  // cacheRoute is required for the same reason, one level down: it names the
+  // prompt-cache lineage this request expects to hit, and every call is
+  // inspected against the last request on that route (see cache-prefix.ts). A
+  // call site that puts volatile text in the cached prefix is reported on its
+  // next request instead of quietly costing a full re-read forever. Requests
+  // meant to hit different cache entries (per group, per prompt shape) must
+  // pass different routes.
   generateText(input: {
     messages: LlmMessage[];
     systemPrompt?: string;
     jsonSchema?: Record<string, unknown>;
+    purpose: LlmCallPurpose;
+    cacheRoute: string;
+    // Set when the caller knowingly rebuilt the prefix (context compression
+    // dropping or rewriting old turns). The rebuild is still reported, just not
+    // as a defect.
+    expectRebuild?: boolean;
   }): Promise<string>;
   // Re-send the context with max_tokens=1 purely to refresh the prompt cache.
-  // No-op for non-Claude providers (Anthropic-cache-specific).
+  // No-op for non-Claude providers (Anthropic-cache-specific). Always recorded
+  // as "context-warm" — the method is the purpose.
   warmContext(input: {
     messages: LlmMessage[];
     systemPrompt?: string;
+    cacheRoute: string;
+    expectRebuild?: boolean;
   }): Promise<void>;
 };
+
+// Reported for every Claude request, including the ones that behaved. main.ts
+// decides what is worth showing; the client's job is that nothing goes
+// unmeasured.
+export type CachePrefixObserver = (event: CachePrefixInspection & {
+  model: string;
+  purpose: LlmCallPurpose;
+  expectRebuild: boolean;
+}) => void;
 
 export type LlmProfileSummary = {
   name: string;
@@ -150,6 +184,46 @@ type ClaudeRequestOptions = {
   cacheStablePrefix?: boolean;
   volatileTailMessages?: number;
 };
+
+// The cached prefix as the API will actually see it: everything from the start
+// of the request up to and including the last cache_control breakpoint. Reading
+// it off the built body (rather than off the caller's messages) means the
+// digest covers exactly what gets hashed on the other side, including the empty
+// blocks buildClaudeMessages drops and the assistant tail it trims.
+export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
+  const systemTexts: string[] = [];
+  const system = Array.isArray(body.system) ? body.system : [];
+  for (const block of system) {
+    if (!block || typeof block !== "object") continue;
+    const record = block as Record<string, unknown>;
+    systemTexts.push(typeof record.text === "string" ? record.text : "");
+    if (record.cache_control) break;
+  }
+
+  const blockTexts: string[] = [];
+  const pending: string[] = [];
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  outer: for (const message of messages) {
+    if (!message || typeof message !== "object") continue;
+    const record = message as Record<string, unknown>;
+    const role = typeof record.role === "string" ? record.role : "user";
+    const content = Array.isArray(record.content) ? record.content : [];
+    for (const block of content) {
+      if (!block || typeof block !== "object") continue;
+      const inner = block as Record<string, unknown>;
+      pending.push(`${role}:${typeof inner.text === "string" ? inner.text : ""}`);
+      if (inner.cache_control) {
+        // Everything buffered so far is inside the breakpoint; anything after
+        // it is the volatile tail and deliberately not part of the identity.
+        blockTexts.push(...pending);
+        pending.length = 0;
+        break outer;
+      }
+    }
+  }
+
+  return buildCachePrefixDigest(systemTexts, blockTexts);
+}
 
 function isFetchFailedError(error: unknown): boolean {
   return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
@@ -1021,10 +1095,14 @@ async function requestClaudeText(
   messages: LlmMessage[],
   options: ClaudeRequestOptions = {},
   recordUsage: (usage: TokenUsageBreakdown) => void,
+  inspectBody: (body: Record<string, unknown>) => void = () => {},
 ): Promise<string> {
   const rateLimitRevision = claudeRateLimitGate.beginRequest();
   let creds = await getClaudeCredentials();
   const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
+  // Before the wire, and before any retry: the prefix is a property of the
+  // request we built, not of whether it happened to succeed.
+  inspectBody(body);
   let fetchAttempts = 0;
 
   let authAttempt = 0;
@@ -1234,10 +1312,34 @@ export async function setActiveLlmProfile(configPath: string, profileName: strin
   await saveConfig(configPath, config);
 }
 
-export async function createLlmClient(configPath: string, requestedProfileName?: string): Promise<LlmClient> {
+export async function createLlmClient(
+  configPath: string,
+  requestedProfileName?: string,
+  options: { cachePrefixObserver?: CachePrefixObserver } = {},
+): Promise<LlmClient> {
   const profile = await resolveLlmProfile(configPath, requestedProfileName);
   const usageQueue = new TokenUsageQueue(profile.model);
-  const recordUsage = (usage: TokenUsageBreakdown): void => usageQueue.record(usage);
+  // Bound per call rather than once per client: the purpose belongs to the
+  // request that produced the usage, and concurrent calls must not share it.
+  const recordUsageFor = (purpose: LlmCallPurpose) => (usage: TokenUsageBreakdown): void =>
+    usageQueue.record(usage, purpose);
+
+  // Per client, so two profiles pointed at different models never compare
+  // prefixes with each other: a cache entry belongs to one model.
+  const prefixTracker = new CachePrefixTracker();
+  const inspectPrefixFor = (
+    purpose: LlmCallPurpose,
+    cacheRoute: string,
+    expectRebuild: boolean,
+  ) => (body: Record<string, unknown>): void => {
+    const observer = options.cachePrefixObserver;
+    if (!observer) return;
+    const inspection = prefixTracker.inspect(
+      `${profile.model}|${cacheRoute}`,
+      digestClaudeCachedPrefix(body),
+    );
+    observer({ ...inspection, model: profile.model, purpose, expectRebuild });
+  };
 
   return {
     profileName: profile.name,
@@ -1247,6 +1349,7 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
     displayName: `${profile.name} (${profile.model})`,
     consumeTokenUsage: () => usageQueue.consume(),
     async generateText(input): Promise<string> {
+      const recordUsage = recordUsageFor(input.purpose);
       const { systemPrompt, contents } = splitSystemPrompt(
         input.messages,
         input.systemPrompt ?? profile.systemPrompt,
@@ -1265,15 +1368,20 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
             volatileTailMessages: 1,
           },
           recordUsage,
+          inspectPrefixFor(input.purpose, input.cacheRoute, input.expectRebuild ?? false),
         );
       }
 
+      // Codex caches on prompt_cache_key + its own prefix rules and reports no
+      // breakpoint to digest, so there is nothing to inspect there.
       return requestCodexText(profile.model, systemPrompt, contents, recordUsage);
     },
     async warmContext(input): Promise<void> {
       if (profile.provider !== "claude") {
         return;
       }
+
+      const recordUsage = recordUsageFor("context-warm");
 
       const { systemPrompt, contents } = splitSystemPrompt(
         input.messages,
@@ -1292,6 +1400,7 @@ export async function createLlmClient(configPath: string, requestedProfileName?:
         warm.messages,
         warm.options,
         recordUsage,
+        inspectPrefixFor("context-warm", input.cacheRoute, input.expectRebuild ?? false),
       );
     },
   };
