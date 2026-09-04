@@ -17,6 +17,7 @@ import {
   type ClaudeUsage,
   type LlmClient,
   type LlmMessage,
+  type LlmToolUseBlock,
 } from "./llm-client.js";
 import {
   ConnectionWatchdog,
@@ -126,6 +127,12 @@ import {
   allocateVariableContextBudgets,
   modelContextWindowTokens,
 } from "./context-budget.js";
+import { shouldWarmReplyRoute } from "./context-warm-policy.js";
+import { ConversationLedger } from "./conversation-ledger.js";
+import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
+import { decideFocus } from "./focus-policy.js";
+import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
+import { QQ_TOOL_DEFINITIONS, createQqToolRunner, type ConversationSummary } from "./qq-tools.js";
 import {
   ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
   AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
@@ -182,6 +189,7 @@ import {
   DEFAULT_PRIVATE_CHAT_CONFIG,
   extractFriendUserIds,
   formatConversationKey,
+  isPrivateConversationKey,
   normalizeOneBotUserId,
   parsePrivateChatConfig,
   type PrivateChatConfig,
@@ -497,6 +505,13 @@ const MODEL_DECISION_RETRY_DELAY_MS = 2000;
 // Re-send dirty per-conversation history with max_tokens=0 on this cadence so
 // the high-frequency decision model gets a stable 1h prompt-cache prefix.
 const CONTEXT_WARM_INTERVAL_MS = 20 * 60 * 1000;
+// A warm is only worth its write premium if something reads the entry before it
+// expires. At the 1h TTL a cache write costs 2x base input and a read 0.1x, so a
+// warm nothing consumes is pure loss — and a group that receives messages is not
+// the same thing as a group Holly answers. Warm only groups whose reply route was
+// actually read inside the TTL window; the rest go cold until they get a real
+// decision again. See markReplyRouteRead / scheduleContextWarm.
+const CONTEXT_WARM_CONSUMER_WINDOW_MS = 60 * 60 * 1000;
 // How often the merged timeline is snapshotted to disk (when dirty). Hourly:
 // a clean shutdown flushes on SIGINT/SIGTERM regardless, and a crash loses at
 // most this window — today's group messages inside it come back through the
@@ -696,6 +711,10 @@ let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // see buildFocusedConversationTurns / scheduleContextWarm / dispatchContextWarmDue).
 // Quiet groups stay out of this set so warming doesn't burn rate-limit budget on them.
 let dirtyGroupKeys = new Set<string>();
+// When each reply cache route was last read by a real decision (reply or
+// proactive). Keyed by route rather than group key so both sides go through
+// replyCacheRoute's private-chat normalization.
+let replyRouteLastReadAt = new Map<string, number>();
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
 let conversationHistoryBootstrapDayByGroup = new Map<string, string>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
@@ -708,6 +727,23 @@ let contextBudgetConfig: ContextBudgetConfig = {
   compressTargetTokens: DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS,
 };
 let privateChatConfig: PrivateChatConfig = { ...DEFAULT_PRIVATE_CHAT_CONFIG };
+let focusModeConfig: FocusModeConfig = { ...DEFAULT_FOCUS_MODE_CONFIG };
+// The focus pipeline's whole context. One lineage, so one cache route.
+const conversationLedger = new ConversationLedger({
+  // Fire-and-forget: LedgerStore serializes its own writes, so order holds, and
+  // a disk hiccup must not take down the turn that is already in memory.
+  onAppend: (message) => {
+    void ledgerStore?.append(message).catch((error: unknown) => {
+      pushMonitorEntry(
+        "error",
+        "Ledger Persist Failed",
+        `A turn is in memory but not on disk; a restart would lose it.\n${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
+  },
+});
+const FOCUS_LEDGER_CACHE_ROUTE = "focus-ledger";
+let ledgerStore: LedgerStore | null = null;
 let privateFriendUserIds = new Set<string>();
 let privateFriendCacheUpdatedAtMs = 0;
 let privateFriendRefreshPromise: Promise<Set<string>> | null = null;
@@ -994,6 +1030,18 @@ async function loadPrivateChatConfig(configPath: string): Promise<PrivateChatCon
     return parsePrivateChatConfig(parsed.private_chat, environmentBotUserId);
   } catch {
     return parsePrivateChatConfig(undefined, environmentBotUserId);
+  }
+}
+
+async function loadFocusModeConfig(configPath: string): Promise<FocusModeConfig> {
+  if (!existsSync(configPath)) {
+    return parseFocusModeConfig(undefined);
+  }
+  try {
+    const parsed = (YAML.parse(await readFile(configPath, "utf-8")) as Record<string, unknown> | null) ?? {};
+    return parseFocusModeConfig(parsed.focus_mode);
+  } catch {
+    return parseFocusModeConfig(undefined);
   }
 }
 
@@ -1484,6 +1532,23 @@ function watchLlmClient(client: LlmClient): LlmClient {
     generateText: async (input) => {
       try {
         const result = await client.generateText(input);
+        connectionWatchdog.recordSuccess();
+        return result;
+      } catch (error) {
+        if (!shouldCountTowardConnectionWatchdog(error)) {
+          connectionWatchdog.recordSuccess();
+        } else if (connectionWatchdog.recordFailure()) {
+          handleConnectionWatchdogStuck({ lastError: error });
+        }
+        throw error;
+      }
+    },
+    runToolLoop: async (input) => {
+      // Same watchdog treatment as the other two: a tool loop that keeps failing
+      // is exactly the "every call fails the same way" state the watchdog exists
+      // to turn into a restart instead of a silent stall.
+      try {
+        const result = await client.runToolLoop(input);
         connectionWatchdog.recordSuccess();
         return result;
       } catch (error) {
@@ -2956,6 +3021,13 @@ function replyCacheRoute(groupId: string | null): string {
   return `reply:${normalizeConversationGroupKey(groupId) ?? "private"}`;
 }
 
+// Called by the decisions that actually read a group's warmed prefix, so
+// scheduleContextWarm can tell a group worth warming from one that only
+// receives traffic.
+function markReplyRouteRead(groupId: string | null, now = Date.now()): void {
+  replyRouteLastReadAt.set(replyCacheRoute(groupId), now);
+}
+
 function parseReplyGroupId(groupId: string | null): number {
   const normalized = normalizeConversationGroupKey(groupId);
   const numeric = normalized ? Number(normalized) : Number.NaN;
@@ -4254,6 +4326,182 @@ async function sendAdminFailureReply(
   }
 }
 
+// --- focus pipeline --------------------------------------------------------
+// One ledger, one cache lineage, and the model moving its own attention. Runs
+// only when focus_mode.enabled is set; otherwise the per-group pipeline below is
+// untouched. See focus-mode-config.ts for why the choice is made in one place.
+
+function focusConversationId(): string | null {
+  const id = hollyStateStore?.getLifecycleState().currentConversationId.trim() ?? "";
+  return id || null;
+}
+
+function setFocusConversationId(id: string): void {
+  const lifecycle = hollyStateStore?.getLifecycleState();
+  if (!lifecycle) return;
+  lifecycle.currentConversationId = id;
+  lifecycle.currentConversationOpenedAt = Date.now();
+  void hollyStateStore?.save();
+}
+
+function renderConversationRecent(groupKey: string, limit: number): string[] | null {
+  const turns = conversationHistoryByGroup.get(groupKey);
+  if (!turns) return null;
+  return turns.slice(-limit).map((turn) => formatConversationTurnForModel(turn).content);
+}
+
+function listConversationSummaries(): ConversationSummary[] {
+  const summaries: ConversationSummary[] = [];
+  for (const [groupKey, turns] of conversationHistoryByGroup) {
+    const last = turns.at(-1) ?? null;
+    summaries.push({
+      id: groupKey,
+      name: formatConversationKey(groupKey),
+      unread: unreadModelMessagesByGroup.get(groupKey)?.length ?? 0,
+      lastMessage: last ? normalizeMessageContent(last.content).slice(0, 80) : "",
+      lastAt: last?.timestamp ?? null,
+    });
+  }
+  return summaries;
+}
+
+async function sendToConversationKey(groupKey: string, message: string): Promise<string | null> {
+  if (isPrivateConversationKey(groupKey)) {
+    const userId = parsePositiveOneBotId(groupKey.slice("private:".length), "reply user_id");
+    return sendPrivateMessage(userId, message);
+  }
+  return sendGroupMessage(parsePositiveOneBotId(groupKey, "reply group_id"), message);
+}
+
+function buildFocusToolRunner(): (call: LlmToolUseBlock) => Promise<string> {
+  return createQqToolRunner({
+    listConversations: async () => listConversationSummaries(),
+    readConversation: async (id) =>
+      renderConversationRecent(id, focusModeConfig.recentTurnsPerConversation),
+    sendToConversation: async (id, message) => {
+      const messageId = await sendToConversationKey(id, message);
+      await appendChatLog("assistant", message);
+      return messageId;
+    },
+    getFocus: focusConversationId,
+    setFocus: setFocusConversationId,
+    canSend: () => (isQqParticipationEnabled()
+      ? { allowed: true, reason: "" }
+      : { allowed: false, reason: `QQ 发送被抑制：${qqSuppressionDetail().replace(/\n/g, ", ")}` }),
+  });
+}
+
+async function restoreConversationLedger(): Promise<void> {
+  const { store, outcome } = await LedgerStore.load(
+    join(LOG_DIR, "conversation-ledger.jsonl"),
+    DEFAULT_LEDGER_STORE_OPTIONS,
+  );
+  ledgerStore = store;
+
+  if (outcome.rejected) {
+    pushMonitorEntry(
+      "status",
+      "Conversation Ledger Reset",
+      `Discarded ${outcome.recordCount} persisted turn(s): ${outcome.rejected}. Starting from an empty transcript.`,
+    );
+    return;
+  }
+  if (outcome.messages.length === 0) {
+    return;
+  }
+
+  conversationLedger.restore(outcome.messages);
+  if (conversationLedger.size !== outcome.messages.length) {
+    // restore() dropped a trailing unanswered tool call. Realign the log now, or
+    // the next boot reads that turn back as a middle one and replays an orphaned
+    // tool_use id — see LedgerStore.rewrite.
+    await ledgerStore.rewrite(conversationLedger.snapshot());
+  }
+  pushMonitorEntry(
+    "status",
+    "Conversation Ledger Restored",
+    `turns=${conversationLedger.size}${
+      conversationLedger.size !== outcome.messages.length
+        ? ` (dropped ${outcome.messages.length - conversationLedger.size} unanswered tool turn(s))`
+        : ""
+    }`,
+  );
+}
+
+async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
+  const client = getDecisionLlmClient();
+  if (!client) {
+    pushMonitorEntry("error", "Focus Loop Skipped", "No decision LLM client is available.");
+    return;
+  }
+
+  const latest = messages[messages.length - 1];
+  const groupKey = normalizeConversationGroupKey(latest.context.groupId);
+  if (!groupKey) {
+    pushMonitorEntry("error", "Focus Loop Skipped", "Batch has no resolvable conversation key.");
+    return;
+  }
+
+  const decision = decideFocus({
+    rawMessage: latest.context.rawMessage,
+    replyTargetType: latest.context.replyTargetType,
+    adminForcedReply: latest.context.isAdmin === true && shouldForceAdminReply({
+      userId: latest.context.userId,
+      messageType: latest.context.replyTargetType,
+    }, adminPolicyConfig),
+  }, privateChatConfig.botUserId);
+
+  const batchText = formatUnreadMessagesForModel(messages);
+  if (decision.foreground) {
+    // Being addressed is not something the model gets to overlook: take the
+    // focus and put the content in front of it, no tool call required.
+    setFocusConversationId(groupKey);
+    const recent = renderConversationRecent(groupKey, focusModeConfig.recentTurnsPerConversation) ?? [];
+    conversationLedger.appendUserText(
+      [`[当前会话已切到 ${formatConversationKey(groupKey)}（${decision.reason}）]`, ...recent, batchText]
+        .filter(Boolean)
+        .join("\n"),
+    );
+  } else {
+    // Ambient traffic is a headline, not a transcript. Whether it is worth
+    // opening is the model's call — that is the whole point of the model.
+    conversationLedger.appendUserText(
+      `[通知] ${formatConversationKey(groupKey)} 有新消息：${batchText.slice(0, 200)}`,
+    );
+  }
+
+  const startedAt = Date.now();
+  try {
+    const result = await client.runToolLoop({
+      messages: [...conversationLedger.snapshot()],
+      tools: [...QQ_TOOL_DEFINITIONS],
+      runTool: buildFocusToolRunner(),
+      purpose: "focus-loop",
+      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+      systemPrompt: buildModelSystemPrompt(client.systemPrompt).trim(),
+      maxRounds: focusModeConfig.maxRounds,
+      onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
+      onToolResults: (results) => conversationLedger.appendToolResults(results),
+    });
+    broadcastLatestLlmUsage(client);
+
+    pushMonitorEntry(
+      result.exhausted ? "error" : "status",
+      `Focus Loop ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
+      [
+        `conversation=${groupKey} focus=${decision.reason}`,
+        `rounds=${result.rounds} ledger=${conversationLedger.size}`,
+        result.exhausted ? "Round ceiling hit with tool calls still pending; the answer is partial." : "",
+        result.text.slice(0, 400),
+      ].filter(Boolean).join("\n"),
+      client.model,
+    );
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Focus Loop Error", `conversation=${groupKey}\n${detail}`, client.model);
+  }
+}
+
 async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
   const messages = pendingMessages
     .map((item) => ({
@@ -4273,6 +4521,11 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
 
   if (messages.length === 0) {
     pushMonitorEntry("status", "Unread Batch Skipped", "All queued messages became stale before the scheduled model scan ran.");
+    return;
+  }
+
+  if (focusModeConfig.enabled) {
+    await forwardBatchViaFocusLoop(messages);
     return;
   }
 
@@ -4379,6 +4632,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
       ? appendRetryFeedbackToVolatileTail(preparedRequest.messages, retryFeedback)
       : preparedRequest.messages;
     try {
+      markReplyRouteRead(effectiveContext.groupId);
       reply = await client.generateText({
         purpose: "reply-decision",
         systemPrompt: preparedRequest.systemPrompt,
@@ -4652,11 +4906,18 @@ function scheduleContextWarm(): void {
     return;
   }
 
+  const now = Date.now();
   const groupKeys = [...dirtyGroupKeys];
   for (const groupKey of groupKeys) {
     // Clear before dispatch so messages arriving during this group's warm call
     // re-arm it for the next pass instead of being silently swallowed.
     dirtyGroupKeys.delete(groupKey);
+    if (!shouldWarmReplyRoute(replyRouteLastReadAt.get(replyCacheRoute(groupKey)), now, CONTEXT_WARM_CONSUMER_WINDOW_MS)) {
+      // Dropped, not deferred: the next message for this group marks it dirty
+      // again, and a real decision re-opens the window. Warming a group nothing
+      // reads costs 2x base input per pass and saves nothing.
+      continue;
+    }
     agentEvents.push({ type: "context_warm_due", groupKey });
   }
 }
@@ -6492,6 +6753,7 @@ async function evaluateProactiveRevival(
 
   let reply: string;
   try {
+    markReplyRouteRead(request.groupKey);
     reply = await client.generateText({
       purpose: "proactive-decision",
       systemPrompt: prepared.systemPrompt,
@@ -8612,6 +8874,7 @@ async function bootstrap(): Promise<void> {
   const loadedHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   const loadedAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const loadedPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
+  const loadedFocusModeConfig = await loadFocusModeConfig(CONFIG_PATH);
   readOnlyMode = await loadReadOnlyConfig(CONFIG_PATH);
   const client = await createWatchedLlmClient(CONFIG_PATH, requestedProfile);
   const decisionClient = requestedDecisionProfile === client.profileName
@@ -8634,11 +8897,13 @@ async function bootstrap(): Promise<void> {
   hollyBootstrapConfig = loadedHollyBootstrapConfig;
   adminPolicyConfig = loadedAdminPolicyConfig;
   privateChatConfig = loadedPrivateChatConfig;
+  focusModeConfig = loadedFocusModeConfig;
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   domainReputationStore = await DomainReputationStore.load(join(LOG_DIR, "domain-reputation.json"));
   thoughtHistoryStore = await ThoughtHistoryStore.load(THOUGHT_HISTORY_LOG_PATH, THOUGHT_HISTORY_LIMIT);
+  await restoreConversationLedger();
   incomingMessageStore = store;
   // Restore the persisted merged timeline BEFORE the WS connects, so incoming
   // messages and the autonomy/proactive loops see the full context immediately.

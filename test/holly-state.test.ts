@@ -187,3 +187,42 @@ test("save + reload: state persists atomically across a fresh load", async () =>
   assert.equal(reloaded.globalDailyCount(), 1);
   await rm(path, { force: true });
 });
+
+// Focus is the one piece of the kagami model that must outlive the process:
+// Holly should come back looking at the conversation it was looking at, rather
+// than reopening whatever spoke first.
+test("lifecycle state: current conversation focus survives a restart", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  const lifecycle = store.getLifecycleState();
+  lifecycle.currentConversationId = "qq_group:20000001";
+  lifecycle.currentConversationOpenedAt = 1_700_000_000_000;
+  await store.save();
+
+  const restored = await HollyStateStore.load(path, TTL);
+  assert.equal(restored.getLifecycleState().currentConversationId, "qq_group:20000001");
+  assert.equal(restored.getLifecycleState().currentConversationOpenedAt, 1_700_000_000_000);
+  await rm(path, { force: true });
+});
+
+test("lifecycle state: a state file written before focus existed loads with no focus", async () => {
+  const path = tmpPath();
+  await writeFile(path, JSON.stringify({
+    version: 1,
+    globalDailyDate: localDateKey(),
+    globalDailyCount: 0,
+    autonomy: {},
+    lifecycle: { bootCount: 7, qqMode: "active" },
+    groups: {},
+  }), "utf-8");
+
+  const store = await HollyStateStore.load(path, TTL);
+  const lifecycle = store.getLifecycleState();
+  // Field-by-field coercion means no version bump was needed; the old file just
+  // reads as "not looking at anything yet".
+  assert.equal(lifecycle.bootCount, 7);
+  assert.equal(lifecycle.qqMode, "active");
+  assert.equal(lifecycle.currentConversationId, "");
+  assert.equal(lifecycle.currentConversationOpenedAt, 0);
+  await rm(path, { force: true });
+});

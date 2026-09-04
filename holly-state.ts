@@ -45,6 +45,16 @@ export type HollyLifecycleState = {
   qqModeReason: string;
   qqModeDecidedAt: number;
   qqModeReconsiderAt: number;
+  // The conversation Holly is currently looking at, or "" for none. One value,
+  // not one per group: this is where attention is, and attention is singular.
+  //
+  // Persisted so focus survives a restart (kagami keeps currentConversationId
+  // across blur for the same reason). The matching "is the app in the
+  // foreground" flag is deliberately NOT persisted — it gates whether a send
+  // target is exposed at all, and a stale true after a crash would let a reply
+  // go somewhere nobody asked for.
+  currentConversationId: string;
+  currentConversationOpenedAt: number;
 };
 
 export type HollyGroupState = {
@@ -113,6 +123,8 @@ function freshLifecycleState(): HollyLifecycleState {
     qqModeReason: "",
     qqModeDecidedAt: 0,
     qqModeReconsiderAt: 0,
+    currentConversationId: "",
+    currentConversationOpenedAt: 0,
   };
 }
 
@@ -179,6 +191,8 @@ function coerceLifecycleState(value: unknown): HollyLifecycleState {
     qqModeReason: typeof v.qqModeReason === "string" ? v.qqModeReason : "",
     qqModeDecidedAt: isFiniteNumber(v.qqModeDecidedAt) ? v.qqModeDecidedAt : 0,
     qqModeReconsiderAt: isFiniteNumber(v.qqModeReconsiderAt) ? v.qqModeReconsiderAt : 0,
+    currentConversationId: typeof v.currentConversationId === "string" ? v.currentConversationId : "",
+    currentConversationOpenedAt: isFiniteNumber(v.currentConversationOpenedAt) ? v.currentConversationOpenedAt : 0,
   };
 }
 
