@@ -113,6 +113,28 @@ export type AutonomyArchiveWriteRequest = {
   reason: string;
 };
 
+export type AutonomyJudgmentCandidate = {
+  eligible: boolean;
+  note: string;
+};
+
+export type AutonomyJudgmentRequest = {
+  nowIso: string;
+  worldObservation: AutonomyJudgmentCandidate;
+  memoryReflection: AutonomyJudgmentCandidate;
+  archiveWriting: AutonomyJudgmentCandidate;
+  groupProactiveNote: string;
+  pendingReplyGroupCount: number;
+  lastActionSummary: string;
+};
+
+export type AutonomyJudgmentDecision =
+  | { action: "do_nothing"; reason: string }
+  | { action: "world_observation"; reason: string }
+  | { action: "memory_reflection"; reason: string }
+  | { action: "archive_writing"; reason: string }
+  | { action: "group_proactive"; reason: string };
+
 export type AutonomyDeps = {
   now: () => number;
   config: AutonomyConfig;
@@ -124,6 +146,8 @@ export type AutonomyDeps = {
   composeArchive: (request: AutonomyArchiveComposeRequest) => Promise<AutonomyArchiveWriteRequest | null>;
   writeArchive: (request: AutonomyArchiveWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
+  requestJudgment: (request: AutonomyJudgmentRequest) => Promise<AutonomyJudgmentDecision>;
+  pendingReplyGroupCount: () => number;
   log: (kind: "status" | "error", title: string, body: string) => void;
   recordWorldObservation: (record: Record<string, unknown>) => void;
 };
@@ -256,6 +280,24 @@ function deferredChecks(
   }));
 }
 
+function freshnessNote(lastAt: number, now: number): string {
+  if (lastAt <= 0) return "从未执行过";
+  const minutes = Math.max(0, Math.round((now - lastAt) / 60_000));
+  return `距上次已 ${minutes} 分钟`;
+}
+
+function lastAutonomyActionSummary(state: AutonomyLoopState, now: number): string {
+  const candidates: Array<{ at: number; label: string }> = [
+    { at: state.lastWorldObservationAt, label: "world_observation" },
+    { at: state.lastMemoryReflectionAt, label: "memory_reflection" },
+    { at: state.lastArchiveWritingAt, label: "archive_writing" },
+  ].filter((candidate) => candidate.at > 0);
+  if (candidates.length === 0) return "尚未行动过";
+  const latest = candidates.reduce((a, b) => (b.at > a.at ? b : a));
+  const minutes = Math.max(0, Math.round((now - latest.at) / 60_000));
+  return `${minutes} 分钟前：${latest.label}`;
+}
+
 export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopResult> {
   const cfg = deps.config;
   if (!cfg.enabled) {
@@ -270,89 +312,154 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
 
   const now = deps.now();
   const state = deps.getState();
-  const checks: AutonomyCheck[] = [];
   rollAutonomyDaily(state, now);
 
-  if (worldObservationDue(cfg, state, now)) {
-    const topic = pickWorldTopic(state, cfg.worldTopics);
-    if (topic) {
-      const reason = "scheduled world observation";
-      state.lastWorldObservationAttemptAt = now;
-      state.worldObservationDailyCount += 1;
-      let observation: ProactiveWorldObservation | null = null;
-      let observationError = "";
-      try {
-        observation = await deps.observeWorld({ topic, reason });
-      } catch (error) {
-        observationError = error instanceof Error ? error.message : String(error);
-        deps.log("error", "Autonomy observe_world failed", observationError);
-      }
-      if (observation) {
-        state.lastWorldObservationAt = now;
-      }
-      await deps.saveState();
+  // Eligibility is computed for all three timed candidates up front, every
+  // tick -- unlike the old cascade, a later candidate's Due() is no longer
+  // skipped just because an earlier one already "won". Nothing here executes
+  // anything yet; these are the ONLY facts the interval/retry gates ever
+  // produce, and the judgment call below can only pick from what's eligible.
+  const worldEligible = worldObservationDue(cfg, state, now);
+  const memoryEligible = memoryReflectionDue(cfg, state, now);
+  const archiveEligible = archiveWritingDue(cfg, state, now);
 
-      if (observation) {
-        deps.recordWorldObservation({
-          ts: new Date(now).toISOString(),
-          action: "observe_world",
-          topic,
-          ok: true,
-          query: observation.query,
-          urls: observation.urls,
-          page_errors: observation.pageErrors ?? [],
-          summary: observation.summary,
-        });
-      }
-      deps.log(
-        "status",
-        observation ? "Autonomy observe_world" : "Autonomy observe_world empty",
-        `topic=${topic}\nquery=${observation?.query ?? ""}\nsources=${observation?.urls.length ?? 0}`,
-      );
-      checks.push({
-        name: "world_observation",
-        status: observation ? "acted" : "no_action",
-        reason: observation
-          ? `已完成“${topic}”世界观察，获得 ${observation.urls.length} 个来源`
-          : observationError
-            ? `“${topic}”世界观察失败：${observationError}`
-            : `已检查“${topic}”，但没有获得可用内容`,
-        nextEligibleAt: null,
-      });
-      checks.push(...deferredChecks(
-        ["memory_reflection", "archive_writing", "group_proactive"],
-        "本轮已执行更高优先级的世界观察",
-      ));
-      return {
-        action: {
-          type: "observe_world",
-          topic,
-          reason,
-          observed: observation !== null,
-        },
-        checks,
-      };
-    }
-  } else {
-    checks.push(scheduledCheckWhenNotDue({
-      name: "world_observation",
-      enabled: cfg.worldObservationEnabled && cfg.worldTopics.length > 0,
-      disabledReason: cfg.worldObservationEnabled ? "没有配置世界观察主题" : "世界观察已关闭",
-      lastCompletedAt: state.lastWorldObservationAt,
-      intervalMs: cfg.worldObservationIntervalMs,
-      lastAttemptAt: state.lastWorldObservationAttemptAt,
-      retryMs: cfg.worldObservationRetryMs,
-      now,
-    }));
+  // Ineligible candidates get their real trace entry now -- nothing changes
+  // it between here and the end of the tick, since only the judge's pick
+  // (if any) ever runs.
+  const worldNotDueCheck = worldEligible ? null : scheduledCheckWhenNotDue({
+    name: "world_observation",
+    enabled: cfg.worldObservationEnabled && cfg.worldTopics.length > 0,
+    disabledReason: cfg.worldObservationEnabled ? "没有配置世界观察主题" : "世界观察已关闭",
+    lastCompletedAt: state.lastWorldObservationAt,
+    intervalMs: cfg.worldObservationIntervalMs,
+    lastAttemptAt: state.lastWorldObservationAttemptAt,
+    retryMs: cfg.worldObservationRetryMs,
+    now,
+  });
+  const memoryNotDueCheck = memoryEligible ? null : scheduledCheckWhenNotDue({
+    name: "memory_reflection",
+    enabled: cfg.memoryReflectionEnabled,
+    disabledReason: "记忆反思已关闭",
+    lastCompletedAt: state.lastMemoryReflectionAt,
+    intervalMs: cfg.memoryReflectionIntervalMs,
+    lastAttemptAt: state.lastMemoryReflectionAttemptAt,
+    retryMs: cfg.memoryReflectionRetryMs,
+    now,
+  });
+  const archiveNotDueCheck = archiveEligible ? null : scheduledCheckWhenNotDue({
+    name: "archive_writing",
+    enabled: cfg.archiveWritingEnabled,
+    disabledReason: "归档写作已关闭",
+    lastCompletedAt: state.lastArchiveWritingAt,
+    intervalMs: cfg.archiveWritingIntervalMs,
+    lastAttemptAt: state.lastArchiveWritingAttemptAt,
+    retryMs: cfg.archiveWritingRetryMs,
+    now,
+  });
+
+  // requestJudgment's own implementation (requestAutonomyJudgment in main.ts)
+  // already catches its own LLM/parse failures and resolves to a do_nothing
+  // decision -- this second, thinner guard is only for a bug in that contract
+  // itself (a dep implementation that throws instead of resolving). Either
+  // way, one bad tick degrades to do_nothing instead of propagating up to
+  // dispatchAutonomyTickDue's catch as a full tick failure.
+  let rawDecision: AutonomyJudgmentDecision;
+  try {
+    rawDecision = await deps.requestJudgment({
+      nowIso: new Date(now).toISOString(),
+      worldObservation: {
+        eligible: worldEligible,
+        note: worldNotDueCheck?.reason ?? freshnessNote(state.lastWorldObservationAt, now),
+      },
+      memoryReflection: {
+        eligible: memoryEligible,
+        note: memoryNotDueCheck?.reason ?? freshnessNote(state.lastMemoryReflectionAt, now),
+      },
+      archiveWriting: {
+        eligible: archiveEligible,
+        note: archiveNotDueCheck?.reason ?? freshnessNote(state.lastArchiveWritingAt, now),
+      },
+      groupProactiveNote: "资格由独立的群聊规则闸判断（冷场/兴趣话题/冷却/限流），这里始终可选",
+      pendingReplyGroupCount: deps.pendingReplyGroupCount(),
+      lastActionSummary: lastAutonomyActionSummary(state, now),
+    });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    deps.log("error", "Autonomy judgment call failed", detail);
+    rawDecision = { action: "do_nothing", reason: `判断调用失败：${detail}` };
   }
 
-  if (memoryReflectionDue(cfg, state, now)) {
+  // Defensive: the caller is expected to build a JSON schema whose enum only
+  // contains currently-eligible candidates (plus do_nothing/group_proactive,
+  // which are always offerable), so this should be unreachable. Never trust a
+  // model response to bypass an interval gate regardless.
+  const decision: AutonomyJudgmentDecision =
+    (rawDecision.action === "world_observation" && !worldEligible)
+    || (rawDecision.action === "memory_reflection" && !memoryEligible)
+    || (rawDecision.action === "archive_writing" && !archiveEligible)
+      ? { action: "do_nothing", reason: `判断选中了未到期的项，已忽略：${rawDecision.reason}` }
+      : rawDecision;
+
+  const checks: AutonomyCheck[] = [];
+  let action: AutonomyAction;
+  let executed: AutonomyCheckName | null = null;
+
+  if (decision.action === "world_observation") {
+    executed = "world_observation";
+    // worldEligible guarantees cfg.worldTopics.length > 0 (see
+    // worldObservationDue), so pickWorldTopic never returns null here.
+    const topic = pickWorldTopic(state, cfg.worldTopics)!;
+    const reason = "scheduled world observation";
+    state.lastWorldObservationAttemptAt = now;
+    state.worldObservationDailyCount += 1;
+    let observation: ProactiveWorldObservation | null = null;
+    let observationError = "";
+    try {
+      observation = await deps.observeWorld({ topic, reason });
+    } catch (error) {
+      observationError = error instanceof Error ? error.message : String(error);
+      deps.log("error", "Autonomy observe_world failed", observationError);
+    }
+    if (observation) {
+      state.lastWorldObservationAt = now;
+    }
+    await deps.saveState();
+
+    if (observation) {
+      deps.recordWorldObservation({
+        ts: new Date(now).toISOString(),
+        action: "observe_world",
+        topic,
+        ok: true,
+        query: observation.query,
+        urls: observation.urls,
+        page_errors: observation.pageErrors ?? [],
+        summary: observation.summary,
+      });
+    }
+    deps.log(
+      "status",
+      observation ? "Autonomy observe_world" : "Autonomy observe_world empty",
+      `topic=${topic}\nquery=${observation?.query ?? ""}\nsources=${observation?.urls.length ?? 0}`,
+    );
+    checks.push({
+      name: "world_observation",
+      status: observation ? "acted" : "no_action",
+      reason: observation
+        ? `已完成“${topic}”世界观察，获得 ${observation.urls.length} 个来源`
+        : observationError
+          ? `“${topic}”世界观察失败：${observationError}`
+          : `已检查“${topic}”，但没有获得可用内容`,
+      nextEligibleAt: null,
+    });
+    action = { type: "observe_world", topic, reason, observed: observation !== null };
+  } else if (decision.action === "memory_reflection") {
+    executed = "memory_reflection";
     const reason = "scheduled memory reflection";
     state.lastMemoryReflectionAttemptAt = now;
     state.memoryReflectionDailyCount += 1;
     let memory: AutonomyMemoryWriteRequest | null = null;
     let reflectionError = "";
-    let writeError = "";
     try {
       memory = await deps.reflectMemory({ reason, nowIso: new Date(now).toISOString() });
     } catch (error) {
@@ -372,56 +479,30 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
           reason: `完成记忆反思并写入“${memory.topic}”`,
           nextEligibleAt: null,
         });
-        checks.push(...deferredChecks(
-          ["archive_writing", "group_proactive"],
-          "本轮已执行更高优先级的记忆反思",
-        ));
-        return {
-          action: {
-            type: "write_memory",
-            topic: memory.topic,
-            reason: memory.reason,
-            content: memory.content,
-          },
-          checks,
-        };
+        action = { type: "write_memory", topic: memory.topic, reason: memory.reason, content: memory.content };
       } catch (error) {
-        writeError = error instanceof Error ? error.message : String(error);
+        const writeError = error instanceof Error ? error.message : String(error);
         deps.log("error", "Autonomy write_memory failed", writeError);
+        const noActionReason = `反思内容未能写入：${writeError}`;
+        checks.push({ name: "memory_reflection", status: "no_action", reason: noActionReason, nextEligibleAt: null });
+        await deps.saveState();
+        action = { type: "do_nothing", reason: noActionReason };
       }
-    }
-
-    checks.push({
-      name: "memory_reflection",
-      status: "no_action",
-      reason: reflectionError
+    } else {
+      const noActionReason = reflectionError
         ? `记忆反思失败：${reflectionError}`
-        : writeError
-          ? `反思内容未能写入：${writeError}`
-          : "模型本轮未生成需要写入的记忆",
-      nextEligibleAt: null,
-    });
-    await deps.saveState();
-  } else {
-    checks.push(scheduledCheckWhenNotDue({
-      name: "memory_reflection",
-      enabled: cfg.memoryReflectionEnabled,
-      disabledReason: "记忆反思已关闭",
-      lastCompletedAt: state.lastMemoryReflectionAt,
-      intervalMs: cfg.memoryReflectionIntervalMs,
-      lastAttemptAt: state.lastMemoryReflectionAttemptAt,
-      retryMs: cfg.memoryReflectionRetryMs,
-      now,
-    }));
-  }
-
-  if (archiveWritingDue(cfg, state, now)) {
+        : "模型本轮未生成需要写入的记忆";
+      checks.push({ name: "memory_reflection", status: "no_action", reason: noActionReason, nextEligibleAt: null });
+      await deps.saveState();
+      action = { type: "do_nothing", reason: noActionReason };
+    }
+  } else if (decision.action === "archive_writing") {
+    executed = "archive_writing";
     const reason = "scheduled archive writing";
     state.lastArchiveWritingAttemptAt = now;
     state.archiveWritingDailyCount += 1;
     let work: AutonomyArchiveWriteRequest | null = null;
     let compositionError = "";
-    let archiveWriteError = "";
     try {
       work = await deps.composeArchive({ reason, nowIso: new Date(now).toISOString() });
     } catch (error) {
@@ -441,82 +522,59 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
           reason: `完成${work.kind === "poem" ? "诗" : "文章"}“${work.title}”`,
           nextEligibleAt: null,
         });
-        checks.push(...deferredChecks(
-          ["group_proactive"],
-          "本轮已执行更高优先级的归档写作",
-        ));
-        return {
-          action: {
-            type: "write_archive",
-            kind: work.kind,
-            title: work.title,
-            reason: work.reason,
-          },
-          checks,
-        };
+        action = { type: "write_archive", kind: work.kind, title: work.title, reason: work.reason };
       } catch (error) {
-        archiveWriteError = error instanceof Error ? error.message : String(error);
+        const archiveWriteError = error instanceof Error ? error.message : String(error);
         deps.log("error", "Autonomy write_archive failed", archiveWriteError);
+        const noActionReason = `归档作品未能写入：${archiveWriteError}`;
+        checks.push({ name: "archive_writing", status: "no_action", reason: noActionReason, nextEligibleAt: null });
+        await deps.saveState();
+        action = { type: "do_nothing", reason: noActionReason };
       }
-    }
-
-    checks.push({
-      name: "archive_writing",
-      status: "no_action",
-      reason: compositionError
+    } else {
+      const noActionReason = compositionError
         ? `归档创作失败：${compositionError}`
-        : archiveWriteError
-          ? `归档作品未能写入：${archiveWriteError}`
-          : "模型本轮没有生成归档作品",
-      nextEligibleAt: null,
-    });
-    await deps.saveState();
+        : "模型本轮没有生成归档作品";
+      checks.push({ name: "archive_writing", status: "no_action", reason: noActionReason, nextEligibleAt: null });
+      await deps.saveState();
+      action = { type: "do_nothing", reason: noActionReason };
+    }
+  } else if (decision.action === "group_proactive") {
+    executed = "group_proactive";
+    const groupResult = await deps.runGroupProactiveAction();
+    if (groupResult.actions.length > 0) {
+      const modes = Array.from(new Set(groupResult.actions.map((groupAction) => groupAction.mode))).join("/");
+      checks.push({
+        name: "group_proactive",
+        status: "acted",
+        reason: `产生 ${groupResult.actions.length} 个主动开口动作（${modes}）`,
+        nextEligibleAt: null,
+      });
+      action = { type: "send_group_message", reason: "group proactive policy produced an action", actions: groupResult.actions };
+    } else {
+      const noActionReason = "没有群聊同时通过冷场、兴趣话题、冷却和限流规则";
+      checks.push({ name: "group_proactive", status: "no_action", reason: noActionReason, nextEligibleAt: null });
+      action = { type: "do_nothing", reason: noActionReason };
+    }
   } else {
-    checks.push(scheduledCheckWhenNotDue({
-      name: "archive_writing",
-      enabled: cfg.archiveWritingEnabled,
-      disabledReason: "归档写作已关闭",
-      lastCompletedAt: state.lastArchiveWritingAt,
-      intervalMs: cfg.archiveWritingIntervalMs,
-      lastAttemptAt: state.lastArchiveWritingAttemptAt,
-      retryMs: cfg.archiveWritingRetryMs,
-      now,
-    }));
+    action = { type: "do_nothing", reason: decision.reason || "no due autonomy action" };
   }
 
-  const groupResult = await deps.runGroupProactiveAction();
-  if (groupResult.actions.length > 0) {
-    const modes = Array.from(new Set(groupResult.actions.map((action) => action.mode))).join("/");
-    checks.push({
-      name: "group_proactive",
-      status: "acted",
-      reason: `产生 ${groupResult.actions.length} 个主动开口动作（${modes}）`,
-      nextEligibleAt: null,
-    });
-    return {
-      action: {
-        type: "send_group_message",
-        reason: "group proactive policy produced an action",
-        actions: groupResult.actions,
-      },
-      checks,
-    };
-  }
-
-  checks.push({
-    name: "group_proactive",
-    status: "no_action",
-    reason: "没有群聊同时通过冷场、兴趣话题、冷却和限流规则",
+  // Trace entries for the three candidates that weren't executed this tick:
+  // either they were never eligible (the real reason, computed above), or
+  // they were eligible but the judge picked something else. "deferred" no
+  // longer means "a higher-priority check preempted me" (there is no more
+  // priority order) -- it now means "the judge had this option and passed".
+  const deferredEntry = (name: AutonomyCheckName): AutonomyCheck => ({
+    name,
+    status: "deferred",
+    reason: "模型本轮选择优先做别的",
     nextEligibleAt: null,
   });
-  const attemptedNoActions = checks
-    .filter((check) => check.status === "no_action")
-    .map((check) => check.reason);
-  return {
-    action: {
-      type: "do_nothing",
-      reason: attemptedNoActions.join("；") || "no due autonomy action",
-    },
-    checks,
-  };
+  if (executed !== "world_observation") checks.push(worldNotDueCheck ?? deferredEntry("world_observation"));
+  if (executed !== "memory_reflection") checks.push(memoryNotDueCheck ?? deferredEntry("memory_reflection"));
+  if (executed !== "archive_writing") checks.push(archiveNotDueCheck ?? deferredEntry("archive_writing"));
+  if (executed !== "group_proactive") checks.push(deferredEntry("group_proactive"));
+
+  return { action, checks };
 }

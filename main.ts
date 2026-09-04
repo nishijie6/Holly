@@ -76,6 +76,8 @@ import {
   type AutonomyArchiveComposeRequest,
   type AutonomyArchiveWriteRequest,
   type AutonomyConfig,
+  type AutonomyJudgmentDecision,
+  type AutonomyJudgmentRequest,
   type AutonomyMemoryReflectionRequest,
   type AutonomyMemoryWriteRequest,
   type AutonomyWorldObservationRequest,
@@ -126,9 +128,11 @@ import {
 } from "./context-budget.js";
 import {
   ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
+  AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
   MEMORY_REFLECTION_SYSTEM_PROMPT,
   WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
   buildArchiveCompositionPrompt,
+  buildAutonomyJudgmentPrompt,
   buildMemoryReflectionPrompt,
   buildWorldObservationBroadcastPrompt,
 } from "./autonomy-prompts.js";
@@ -6622,6 +6626,90 @@ function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
   });
 }
 
+// do_nothing and group_proactive are always offerable (see
+// AutonomyJudgmentRequest.groupProactiveNote); the three timed candidates
+// only appear when their interval/retry gate has actually cleared. This is
+// the hard backstop for "the model can't pick an ineligible candidate" —
+// enforced by the schema itself, not by asking the model to read a note and
+// comply. runAutonomyLoop still double-checks defensively regardless.
+function buildAutonomyJudgmentSchema(eligibleActions: readonly string[]): Record<string, unknown> {
+  return {
+    type: "object",
+    additionalProperties: false,
+    required: ["action", "reason"],
+    properties: {
+      action: { type: "string", enum: ["do_nothing", "group_proactive", ...eligibleActions] },
+      reason: { type: "string" },
+    },
+  };
+}
+
+const AUTONOMY_JUDGMENT_ACTIONS = [
+  "do_nothing",
+  "world_observation",
+  "memory_reflection",
+  "archive_writing",
+  "group_proactive",
+] as const;
+
+function parseAutonomyJudgment(raw: string): AutonomyJudgmentDecision | null {
+  let value: unknown;
+  try {
+    value = JSON.parse(unwrapJsonBlock(raw));
+  } catch {
+    return null;
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+
+  const action = AUTONOMY_JUDGMENT_ACTIONS.find((candidate) => candidate === record.action);
+  if (!action) return null;
+  const reason = typeof record.reason === "string" ? record.reason.trim() : "";
+  if (!reason) return null;
+
+  return { action, reason } as AutonomyJudgmentDecision;
+}
+
+async function requestAutonomyJudgment(request: AutonomyJudgmentRequest): Promise<AutonomyJudgmentDecision> {
+  const fallback: AutonomyJudgmentDecision = { action: "do_nothing", reason: "判断调用不可用，本轮跳过" };
+  // Decision profile, not the response profile: this is a pure label pick,
+  // no content generation, and it runs 60x/hour — the same reasoning that
+  // puts reply-decision on the cheaper/faster profile applies here even
+  // harder, since every other autonomy call (memory/archive/world/qq-mode)
+  // fires at most a few dozen times a day, not every single tick.
+  const client = decisionLlmClient ?? activeLlmClient;
+  if (!client) return fallback;
+
+  const eligibleActions = [
+    request.worldObservation.eligible ? "world_observation" : null,
+    request.memoryReflection.eligible ? "memory_reflection" : null,
+    request.archiveWriting.eligible ? "archive_writing" : null,
+  ].filter((action): action is string => action !== null);
+
+  try {
+    const reply = await client.generateText({
+      purpose: "autonomy-judgment",
+      systemPrompt: AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
+      messages: [{ role: "user", content: buildAutonomyJudgmentPrompt(request) }],
+      jsonSchema: buildAutonomyJudgmentSchema(eligibleActions),
+      // Fixed route, expected near-0% hit rate: the candidate state changes
+      // every tick, so there is no stable prefix to warm. token-usage.ts's
+      // uncacheableInputTokens accounting already reports this honestly
+      // rather than as a fabricated 0% miss.
+      cacheRoute: "autonomy-judgment",
+    });
+    broadcastLatestLlmUsage(client);
+    return parseAutonomyJudgment(reply) ?? { ...fallback, reason: "判断响应解析失败，本轮跳过" };
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Autonomy Judgment Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return fallback;
+  }
+}
+
 function buildAutonomyDeps() {
   const store = hollyStateStore;
   if (!store) return null;
@@ -6636,6 +6724,8 @@ function buildAutonomyDeps() {
     composeArchive: composeArchiveForAutonomy,
     writeArchive: writeArchiveForAutonomy,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
+    requestJudgment: requestAutonomyJudgment,
+    pendingReplyGroupCount: () => unreadModelMessagesByGroup.size,
     log: (kind: "status" | "error", title: string, body: string) => {
       pushMonitorEntry(kind, title, body);
     },

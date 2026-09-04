@@ -14,6 +14,7 @@ export type LlmCallPurpose =
   | "proactive-response"
   | "boot-orientation"
   | "qq-mode-decision"
+  | "autonomy-judgment"
   | "eval-script";
 
 export type TokenUsageBreakdown = {
