@@ -54,7 +54,17 @@ export function estimateSystemPromptTokens(systemPrompt: string): number {
 }
 
 export function estimateMessageTokens(message: LlmMessage): number {
-  return estimateTextTokens(message.content) + 6;
+  // Tool blocks are not decoration: in the focus pipeline a tool_result holds a
+  // whole rendered conversation, so a turn whose content is "" can still be
+  // thousands of tokens. Counting only `content` would report such a transcript
+  // as nearly free and let it grow past any budget unnoticed.
+  const blockTokens = (message.blocks ?? []).reduce((sum, block) => {
+    if (block.type === "tool_use") {
+      return sum + estimateTextTokens(block.name) + estimateTextTokens(JSON.stringify(block.input)) + 4;
+    }
+    return sum + estimateTextTokens(block.content) + 4;
+  }, 0);
+  return estimateTextTokens(message.content) + blockTokens + 6;
 }
 
 export function estimateMessagesTokens(messages: readonly LlmMessage[]): number {

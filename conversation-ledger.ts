@@ -123,6 +123,37 @@ export class ConversationLedger {
     }
   }
 
+  /**
+   * Replace the front of the transcript with one summary turn.
+   *
+   * This is the exception the class comment promised, and it is deliberately
+   * ugly to call: it BREAKS THE PROMPT-CACHE PREFIX. Everything in front of the
+   * cut stops being a cache read and is paid for again at full price on the next
+   * request, and the drift detector will report a rebuilt prefix — correctly.
+   * Callers must expect that (expectRebuild) rather than treat it as a defect.
+   *
+   * `keep` must come from planLedgerCompaction, which guarantees it starts on a
+   * settled turn; a tail beginning with orphaned tool_results is a 400.
+   */
+  public replaceFrontWithSummary(summary: string, keep: readonly LlmMessage[]): void {
+    const text = summary.trim();
+    if (!text) {
+      throw new Error("ConversationLedger: refusing to compact into an empty summary.");
+    }
+    if (this.pendingToolUseIds.length > 0) {
+      throw new Error("ConversationLedger: cannot compact while tool calls are unanswered.");
+    }
+    if (keep.some((message) => (message.blocks ?? []).some((block) => block.type === "tool_result"))
+      && (keep[0]?.blocks ?? []).some((block) => block.type === "tool_result")) {
+      throw new Error("ConversationLedger: the kept tail starts with an orphaned tool_result.");
+    }
+    this.messages.length = 0;
+    this.messages.push({ role: "user", content: text });
+    for (const message of keep) {
+      this.messages.push(message);
+    }
+  }
+
   private push(message: LlmMessage): LedgerAppendResult {
     this.messages.push(message);
     this.onAppend?.(message);

@@ -26,13 +26,23 @@ export type LedgerRestoreOutcome = {
 export type LedgerStoreOptions = {
   /** A transcript older than this is a different conversation, not this one. */
   maxAgeMs: number;
-  /** Above this, restoring costs more per request than starting cold. */
+  /**
+   * A last-resort guard, not the routine size limit.
+   *
+   * Size is governed by ledger-compaction, which measures tokens. This one
+   * counts turns, so the two disagree: a transcript of many short turns can pass
+   * compaction's budget comfortably and still trip a turn count. Set well above
+   * anything compaction leaves behind, so that tripping it means something is
+   * actually wrong (compaction wedged, a runaway loop) rather than that the
+   * conversation simply got long — because tripping it throws the transcript
+   * away whole.
+   */
   maxMessages: number;
 };
 
 export const DEFAULT_LEDGER_STORE_OPTIONS: LedgerStoreOptions = {
   maxAgeMs: 12 * 60 * 60 * 1000,
-  maxMessages: 400,
+  maxMessages: 2_000,
 };
 
 type LedgerRecord = { at: string; message: LlmMessage };

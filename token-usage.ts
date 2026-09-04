@@ -16,6 +16,7 @@ export type LlmCallPurpose =
   | "qq-mode-decision"
   | "autonomy-judgment"
   | "focus-loop"
+  | "ledger-compaction"
   | "eval-script";
 
 export type TokenUsageBreakdown = {

@@ -130,6 +130,11 @@ import {
 import { shouldWarmReplyRoute } from "./context-warm-policy.js";
 import { ConversationLedger } from "./conversation-ledger.js";
 import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
+import {
+  DEFAULT_LEDGER_COMPACTION_OPTIONS,
+  buildLedgerSummaryPrompt,
+  planLedgerCompaction,
+} from "./ledger-compaction.js";
 import { decideFocus } from "./focus-policy.js";
 import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
 import { QQ_TOOL_DEFINITIONS, createQqToolRunner, type ConversationSummary } from "./qq-tools.js";
@@ -4428,6 +4433,64 @@ async function restoreConversationLedger(): Promise<void> {
   );
 }
 
+/**
+ * Compact the ledger if it has outgrown its budget.
+ *
+ * Returns true when the prefix was rebuilt, so the caller can tell the drift
+ * detector this one was on purpose. Compaction is the only thing in the focus
+ * pipeline that breaks the prefix, and it must never be mistaken for the bug
+ * that detector exists to catch.
+ */
+async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
+  const plan = planLedgerCompaction(conversationLedger.snapshot(), DEFAULT_LEDGER_COMPACTION_OPTIONS);
+  if (!plan) {
+    return false;
+  }
+
+  const startedAt = Date.now();
+  let summary: string;
+  try {
+    summary = await client.generateText({
+      purpose: "ledger-compaction",
+      systemPrompt: "你在压缩自己的对话记录。只输出摘要正文，不要任何前后缀。",
+      messages: [{ role: "user", content: buildLedgerSummaryPrompt(plan.summarize) }],
+      cacheRoute: "ledger-compaction",
+    });
+  } catch (error) {
+    // A failed summary is not a reason to drop the transcript. Leaving it
+    // oversized costs tokens; discarding it unsummarized loses the conversation.
+    pushMonitorEntry(
+      "error",
+      "Ledger Compaction Failed",
+      `Kept the full transcript.\n${error instanceof Error ? error.message : String(error)}`,
+      client.model,
+    );
+    return false;
+  }
+
+  if (!summary.trim()) {
+    pushMonitorEntry("error", "Ledger Compaction Failed", "The summary came back empty; kept the full transcript.");
+    return false;
+  }
+
+  const before = conversationLedger.size;
+  conversationLedger.replaceFrontWithSummary(summary, plan.keep);
+  // The log must match memory, and this is a rewrite, not an append.
+  await ledgerStore?.rewrite(conversationLedger.snapshot());
+
+  pushMonitorEntry(
+    "status",
+    `Ledger Compacted - ${formatElapsedDuration(startedAt, Date.now())}`,
+    [
+      `turns ${before} -> ${conversationLedger.size} (summarized ${plan.summarize.length})`,
+      "The prompt-cache prefix is rebuilt from here; the next request pays full price once.",
+      summary.slice(0, 300),
+    ].join("\n"),
+    client.model,
+  );
+  return true;
+}
+
 async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
   const client = getDecisionLlmClient();
   if (!client) {
@@ -4470,9 +4533,12 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
     );
   }
 
+  const compacted = await compactLedgerIfNeeded(client);
+
   const startedAt = Date.now();
   try {
     const result = await client.runToolLoop({
+      expectRebuild: compacted,
       messages: [...conversationLedger.snapshot()],
       tools: [...QQ_TOOL_DEFINITIONS],
       runTool: buildFocusToolRunner(),

@@ -203,3 +203,51 @@ test("the tool loop's turn hooks keep a ledger in step, in order", async () => {
   assert.equal(ledger.snapshot()[1].blocks?.[0].type, "tool_use");
   assert.equal(ledger.snapshot()[2].blocks?.[0].type, "tool_result");
 });
+
+// --- compaction, the one sanctioned rewrite --------------------------------
+
+test("compaction replaces the front with a summary and keeps the tail verbatim", () => {
+  const ledger = new ConversationLedger();
+  ledger.appendUserText("一");
+  ledger.appendUserText("二");
+  ledger.appendUserText("三");
+
+  ledger.replaceFrontWithSummary("此前聊了一和二", ledger.snapshot().slice(2));
+  assert.deepEqual(ledger.snapshot().map((m) => m.content), ["此前聊了一和二", "三"]);
+});
+
+test("the ledger keeps working normally after a compaction", () => {
+  const ledger = new ConversationLedger();
+  ledger.appendUserText("一");
+  ledger.appendUserText("二");
+  ledger.replaceFrontWithSummary("摘要", ledger.snapshot().slice(1));
+  ledger.appendAssistantTurn("三");
+  assert.deepEqual(ledger.snapshot().map((m) => m.content), ["摘要", "二", "三"]);
+});
+
+test("compaction refuses an empty summary", () => {
+  const ledger = new ConversationLedger();
+  ledger.appendUserText("一");
+  assert.throws(() => ledger.replaceFrontWithSummary("   ", []), /empty summary/);
+});
+
+test("compaction refuses to run mid tool call", () => {
+  const ledger = new ConversationLedger();
+  ledger.appendUserText("weather?");
+  ledger.appendAssistantTurn("", [use("tu_1")]);
+  assert.throws(() => ledger.replaceFrontWithSummary("摘要", []), /unanswered/);
+});
+
+test("compaction refuses a tail that starts with an orphaned tool_result", () => {
+  const ledger = new ConversationLedger();
+  ledger.appendUserText("一");
+  // The tool_use that this result answers would be summarized away, so the
+  // kept half opens with an orphan — a 400 on the very next request.
+  assert.throws(
+    () => ledger.replaceFrontWithSummary("摘要", [
+      { role: "user", content: "", blocks: [result("tu_1")] },
+      { role: "user", content: "后续" },
+    ]),
+    /orphaned tool_result/,
+  );
+});
