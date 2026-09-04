@@ -15,6 +15,7 @@ export type LlmCallPurpose =
   | "boot-orientation"
   | "qq-mode-decision"
   | "autonomy-judgment"
+  | "focus-loop"
   | "eval-script";
 
 export type TokenUsageBreakdown = {

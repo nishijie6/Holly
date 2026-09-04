@@ -18,10 +18,42 @@ import {
 
 export type LlmMessageRole = "system" | "user" | "assistant";
 
+// A tool call the model asked for, and the result we feed back. The API pairs
+// them by id, so both halves must survive into the request together — see the
+// no-merge/no-trim rule in buildClaudeMessages.
+export type LlmToolUseBlock = {
+  type: "tool_use";
+  id: string;
+  name: string;
+  input: Record<string, unknown>;
+};
+
+export type LlmToolResultBlock = {
+  type: "tool_result";
+  toolUseId: string;
+  content: string;
+  isError?: boolean;
+};
+
+export type LlmStructuralBlock = LlmToolUseBlock | LlmToolResultBlock;
+
 export type LlmMessage = {
   role: LlmMessageRole;
   content: string;
+  // Present only on tool turns. An assistant turn may carry prose in `content`
+  // and its tool calls here at once, which is what the model actually returns.
+  blocks?: LlmStructuralBlock[];
 };
+
+export type LlmToolDefinition = {
+  name: string;
+  description: string;
+  inputSchema: Record<string, unknown>;
+};
+
+export function messageHasStructuralBlocks(message: LlmMessage): boolean {
+  return Array.isArray(message.blocks) && message.blocks.length > 0;
+}
 
 export type LlmProvider = "codex" | "claude";
 
@@ -94,6 +126,23 @@ export type LlmClient = {
     cacheRoute: string;
     expectRebuild?: boolean;
   }): Promise<void>;
+  // The agentic sibling of generateText. It exists on the client rather than as
+  // a bare function call so the focus pipeline inherits the same instrumentation
+  // every other call gets: per-purpose token accounting, cache-prefix inspection
+  // on every round, and the connection watchdog. Bypassing the client would make
+  // the one pipeline whose economics are under review the only unmeasured one.
+  runToolLoop(input: {
+    messages: LlmMessage[];
+    tools: LlmToolDefinition[];
+    runTool: (call: LlmToolUseBlock) => Promise<string>;
+    purpose: LlmCallPurpose;
+    cacheRoute: string;
+    systemPrompt?: string;
+    maxRounds?: number;
+    expectRebuild?: boolean;
+    onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[]) => void;
+    onToolResults?: (results: LlmToolResultBlock[]) => void;
+  }): Promise<ClaudeToolLoopResult>;
 };
 
 // Reported for every Claude request, including the ones that behaved. main.ts
@@ -183,6 +232,11 @@ type ClaudeRequestOptions = {
   // memory, and the current scan never poison the reusable prefix hash.
   cacheStablePrefix?: boolean;
   volatileTailMessages?: number;
+  // Tools render before `system` on the wire, so they sit inside whatever the
+  // system breakpoint caches. Keep the list byte-stable for a process (see
+  // kagami's system-prompt.ts note on the same invariant) or every change to it
+  // rebuilds the prefix for every route.
+  tools?: LlmToolDefinition[];
 };
 
 // The cached prefix as the API will actually see it: everything from the start
@@ -190,6 +244,20 @@ type ClaudeRequestOptions = {
 // it off the built body (rather than off the caller's messages) means the
 // digest covers exactly what gets hashed on the other side, including the empty
 // blocks buildClaudeMessages drops and the assistant tail it trims.
+// A tool block carries its identity in fields other than `text`. Digesting it as
+// the empty string would make two different tool calls look byte-identical, and
+// the drift detector would report a rebuilt prefix as "unchanged" — the one
+// safety net this migration has, reading clean while it is broken.
+function describePrefixBlock(block: Record<string, unknown>): string {
+  if (block.type === "tool_use") {
+    return `tool_use:${String(block.id)}:${String(block.name)}:${JSON.stringify(block.input ?? null)}`;
+  }
+  if (block.type === "tool_result") {
+    return `tool_result:${String(block.tool_use_id)}:${String(block.content ?? "")}`;
+  }
+  return typeof block.text === "string" ? block.text : "";
+}
+
 export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
   const systemTexts: string[] = [];
   const system = Array.isArray(body.system) ? body.system : [];
@@ -211,7 +279,7 @@ export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePr
     for (const block of content) {
       if (!block || typeof block !== "object") continue;
       const inner = block as Record<string, unknown>;
-      pending.push(`${role}:${typeof inner.text === "string" ? inner.text : ""}`);
+      pending.push(`${role}:${describePrefixBlock(inner)}`);
       if (inner.cache_control) {
         // Everything buffered so far is inside the breakpoint; anything after
         // it is the volatile tail and deliberately not part of the identity.
@@ -225,8 +293,16 @@ export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePr
   return buildCachePrefixDigest(systemTexts, blockTexts);
 }
 
-function isFetchFailedError(error: unknown): boolean {
-  return error instanceof Error && error.message.toLowerCase().includes("fetch failed");
+// Two shapes of the same thing: the proxy dropped this attempt. undici reports a
+// refused or reset connection as "fetch failed"; a connection that opens and
+// then stalls surfaces instead as AbortSignal.timeout's TimeoutError. Only the
+// first was retried, so a stalled request died outright while a refused one
+// recovered — and the tool loop multiplies that exposure, since one agent turn
+// makes several requests and any of them can stall.
+function isRetryableTransportError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  if (error.message.toLowerCase().includes("fetch failed")) return true;
+  return error.name === "TimeoutError";
 }
 
 function delay(ms: number): Promise<void> {
@@ -629,7 +705,7 @@ async function requestCodexText(
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
-      if (isFetchFailedError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+      if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
         console.warn(
           `Codex request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
         );
@@ -841,7 +917,29 @@ function buildClaudeHeaders(accessToken: string): Record<string, string> {
 }
 
 type ClaudeMessageBlock = { text: string; volatile: boolean };
-type ClaudeMergedMessage = { role: "user" | "assistant"; blocks: ClaudeMessageBlock[] };
+type ClaudeMergedMessage = {
+  role: "user" | "assistant";
+  blocks: ClaudeMessageBlock[];
+  // Tool turns are structural: the API matches each tool_use to its tool_result
+  // by id, so these must not merge into a neighbour and must not be trimmed away
+  // — losing either half of a pair is a 400, not a degraded prompt.
+  structural?: LlmStructuralBlock[];
+  // Structural blocks all come from one source message, so they share its
+  // volatility. Tracked because the cache breakpoint may legally sit on them.
+  structuralVolatile?: boolean;
+};
+
+function toClaudeStructuralBlock(block: LlmStructuralBlock): Record<string, unknown> {
+  if (block.type === "tool_use") {
+    return { type: "tool_use", id: block.id, name: block.name, input: block.input };
+  }
+  return {
+    type: "tool_result",
+    tool_use_id: block.toolUseId,
+    content: block.content,
+    ...(block.isError ? { is_error: true } : {}),
+  };
+}
 
 // One text block per source LlmMessage (conversation turn). Consecutive
 // same-role turns merge into one API message but keep their block boundaries,
@@ -852,22 +950,31 @@ function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): 
 
   for (const [index, message] of messages.entries()) {
     const content = message.content.trim();
-    if (!content) {
+    const structural = messageHasStructuralBlocks(message) ? message.blocks : undefined;
+    if (!content && !structural) {
       continue;
     }
 
     const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
-    const block: ClaudeMessageBlock = { text: content, volatile: index >= volatileFrom };
+    const volatile = index >= volatileFrom;
+    const textBlocks: ClaudeMessageBlock[] = content ? [{ text: content, volatile }] : [];
     const last = merged[merged.length - 1];
-    if (last && last.role === role) {
-      last.blocks.push(block);
+    // A structural turn opens its own message, and never absorbs a later one:
+    // merging would reorder tool_use/tool_result blocks relative to the prose
+    // the model paired them with.
+    if (last && last.role === role && !structural && !last.structural) {
+      last.blocks.push(...textBlocks);
     } else {
-      merged.push({ role, blocks: [block] });
+      merged.push({
+        role,
+        blocks: textBlocks,
+        ...(structural ? { structural, structuralVolatile: volatile } : {}),
+      });
     }
   }
 
   // The Messages API requires the first message to be a user turn.
-  while (merged.length > 0 && merged[0].role === "assistant") {
+  while (merged.length > 0 && merged[0].role === "assistant" && !merged[0].structural) {
     merged.shift();
   }
 
@@ -876,7 +983,13 @@ function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): 
   // assistant message prefill"). This happens on the cache-warm path, which
   // sends history with no new user turn appended (its empty current message is
   // dropped above), leaving the bot's own last reply as the final turn.
-  while (merged.length > 0 && merged[merged.length - 1].role === "assistant") {
+  // A structural assistant turn is exempt: mid tool loop it is answered by the
+  // tool_result turn after it, and dropping it orphans that result's id.
+  while (
+    merged.length > 0
+    && merged[merged.length - 1].role === "assistant"
+    && !merged[merged.length - 1].structural
+  ) {
     merged.pop();
   }
 
@@ -891,13 +1004,28 @@ function buildClaudeMessagesBody(
   const merged = buildClaudeMessages(messages, volatileTailMessages);
   const apiMessages = merged.map((message): Record<string, unknown> => ({
     role: message.role,
-    content: message.blocks.map((block) => ({ type: "text", text: block.text })),
+    content: [
+      ...message.blocks.map((block) => ({ type: "text", text: block.text })),
+      // Structural blocks always follow the prose of their own turn, matching
+      // the order the model emits them in.
+      ...(message.structural ?? []).map(toClaudeStructuralBlock),
+    ],
   }));
 
   if (cacheStablePrefix) {
+    // Walk the wire content backwards, not just the text blocks: in a tool loop
+    // the newest stable content is a tool_use/tool_result block, and skipping
+    // those pins the breakpoint to the last prose turn — the growing transcript
+    // would then never be cached at all.
     outer: for (let i = merged.length - 1; i >= 0; i -= 1) {
-      for (let j = merged[i].blocks.length - 1; j >= 0; j -= 1) {
-        if (!merged[i].blocks[j].volatile) {
+      const message = merged[i];
+      const structuralCount = message.structural?.length ?? 0;
+      const volatility = [
+        ...message.blocks.map((block) => block.volatile),
+        ...Array.from({ length: structuralCount }, () => message.structuralVolatile ?? false),
+      ];
+      for (let j = volatility.length - 1; j >= 0; j -= 1) {
+        if (!volatility[j]) {
           const content = apiMessages[i].content as Array<Record<string, unknown>>;
           content[j].cache_control = { type: "ephemeral", ttl: "1h" };
           break outer;
@@ -937,8 +1065,17 @@ export function buildClaudeRequestBody(
     ),
   };
 
+  if (options.tools && options.tools.length > 0) {
+    body.tools = options.tools.map((tool) => ({
+      name: tool.name,
+      description: tool.description,
+      input_schema: tool.inputSchema,
+    }));
+  }
+
   if (options.jsonSchema) {
     // Structured outputs guarantee the response is schema-valid JSON (GA on Opus 4.7 / Sonnet 4.6).
+    // Verified to coexist with `tools` on this transport.
     body.output_config = { format: { type: "json_schema", schema: options.jsonSchema } };
   }
 
@@ -1097,6 +1234,21 @@ async function requestClaudeText(
   recordUsage: (usage: TokenUsageBreakdown) => void,
   inspectBody: (body: Record<string, unknown>) => void = () => {},
 ): Promise<string> {
+  const data = await requestClaudeMessage(model, systemPrompt, messages, options, recordUsage, inspectBody);
+  return extractClaudeText(data);
+}
+
+// The whole transport — auth retry, credential rotation, fetch retry, rate-limit
+// gate, usage capture — in one place, returning the raw message so both the
+// text path and the tool loop get identical handling.
+async function requestClaudeMessage(
+  model: string,
+  systemPrompt: string,
+  messages: LlmMessage[],
+  options: ClaudeRequestOptions = {},
+  recordUsage: (usage: TokenUsageBreakdown) => void,
+  inspectBody: (body: Record<string, unknown>) => void = () => {},
+): Promise<Record<string, unknown>> {
   const rateLimitRevision = claudeRateLimitGate.beginRequest();
   let creds = await getClaudeCredentials();
   const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
@@ -1117,7 +1269,7 @@ async function requestClaudeText(
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       });
     } catch (error) {
-      if (isFetchFailedError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+      if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
         console.warn(
           `Claude request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
         );
@@ -1165,15 +1317,120 @@ async function requestClaudeText(
     }
 
     claudeRateLimitGate.recordSuccess(rateLimitRevision);
-    const data = await res.json();
+    const data = await res.json() as Record<string, unknown>;
     const tokens = readClaudeUsageTokens(data);
     if (tokens) {
       recordUsage(tokens);
     }
-    return extractClaudeText(data);
+    return data;
   }
 
   throw new Error("Claude request failed after retry.");
+}
+
+// A loop with no ceiling is a loop that can spend the whole budget on one
+// confused turn. Each round is a full request carrying the whole transcript, so
+// the cost of a runaway grows quadratically, not linearly.
+const CLAUDE_TOOL_LOOP_MAX_ROUNDS = 12;
+
+export type ClaudeToolLoopResult = {
+  text: string;
+  messages: LlmMessage[];
+  rounds: number;
+  // True when the ceiling cut the loop off with the model still asking for
+  // tools. The caller has a partial answer, not a finished one — never present
+  // it as complete.
+  exhausted: boolean;
+};
+
+export function parseClaudeToolUses(data: Record<string, unknown>): LlmToolUseBlock[] {
+  const content = Array.isArray(data.content) ? data.content : [];
+  const uses: LlmToolUseBlock[] = [];
+  for (const block of content) {
+    if (!block || typeof block !== "object") continue;
+    const record = block as Record<string, unknown>;
+    if (record.type !== "tool_use") continue;
+    if (typeof record.id !== "string" || typeof record.name !== "string") continue;
+    uses.push({
+      type: "tool_use",
+      id: record.id,
+      name: record.name,
+      input: (record.input && typeof record.input === "object" ? record.input : {}) as Record<string, unknown>,
+    });
+  }
+  return uses;
+}
+
+// Drives tool_use -> tool_result -> end_turn against the same transport as every
+// other Claude call. `messages` is grown, never rewritten: each round appends the
+// assistant turn and one user turn holding every result, which is both what the
+// API requires and what keeps the prompt-cache prefix extending instead of
+// rebuilding.
+export async function runClaudeToolLoop(input: {
+  model: string;
+  systemPrompt: string;
+  messages: LlmMessage[];
+  tools: LlmToolDefinition[];
+  runTool: (call: LlmToolUseBlock) => Promise<string>;
+  options?: ClaudeRequestOptions;
+  recordUsage: (usage: TokenUsageBreakdown) => void;
+  inspectBody?: (body: Record<string, unknown>) => void;
+  maxRounds?: number;
+  // Called as each turn is decided, before the next request goes out. This is
+  // the seam for an owner of the transcript (ConversationLedger): the loop stays
+  // transport-level and ledger-agnostic, while the ledger still sees every turn
+  // in order rather than being reconciled against a returned array afterwards.
+  onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[]) => void;
+  onToolResults?: (results: LlmToolResultBlock[]) => void;
+}): Promise<ClaudeToolLoopResult> {
+  const maxRounds = Math.max(1, input.maxRounds ?? CLAUDE_TOOL_LOOP_MAX_ROUNDS);
+  const messages: LlmMessage[] = [...input.messages];
+  let lastText = "";
+
+  for (let round = 1; round <= maxRounds; round += 1) {
+    const data = await requestClaudeMessage(
+      input.model,
+      input.systemPrompt,
+      messages,
+      { ...input.options, tools: input.tools },
+      input.recordUsage,
+      input.inspectBody,
+    );
+
+    const text = extractClaudeText(data);
+    if (text) lastText = text;
+
+    const toolUses = parseClaudeToolUses(data);
+    if (toolUses.length === 0) {
+      return { text: lastText, messages, rounds: round, exhausted: false };
+    }
+
+    messages.push({ role: "assistant", content: text, blocks: toolUses });
+    input.onAssistantTurn?.(text, toolUses);
+
+    // Every result rides in ONE user turn. Splitting them across turns is
+    // accepted by the API but teaches the model to stop calling tools in
+    // parallel, which costs a round trip on every later multi-tool turn.
+    const results: LlmToolResultBlock[] = [];
+    for (const call of toolUses) {
+      try {
+        results.push({ type: "tool_result", toolUseId: call.id, content: await input.runTool(call) });
+      } catch (error) {
+        // A thrown tool still owes the model a result: an unanswered tool_use id
+        // is a 400 on the next round, turning one tool bug into a dead loop.
+        results.push({
+          type: "tool_result",
+          toolUseId: call.id,
+          content: error instanceof Error ? error.message : String(error),
+          isError: true,
+        });
+      }
+    }
+    messages.push({ role: "user", content: "", blocks: results });
+    input.onToolResults?.(results);
+  }
+
+  return { text: lastText, messages, rounds: maxRounds, exhausted: true };
 }
 
 // Minimal request whose only purpose is to capture the rate-limit headers so the
@@ -1348,6 +1605,34 @@ export async function createLlmClient(
     systemPrompt: profile.systemPrompt,
     displayName: `${profile.name} (${profile.model})`,
     consumeTokenUsage: () => usageQueue.consume(),
+    async runToolLoop(input): Promise<ClaudeToolLoopResult> {
+      if (profile.provider !== "claude") {
+        // Tool use here is the Anthropic Messages shape; Codex would need its
+        // own translation. Fail loudly rather than silently answering without
+        // the tools the caller depends on.
+        throw new Error(`runToolLoop is not implemented for provider '${profile.provider}'.`);
+      }
+      const { systemPrompt, contents } = splitSystemPrompt(
+        input.messages,
+        input.systemPrompt ?? profile.systemPrompt,
+      );
+      return runClaudeToolLoop({
+        model: profile.model,
+        systemPrompt,
+        messages: contents,
+        tools: input.tools,
+        runTool: input.runTool,
+        options: { cacheStablePrefix: true, volatileTailMessages: 1 },
+        recordUsage: recordUsageFor(input.purpose),
+        // Inspected per round, not per turn: each round is its own request, and
+        // a prefix that stops extending mid-loop is exactly the regression the
+        // ledger is meant to make impossible.
+        inspectBody: inspectPrefixFor(input.purpose, input.cacheRoute, input.expectRebuild ?? false),
+        maxRounds: input.maxRounds,
+        onAssistantTurn: input.onAssistantTurn,
+        onToolResults: input.onToolResults,
+      });
+    },
     async generateText(input): Promise<string> {
       const recordUsage = recordUsageFor(input.purpose);
       const { systemPrompt, contents } = splitSystemPrompt(
