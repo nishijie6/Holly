@@ -299,6 +299,29 @@ export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePr
 // first was retried, so a stalled request died outright while a refused one
 // recovered — and the tool loop multiplies that exposure, since one agent turn
 // makes several requests and any of them can stall.
+// What actually went wrong, for a log line that can be correlated with anything.
+// "fetch failed" alone is undici's outer wrapper and says nothing: the cause
+// underneath distinguishes a refused connection from a dropped TLS handshake
+// from a stalled read, and those have different fixes.
+export function describeTransportError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const cause = (error as { cause?: unknown }).cause;
+  const causeText = cause instanceof Error
+    ? `${cause.name}: ${cause.message}`
+    : cause !== undefined ? String(cause) : "";
+  const code = (cause as { code?: string } | undefined)?.code;
+  return [error.name, error.message, causeText, code && `code=${code}`]
+    .filter(Boolean)
+    .join(" | ");
+}
+
+// Jittered so several in-flight calls that fail together do not all come back at
+// the same instant and re-create the burst they are retrying through.
+function retryDelayMs(attempt: number): number {
+  const backoff = FETCH_FAILED_RETRY_DELAY_MS * Math.min(4, attempt);
+  return Math.round(backoff * (0.7 + Math.random() * 0.6));
+}
+
 function isRetryableTransportError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.message.toLowerCase().includes("fetch failed")) return true;
@@ -706,10 +729,11 @@ async function requestCodexText(
       });
     } catch (error) {
       if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+        const wait = retryDelayMs(fetchAttempts);
         console.warn(
-          `Codex request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
+          `[${new Date().toISOString()}] Codex transport failed (${fetchAttempts}/${FETCH_FAILED_MAX_ATTEMPTS}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`,
         );
-        await delay(FETCH_FAILED_RETRY_DELAY_MS);
+        await delay(wait);
         continue;
       }
       throw error;
@@ -1270,11 +1294,19 @@ async function requestClaudeMessage(
       });
     } catch (error) {
       if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+        const wait = retryDelayMs(fetchAttempts);
         console.warn(
-          `Claude request fetch failed; retrying in ${FETCH_FAILED_RETRY_DELAY_MS / 1000}s (${fetchAttempts + 1}/${FETCH_FAILED_MAX_ATTEMPTS}).`,
+          `[${new Date().toISOString()}] Claude transport failed (${fetchAttempts}/${FETCH_FAILED_MAX_ATTEMPTS}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`,
         );
-        await delay(FETCH_FAILED_RETRY_DELAY_MS);
+        await delay(wait);
         continue;
+      }
+      if (isRetryableTransportError(error)) {
+        // Out of attempts. Say so explicitly: the alternative is a bare stack
+        // trace that looks identical to a code defect.
+        console.error(
+          `[${new Date().toISOString()}] Claude transport gave up after ${fetchAttempts} attempts: ${describeTransportError(error)}`,
+        );
       }
       throw error;
     }

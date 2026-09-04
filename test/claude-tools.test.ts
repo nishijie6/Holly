@@ -333,3 +333,28 @@ test("a stalled request is retried, not surfaced as a dead turn", async () => {
     globalThis.fetch = original;
   }
 });
+
+test("describeTransportError names the cause, not undici's wrapper", async () => {
+  const { describeTransportError } = await import("../llm-client.js");
+
+  // What Holly actually saw during the proxy bursts: "fetch failed" on the
+  // outside, the real reason one level down. Logging only the outer message is
+  // what made a week of these undiagnosable.
+  const wrapped = new TypeError("fetch failed");
+  (wrapped as { cause?: unknown }).cause = Object.assign(
+    new Error("Client network socket disconnected before secure TLS connection was established"),
+    { code: "ECONNRESET" },
+  );
+  const described = describeTransportError(wrapped);
+  assert.match(described, /fetch failed/);
+  assert.match(described, /secure TLS connection/);
+  assert.match(described, /code=ECONNRESET/);
+
+  // A timeout has no cause, and must still describe itself.
+  assert.match(
+    describeTransportError(new DOMException("The operation was aborted due to timeout", "TimeoutError")),
+    /TimeoutError/,
+  );
+  // Non-Errors must not crash the logger they were thrown into.
+  assert.equal(describeTransportError("plain string"), "plain string");
+});
