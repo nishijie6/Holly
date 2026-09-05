@@ -1,8 +1,8 @@
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
-import { mkdir, appendFile, readFile, writeFile } from "node:fs/promises";
+import { mkdir, appendFile, readFile, writeFile, readdir, rm, stat } from "node:fs/promises";
 import { existsSync, readFileSync, watch, type FSWatcher } from "node:fs";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { WebSocket, type RawData } from "ws";
@@ -130,6 +130,12 @@ import {
 import { shouldWarmReplyRoute } from "./context-warm-policy.js";
 import { ConversationLedger } from "./conversation-ledger.js";
 import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
+import {
+  DEFAULT_SESSION_LOG_PRUNE,
+  JSONL_RETENTION_RULES,
+  planSessionLogPrune,
+  trimJsonlContent,
+} from "./log-retention.js";
 import {
   DEFAULT_LEDGER_COMPACTION_OPTIONS,
   buildLedgerSummaryPrompt,
@@ -4394,6 +4400,65 @@ function buildFocusToolRunner(): (call: LlmToolUseBlock) => Promise<string> {
       ? { allowed: true, reason: "" }
       : { allowed: false, reason: `QQ 发送被抑制：${qqSuppressionDetail().replace(/\n/g, ", ")}` }),
   });
+}
+
+// Nothing in Holly deleted anything, so logs/ had grown to 43MB — a 21MB
+// thought history whose in-memory cap is ~400 entries, and ~140 per-session
+// transcripts, most of them a few hundred bytes from a restart that said
+// nothing. See log-retention.ts for what is in scope and what deliberately is
+// not.
+const LOG_RETENTION_INTERVAL_MS = 6 * 60 * 60 * 1000;
+
+async function runLogRetention(): Promise<void> {
+  const trimmed: string[] = [];
+  for (const rule of JSONL_RETENTION_RULES) {
+    const filePath = join(LOG_DIR, rule.file);
+    try {
+      const raw = await readFile(filePath, "utf-8");
+      const next = trimJsonlContent(raw, rule.keepLines);
+      if (next === null) continue;
+      await writeFile(filePath, next, "utf-8");
+      trimmed.push(`${rule.file}: ${raw.length} -> ${next.length} bytes`);
+    } catch {
+      // A log that does not exist yet, or cannot be read, is not a failure
+      // worth interrupting anything for.
+    }
+  }
+
+  const deleted: string[] = [];
+  try {
+    const names = (await readdir(LOG_DIR)).filter((name) => /^chat-session-.*\.log$/.test(name));
+    const files = [];
+    for (const name of names) {
+      try {
+        files.push({ name, modifiedAtMs: (await stat(join(LOG_DIR, name))).mtimeMs });
+      } catch {
+        // Raced with something else removing it; nothing to prune.
+      }
+    }
+    const activeFile = sessionLogPath ? basename(sessionLogPath) : null;
+    for (const name of planSessionLogPrune(files, {
+      ...DEFAULT_SESSION_LOG_PRUNE,
+      activeFile,
+      now: Date.now(),
+    })) {
+      await rm(join(LOG_DIR, name), { force: true });
+      deleted.push(name);
+    }
+  } catch {
+    // Directory unreadable — leave it alone rather than guess.
+  }
+
+  if (trimmed.length > 0 || deleted.length > 0) {
+    pushMonitorEntry(
+      "status",
+      "Log Retention",
+      [
+        trimmed.length > 0 ? `trimmed:\n${trimmed.join("\n")}` : "",
+        deleted.length > 0 ? `deleted ${deleted.length} session transcript(s)` : "",
+      ].filter(Boolean).join("\n"),
+    );
+  }
 }
 
 async function restoreConversationLedger(): Promise<void> {
@@ -9031,6 +9096,11 @@ async function bootstrap(): Promise<void> {
 
   // Snapshot the merged timeline to disk so a restart keeps the whole context.
   setInterval(persistConversationContext, CONVERSATION_CONTEXT_PERSIST_INTERVAL_MS);
+
+  // Keep logs/ from growing without bound. Runs once at boot too, since a
+  // process that restarts often would otherwise never reach the interval.
+  void runLogRetention();
+  setInterval(() => { void runLogRetention(); }, LOG_RETENTION_INTERVAL_MS);
   const flushContextAndExit = () => {
     if (qqModeReconsiderTimer) {
       clearTimeout(qqModeReconsiderTimer);
