@@ -130,6 +130,7 @@ import {
 import { shouldWarmReplyRoute } from "./context-warm-policy.js";
 import { ConversationLedger } from "./conversation-ledger.js";
 import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
+import { JsonlLog } from "./jsonl-log.js";
 import {
   DEFAULT_SESSION_LOG_PRUNE,
   JSONL_RETENTION_RULES,
@@ -686,7 +687,6 @@ let conversationContextStore: ConversationContextStore | null = null;
 let conversationHistoryPersistDirty = false;
 let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
-let proactiveShadowQueue: Promise<void> = Promise.resolve();
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
 let browserAgentConfig: BrowserAgentRuntimeConfig = DEFAULT_BROWSER_AGENT_CONFIG;
 let hollyBootstrapConfig: HollyBootstrapConfig = DEFAULT_HOLLY_BOOTSTRAP_CONFIG;
@@ -715,7 +715,6 @@ let readOnlyMode = false;
 let readOnlyPersistQueue: Promise<void> = Promise.resolve();
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
-let aiToneShadowQueue: Promise<void> = Promise.resolve();
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // Groups whose own history grew since the last warm pass (single-group focus:
 // each group now has its own cache-stable prefix, so warming is per-group —
@@ -5104,33 +5103,27 @@ function recordOutgoingAiTone(text: string, groupId: number | string | null): vo
     label: result.label,
     text: cleaned,
   };
-  aiToneShadowQueue = aiToneShadowQueue
-    .then(async () => {
-      await mkdir(LOG_DIR, { recursive: true });
-      await appendFile(AI_TONE_SHADOW_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
-    })
-    .catch((error) => {
-      console.error("Failed to write ai-tone shadow log:", error);
-    });
+  aiToneShadowLog.append(record);
 }
 
 const PROACTIVE_SHADOW_LOG_PATH = join(LOG_DIR, "proactive-shadow.jsonl");
 
 function appendProactiveShadowLog(record: Record<string, unknown>): void {
-  proactiveShadowQueue = proactiveShadowQueue
-    .then(async () => {
-      await mkdir(LOG_DIR, { recursive: true });
-      await appendFile(PROACTIVE_SHADOW_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
-    })
-    .catch((error) => {
-      console.error("Failed to write proactive shadow log:", error);
-    });
+  proactiveShadowLog.append(record);
 }
 
 const WORLD_OBSERVATION_LOG_PATH = join(LOG_DIR, "world-observations.jsonl");
 const HOLLY_MEMORY_LOG_PATH = join(LOG_DIR, "holly-memories.jsonl");
 const BOOT_THOUGHT_LOG_PATH = join(LOG_DIR, "boot-thoughts.jsonl");
 const THOUGHT_HISTORY_LOG_PATH = join(LOG_DIR, "thought-history.jsonl");
+
+// One queue each. Three of these previously chained onto the proactive shadow
+// log's queue, which serialized four unrelated files behind one another.
+const aiToneShadowLog = new JsonlLog(AI_TONE_SHADOW_LOG_PATH, "ai-tone shadow log");
+const proactiveShadowLog = new JsonlLog(PROACTIVE_SHADOW_LOG_PATH, "proactive shadow log");
+const worldObservationLog = new JsonlLog(WORLD_OBSERVATION_LOG_PATH, "world observation log");
+const hollyMemoryLog = new JsonlLog(HOLLY_MEMORY_LOG_PATH, "Holly memory log");
+const bootThoughtLog = new JsonlLog(BOOT_THOUGHT_LOG_PATH, "Holly boot thought log");
 const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
 const MEMORY_REFLECTION_WORLD_LIMIT = 6;
 const MEMORY_REFLECTION_INTERNAL_LIMIT = 6;
@@ -5185,36 +5178,15 @@ function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
 }
 
 function appendWorldObservationLog(record: Record<string, unknown>): void {
-  proactiveShadowQueue = proactiveShadowQueue
-    .then(async () => {
-      await mkdir(LOG_DIR, { recursive: true });
-      await appendFile(WORLD_OBSERVATION_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
-    })
-    .catch((error) => {
-      console.error("Failed to write world observation log:", error);
-    });
+  worldObservationLog.append(record);
 }
 
 function appendHollyMemoryLog(record: Record<string, unknown>): void {
-  proactiveShadowQueue = proactiveShadowQueue
-    .then(async () => {
-      await mkdir(LOG_DIR, { recursive: true });
-      await appendFile(HOLLY_MEMORY_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
-    })
-    .catch((error) => {
-      console.error("Failed to write Holly memory log:", error);
-    });
+  hollyMemoryLog.append(record);
 }
 
 function appendBootThoughtLog(record: Record<string, unknown>): void {
-  proactiveShadowQueue = proactiveShadowQueue
-    .then(async () => {
-      await mkdir(LOG_DIR, { recursive: true });
-      await appendFile(BOOT_THOUGHT_LOG_PATH, `${JSON.stringify(record)}\n`, "utf-8");
-    })
-    .catch((error) => {
-      console.error("Failed to write Holly boot thought log:", error);
-    });
+  bootThoughtLog.append(record);
 }
 
 function toSidebarMemoryRecord(record: Record<string, unknown>): AutonomySidebarMemory | null {
