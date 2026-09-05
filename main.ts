@@ -642,6 +642,10 @@ let wsClient: WebSocket | null = null;
 let wsReconnectTimer: NodeJS.Timeout | null = null;
 let qqModeReconsiderTimer: NodeJS.Timeout | null = null;
 let monitorHistory: MonitorEntry[] = [];
+// Declared here, not with the other log paths further down: pushMonitorEntry is
+// defined above those and a const in the temporal dead zone would throw a
+// ReferenceError if anything logged during module initialisation.
+const monitorLog = new JsonlLog(join(LOG_DIR, "monitor.jsonl"), "monitor log");
 let activeLlmClient: LlmClient | null = null;
 let decisionLlmClient: LlmClient | null = null;
 let activeLlmLabel = "Assistant";
@@ -2918,6 +2922,17 @@ function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, l
     timestamp: new Date().toISOString(),
     ...(label ? { label } : {}),
   };
+
+  // Holly's richest signal — prefix drift, watchdog restarts, compaction, every
+  // model error — flowed only into monitorHistory, an in-memory ring of
+  // WS_HISTORY_LIMIT entries that a restart emptied. So the one stream worth
+  // reading after an incident was the one stream that never survived it. The
+  // monitor UI still shows this session; the file is what makes yesterday
+  // answerable.
+  //
+  // `id` is per-process and restarts at 1, so it is deliberately not written:
+  // across restarts it is not a key, and looking like one would mislead.
+  monitorLog.append({ ts: entry.timestamp, kind, title, body, ...(label ? { label } : {}) });
 
   monitorHistory = [...monitorHistory.slice(-(WS_HISTORY_LIMIT - 1)), entry];
   broadcastMonitorEvent({

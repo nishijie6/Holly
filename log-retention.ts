@@ -27,6 +27,9 @@ export type JsonlRetentionRule = {
 };
 
 export const JSONL_RETENTION_RULES: readonly JsonlRetentionRule[] = [
+  // The highest-volume log here: every monitor entry, and there are 153 call
+  // sites. Kept longest anyway — it is the one people read after an incident.
+  { file: "monitor.jsonl", keepLines: 20_000, readBy: "nothing at runtime — for post-incident reading" },
   { file: "thought-history.jsonl", keepLines: 5_000, readBy: "ThoughtHistoryStore (in-memory cap ~400)" },
   { file: "world-observations.jsonl", keepLines: 2_000, readBy: "loadWorldObservationMemory (cap 128)" },
   { file: "holly-memories.jsonl", keepLines: 2_000, readBy: "memory sidebar (slice(-12))" },
