@@ -245,6 +245,67 @@ function userEngagedAfter(history: ProactiveTurn[], sentAt: number, successWindo
   return false;
 }
 
+// ②③④ 三道闸合成一个判断：这个群此刻有没有一个「该捡起来的话题」。
+//
+// 抽出来是为了让 hasProactiveWork 能在不调模型、不产生任何副作用的前提下问同一个问题。
+// 两处各写一份闸门迟早会漂，而漂的后果很隐蔽：预查说没事、真跑起来却有事（漏了一次主动
+// 发言），或者反过来每轮都说有事（降频白做）。
+//
+// 注意这里读 pendingObservation 只当作「这个群正在观察窗里，别叠第二个」。真正需要跑结算
+// 的情况由调用方各自处理：runProactiveTick 在 ① 里结算，hasProactiveWork 直接据此返回
+// true——结算有副作用，不能放进这个纯判断里。
+function findActionableThread(
+  deps: ProactiveDeps,
+  groupKey: string,
+  history: ProactiveTurn[],
+  now: number,
+): DroppedThread | null {
+  const cfg = deps.config;
+  if (history.length === 0) return null;
+  const last = history[history.length - 1];
+  const lastMs = parseTs(last.timestamp);
+  if (!Number.isFinite(lastMs)) return null;
+  const lull = now - lastMs;
+  const g = deps.state.getGroup(groupKey);
+
+  if (cfg.echoOnlyGroups.includes(groupKey)) return null;
+  if (last.role === "assistant") return null;
+  const factor = backoffFactor(g.backoffLevel, cfg.backoffMultiplier);
+  if (lull < cfg.lullMinMs * factor) return null;
+  if (lull > cfg.lullDeadzoneMs) return null;
+  if (g.pendingObservation) return null; // 一次只追一个观察窗
+  if (g.dailyCount >= cfg.perGroupDailyCap) return null;
+  if (deps.state.globalDailyCount() >= cfg.globalDailyCap) return null;
+  if (g.lastProactiveAt > 0 && now - g.lastProactiveAt < cfg.cooldownMs * factor) return null;
+
+  const thread = findDroppedInterestThread(history, cfg);
+  if (!thread) return null;
+  if (deps.state.isThreadEngaged(groupKey, thread.threadKey, now)) return null;
+  return thread;
+}
+
+// 这一轮 autonomy tick 里，主动发言这条线有没有事可做。
+//
+// 存在的理由是省钱：autonomy 每分钟醒一次，每次都无条件问一遍判断模型「现在该干什么」，
+// 一天九百多次、每次七百来 token，而且这些请求短到够不着最小可缓存长度，一个 token 的
+// 缓存都吃不上。真相是绝大多数轮次三个定时候选都没到期、主动发言也在冷却里——那一轮
+// 无论模型怎么答都只能是 do_nothing，这次调用纯属白花。
+//
+// 返回 true 的两种情形，缺一不可：
+//   - 有群还挂着待结算的观察窗。结算必须发生，否则 backoffLevel 永远不更新，而
+//     findActionableThread 又因为 pendingObservation 还在而一直说没事做——两边一卡就是
+//     死锁，那个群再也不会被主动发言碰到。
+//   - 有群真的通过了全部规则闸。
+export function hasProactiveWork(deps: ProactiveDeps): boolean {
+  if (!deps.config.enabled) return false;
+  const now = deps.now();
+  for (const groupKey of deps.listGroups()) {
+    if (deps.state.getGroup(groupKey).pendingObservation) return true;
+    if (findActionableThread(deps, groupKey, deps.getHistory(groupKey), now)) return true;
+  }
+  return false;
+}
+
 export async function runProactiveTick(deps: ProactiveDeps): Promise<ProactiveTickResult> {
   const cfg = deps.config;
   const actions: ProactiveGroupAction[] = [];
@@ -281,22 +342,13 @@ export async function runProactiveTick(deps: ProactiveDeps): Promise<ProactiveTi
       }
     }
 
-    // ② 规则闸
-    if (cfg.echoOnlyGroups.includes(groupKey)) continue;
-    if (last.role === "assistant") continue;
-    const factor = backoffFactor(g.backoffLevel, cfg.backoffMultiplier);
-    if (lull < cfg.lullMinMs * factor) continue;
-    if (lull > cfg.lullDeadzoneMs) continue;
-    if (g.pendingObservation) continue; // 一次只追一个观察窗
-    if (g.dailyCount >= cfg.perGroupDailyCap) continue;
-    if (deps.state.globalDailyCount() >= cfg.globalDailyCap) continue;
-    if (g.lastProactiveAt > 0 && now - g.lastProactiveAt < cfg.cooldownMs * factor) continue;
-
-    // ③ 找被冷掉的兴趣话题
-    const thread = findDroppedInterestThread(history, cfg);
+    // ②③④ 规则闸 + 找话题 + 已接过。全部确定性，不碰模型，所以 hasProactiveWork
+    // 能拿同一个函数提前问一遍「这一轮到底有没有事可做」。
+    const thread = findActionableThread(deps, groupKey, history, now);
     if (!thread) continue;
-    // ④ 已接过(TTL 内)
-    if (deps.state.isThreadEngaged(groupKey, thread.threadKey, now)) continue;
+    // 发送前复查还要用退避系数。闸门本身已经在 findActionableThread 里查过了，这里重算
+    // 一次是因为 ① 的结算可能刚刚动过 backoffLevel。
+    const factor = backoffFactor(deps.state.getGroup(groupKey).backoffLevel, cfg.backoffMultiplier);
 
     // ⑤ 门控B:模型判要不要捡 + 写话。时间线不再做摘录/额外标记 —— 指令只报
     //    group_id + 本次触发周期起点,模型直接读全局时间线末尾。

@@ -81,6 +81,7 @@ import { ConversationContextStore } from "./context-store.js";
 import {
   runProactiveTick,
   buildProactiveRevivePrompt,
+  hasProactiveWork,
   type ProactiveConfig,
   type ProactiveDecision,
   type ProactiveDeps,
@@ -145,7 +146,13 @@ import {
   allocateVariableContextBudgets,
   modelContextWindowTokens,
 } from "./context-budget.js";
-import { shouldWarmReplyRoute } from "./context-warm-policy.js";
+import {
+  DEFAULT_CONTEXT_WARM_CONFIG,
+  parseContextWarmConfig,
+  shouldWarmReplyRoute,
+  type ContextWarmConfig,
+} from "./context-warm-policy.js";
+import { selectObservationWindow } from "./world-observation-window.js";
 import { ConversationLedger } from "./conversation-ledger.js";
 import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
 import { JsonlLog } from "./jsonl-log.js";
@@ -161,6 +168,12 @@ import {
   planLedgerCompaction,
 } from "./ledger-compaction.js";
 import { decideFocus } from "./focus-policy.js";
+import {
+  buildFocusForegroundInjection,
+  buildFocusNotificationInjection,
+  buildFocusSystemPrompt,
+  type FocusInjectionInput,
+} from "./focus-prompt.js";
 import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
 import { QQ_TOOL_DEFINITIONS, createQqToolRunner, type ConversationSummary } from "./qq-tools.js";
 import {
@@ -849,6 +862,7 @@ let contextBudgetConfig: ContextBudgetConfig = {
 };
 let privateChatConfig: PrivateChatConfig = { ...DEFAULT_PRIVATE_CHAT_CONFIG };
 let focusModeConfig: FocusModeConfig = { ...DEFAULT_FOCUS_MODE_CONFIG };
+let contextWarmConfig: ContextWarmConfig = { ...DEFAULT_CONTEXT_WARM_CONFIG };
 // The focus pipeline's whole context. One lineage, so one cache route.
 const conversationLedger = new ConversationLedger({
   // Fire-and-forget: LedgerStore serializes its own writes, so order holds, and
@@ -1165,6 +1179,18 @@ async function loadPrivateChatConfig(configPath: string): Promise<PrivateChatCon
     return parsePrivateChatConfig(parsed.private_chat, environmentBotUserId);
   } catch {
     return parsePrivateChatConfig(undefined, environmentBotUserId);
+  }
+}
+
+async function loadContextWarmConfig(configPath: string): Promise<ContextWarmConfig> {
+  if (!existsSync(configPath)) {
+    return parseContextWarmConfig(undefined);
+  }
+  try {
+    const parsed = (YAML.parse(await readFile(configPath, "utf-8")) as Record<string, unknown> | null) ?? {};
+    return parseContextWarmConfig(parsed.context_warm);
+  } catch {
+    return parseContextWarmConfig(undefined);
   }
 }
 
@@ -4899,23 +4925,47 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
     }, adminPolicyConfig),
   }, privateChatConfig.botUserId);
 
-  const batchText = formatUnreadMessagesForModel(messages);
+  // 注入文本的渲染全在 focus-prompt.ts;这里只把素材凑齐。老管线的
+  // formatUnreadMessagesForModel 不能复用:它按「消息内容已经在缓存前缀的时间线上」
+  // 这个前提写的,只输出 current_time / group_id 这类元数据,而后台通知路径并不推
+  // 时间线——照搬会让模型收到一条没有任何消息内容的通知。
+  const adminMessages = messages.filter((item) => (
+    item.context.isAdmin === true
+    && shouldForceAdminReply({
+      userId: item.context.userId,
+      messageType: item.context.replyTargetType,
+    }, adminPolicyConfig)
+  ));
+  const latestCodeJob = [...adminMessages]
+    .reverse()
+    .find((item) => item.context.adminCodeJobId || item.context.adminCodeJobNote);
+  const injection: FocusInjectionInput = {
+    conversationLabel: formatConversationKey(groupKey),
+    reason: decision.reason,
+    currentTime: formatLocalDateTimeForModel(),
+    recent: decision.foreground
+      ? renderConversationRecent(groupKey, focusModeConfig.recentTurnsPerConversation) ?? []
+      : [],
+    batch: messages.map((item) => ({
+      senderLabel: formatConversationSenderLabel(item.context.senderName, item.context.userId),
+      text: compactSameGroupConversationContent(item.message),
+    })),
+    adminUserIds: adminMessages
+      .map((item) => item.context.userId)
+      .filter((userId): userId is string => Boolean(userId)),
+    codeJobId: latestCodeJob?.context.adminCodeJobId ?? null,
+    codeJobNote: latestCodeJob?.context.adminCodeJobNote ?? null,
+  };
+
   if (decision.foreground) {
     // Being addressed is not something the model gets to overlook: take the
     // focus and put the content in front of it, no tool call required.
     setFocusConversationId(groupKey);
-    const recent = renderConversationRecent(groupKey, focusModeConfig.recentTurnsPerConversation) ?? [];
-    conversationLedger.appendUserText(
-      [`[当前会话已切到 ${formatConversationKey(groupKey)}（${decision.reason}）]`, ...recent, batchText]
-        .filter(Boolean)
-        .join("\n"),
-    );
+    conversationLedger.appendUserText(buildFocusForegroundInjection(injection));
   } else {
     // Ambient traffic is a headline, not a transcript. Whether it is worth
     // opening is the model's call — that is the whole point of the model.
-    conversationLedger.appendUserText(
-      `[通知] ${formatConversationKey(groupKey)} 有新消息：${batchText.slice(0, 200)}`,
-    );
+    conversationLedger.appendUserText(buildFocusNotificationInjection(injection));
   }
 
   const compacted = await compactLedgerIfNeeded(client);
@@ -4929,7 +4979,8 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
       runTool: buildFocusToolRunner(),
       purpose: "focus-loop",
       cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
-      systemPrompt: buildModelSystemPrompt(client.systemPrompt).trim(),
+      // persona + focus 协议,不是 persona + 决策协议:见 focus-prompt.ts 开头。
+      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
       maxRounds: focusModeConfig.maxRounds,
       onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
       onToolResults: (results) => conversationLedger.appendToolResults(results),
@@ -5379,6 +5430,13 @@ async function warmGroupContext(groupKey: string): Promise<void> {
 // drains the dirty set into L1 events — see dispatchContextWarmDue for what
 // actually runs a warm and for the re-arm-on-failure behaviour.
 function scheduleContextWarm(): void {
+  // 总开关先于一切:预热在当前流量下是净亏的,理由写在 context-warm-policy.ts
+  // 的 ContextWarmConfig 上面。关掉时连脏群集合都不清——留着它,等哪天配置打开,
+  // 第一轮就能把积压的群一次性预热上,而不是干等下一条消息来重新标脏。
+  if (!contextWarmConfig.enabled) {
+    return;
+  }
+
   // The warm cache only serves group replies; in read-only mode none happen,
   // so warming would burn tokens for nothing.
   if (!isQqParticipationEnabled()) {
@@ -5480,7 +5538,8 @@ const worldObservationLog = new JsonlLog(WORLD_OBSERVATION_LOG_PATH, "world obse
 const hollyMemoryLog = new JsonlLog(HOLLY_MEMORY_LOG_PATH, "Holly memory log");
 const bootThoughtLog = new JsonlLog(BOOT_THOUGHT_LOG_PATH, "Holly boot thought log");
 const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
-const MEMORY_REFLECTION_WORLD_LIMIT = 6;
+// 进反思上下文的世界观察条数不再是一个定值：滞后窗口让它在 lowWater~highWater 之间
+// 浮动，参数与理由见 world-observation-window.ts。
 const MEMORY_REFLECTION_INTERNAL_LIMIT = 6;
 const MEMORY_REFLECTION_TURN_LIMIT = 16;
 
@@ -6525,19 +6584,31 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
 // someone to hunt for a volatile value that broke the prefix.
 const autonomyStablePrefixes = new StablePrefixLedger();
 
-function formatWorldObservationsForReflection(nowMs: number): string[] {
-  return [...worldObservationMemory]
-    .filter((item) => nowMs - item.observedAtMs <= 24 * 60 * 60 * 1000)
-    .slice(-MEMORY_REFLECTION_WORLD_LIMIT)
-    .map((item, index) => [
-      `World observation ${index + 1}:`,
-      `- observed_at: ${new Date(item.observedAtMs).toISOString()}`,
-      `- topic: ${item.topic}`,
-      `- query: ${item.observation.query}`,
-      `- urls: ${item.observation.urls.slice(0, 3).join(" ") || "(none)"}`,
-      `- page_errors: ${(item.observation.pageErrors ?? []).slice(0, 3).join(" ") || "(none)"}`,
-      `- summary: ${compactReflectionText(item.observation.summary, 900)}`,
-    ].join("\n"));
+// 窗口起点。进程内活着就行——重启后从 0 起算，第一次反思重建一次前缀，之后照常滞后。
+// 落盘反而要处理「盘上的起点指向一条已被 24h 规则淘汰的观察」，不值那个复杂度。
+let worldObservationWindowFromMs = 0;
+
+// 不再接 nowMs：按当前时间重新过滤正是旧版让前缀凭空漂移的原因，见
+// world-observation-window.ts。24h 过期和 128 条上限归 rememberWorldObservation 管。
+//
+// 记忆反思、归档写作、启动定向三条路线共用这一个窗口，是沿用原来的有意设计——它们读
+// 同一批世界观察，共用窗口才能让三边的断点落在同一处。窗口推进时哪条路线该报重建，由
+// 各自的 autonomyStablePrefixes.changed(route, stable) 分别判断，所以这里不必也不该
+// 返回一个「谁先调用谁消费掉」的 compacted 标志。
+function formatWorldObservationsForReflection(): string[] {
+  const selection = selectObservationWindow(worldObservationMemory, worldObservationWindowFromMs);
+  worldObservationWindowFromMs = selection.fromMs;
+  // 不再按数组下标编号：下标随窗口移动集体左移，会把「只追加了一条」变成「整段都变了」。
+  // observed_at 本来就是稳定且唯一的标识，够用了。
+  return selection.window.map((item) => [
+    "World observation:",
+    `- observed_at: ${new Date(item.observedAtMs).toISOString()}`,
+    `- topic: ${item.topic}`,
+    `- query: ${item.observation.query}`,
+    `- urls: ${item.observation.urls.slice(0, 3).join(" ") || "(none)"}`,
+    `- page_errors: ${(item.observation.pageErrors ?? []).slice(0, 3).join(" ") || "(none)"}`,
+    `- summary: ${compactReflectionText(item.observation.summary, 900)}`,
+  ].join("\n"));
 }
 
 async function formatInternalMemoriesForReflection(): Promise<string[]> {
@@ -6619,8 +6690,7 @@ async function reflectMemoryForAutonomy(
   const client = activeLlmClient;
   if (!client) return null;
 
-  const nowMs = Date.parse(request.nowIso);
-  const worldBlocks = formatWorldObservationsForReflection(Number.isFinite(nowMs) ? nowMs : Date.now());
+  const worldBlocks = formatWorldObservationsForReflection();
   const internalBlocks = await formatInternalMemoriesForReflection();
   const conversationBlocks = formatRecentTurnsForReflection();
   const stableMaterial = worldBlocks.filter(Boolean);
@@ -6717,7 +6787,6 @@ function countRestoredConversationTurns(): number {
 }
 
 async function buildHollyBootstrapMaterial(): Promise<string[]> {
-  const now = Date.now();
   let qdrantMemories: string[] = [];
   try {
     qdrantMemories = await formatInternalMemoriesForReflection();
@@ -6737,7 +6806,7 @@ async function buildHollyBootstrapMaterial(): Promise<string[]> {
         `- content: ${compactReflectionText(memory.content, 600)}`,
       ].join("\n"));
   return [
-    ...formatWorldObservationsForReflection(now),
+    ...formatWorldObservationsForReflection(),
     ...qdrantMemories,
     ...localMemories,
     ...formatRecentTurnsForReflection(),
@@ -7265,8 +7334,7 @@ async function composeArchiveForAutonomy(
   const client = activeLlmClient;
   if (!client) return null;
 
-  const nowMs = Date.parse(request.nowIso);
-  const worldBlocks = formatWorldObservationsForReflection(Number.isFinite(nowMs) ? nowMs : Date.now());
+  const worldBlocks = formatWorldObservationsForReflection();
   const internalBlocks = await formatInternalMemoriesForReflection();
   const conversationBlocks = formatRecentTurnsForReflection();
   const recentTitles = archiveWorks.slice(-8).map((work) => `- [${work.kind}] ${work.title}`);
@@ -7634,6 +7702,13 @@ function buildAutonomyDeps() {
     writeArchive: writeArchiveForAutonomy,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
     requestJudgment: requestAutonomyJudgment,
+    // 让 autonomy 在三个定时候选都没到期时能先问一句「主动发言有事做吗」，没有就整轮
+    // 跳过判断调用。闸门复用 proactive 自己那套，见 proactive-engine.hasProactiveWork。
+    hasProactiveWork: () => {
+      if (!isQqParticipationEnabled()) return false;
+      const proactiveDeps = buildProactiveDeps();
+      return proactiveDeps !== null && hasProactiveWork(proactiveDeps);
+    },
     pendingReplyGroupCount: () => unreadModelMessagesByGroup.size,
     log: (kind: "status" | "error", title: string, body: string) => {
       pushMonitorEntry(kind, title, body);
@@ -10217,6 +10292,7 @@ async function bootstrap(): Promise<void> {
   const loadedAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const loadedPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
   const loadedFocusModeConfig = await loadFocusModeConfig(CONFIG_PATH);
+  const loadedContextWarmConfig = await loadContextWarmConfig(CONFIG_PATH);
   readOnlyMode = await loadReadOnlyConfig(CONFIG_PATH);
   const client = await createWatchedLlmClient(CONFIG_PATH, requestedProfile);
   const decisionClient = requestedDecisionProfile === client.profileName
@@ -10240,6 +10316,7 @@ async function bootstrap(): Promise<void> {
   adminPolicyConfig = loadedAdminPolicyConfig;
   privateChatConfig = loadedPrivateChatConfig;
   focusModeConfig = loadedFocusModeConfig;
+  contextWarmConfig = loadedContextWarmConfig;
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);

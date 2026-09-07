@@ -85,6 +85,9 @@ function baseDeps(overrides: Partial<AutonomyDeps> & { config?: AutonomyConfig; 
     writeArchive: unexpected("writeArchive"),
     runGroupProactiveAction: unexpected("runGroupProactiveAction"),
     requestJudgment: async () => ({ action: "do_nothing", reason: "test default" }),
+    // 默认「主动发言没事做」：这样一个三候选都没到期的 deps 会走短路，想测判断调用的
+    // 用例本来就都有候选到期，不受影响。
+    hasProactiveWork: () => false,
     pendingReplyGroupCount: () => 0,
     log: () => {},
     recordWorldObservation: () => {},
@@ -412,4 +415,94 @@ test("an eligible-but-unpicked candidate is traced as deferred, not disabled/wai
   const worldCheck = result.checks.find((c) => c.name === "world_observation");
   assert.equal(worldCheck?.status, "deferred");
   assert.match(worldCheck?.reason ?? "", /选择优先做别的/);
+});
+
+// 什么都做不了的那一轮跳过判断调用。
+//
+// 这是 autonomy 最贵的一条线：每分钟一次、一天九百多次，而且每次七百来 token 都够不着
+// 最小可缓存长度，一个 token 的缓存都吃不上。绝大多数轮次三个定时候选都没到期、主动发言
+// 也在冷却里，那一轮无论模型答什么都只能是 do_nothing。下面钉的是「省得对」：该省的省掉，
+// 不该省的一次都不能省——漏掉一次主动发言的机会，代价是 Holly 该说话时没说。
+
+const allIdleState = () => baseState({
+  // 三个定时候选都刚做过，离下次到期还早。
+  lastWorldObservationAt: NOW - 1 * MIN,
+  lastMemoryReflectionAt: NOW - 1 * MIN,
+  lastArchiveWritingAt: NOW - 1 * MIN,
+});
+
+test("三候选未到期且主动发言无事可做 → 不调判断模型", async () => {
+  let judgmentCalls = 0;
+  const result = await runAutonomyLoop(baseDeps({
+    state: allIdleState(),
+    hasProactiveWork: () => false,
+    requestJudgment: async () => {
+      judgmentCalls += 1;
+      return { action: "do_nothing", reason: "should not be reached" };
+    },
+  }));
+
+  assert.equal(judgmentCalls, 0);
+  assert.equal(result.action.type, "do_nothing");
+  assert.match(result.action.reason, /跳过判断调用/u);
+});
+
+test("主动发言有事可做时照常问模型，哪怕三个定时候选都没到期", async () => {
+  let judgmentCalls = 0;
+  await runAutonomyLoop(baseDeps({
+    state: allIdleState(),
+    // 冷场到点了，或者有观察窗等着结算——这一轮是有事可做的，省不得。
+    hasProactiveWork: () => true,
+    requestJudgment: async () => {
+      judgmentCalls += 1;
+      return { action: "do_nothing", reason: "模型说这轮算了" };
+    },
+  }));
+
+  assert.equal(judgmentCalls, 1);
+});
+
+test("任何一个定时候选到期都照常问模型，不看主动发言的脸色", async () => {
+  for (const [label, state] of [
+    ["world", baseState({ lastWorldObservationAt: NOW - 65 * MIN, lastMemoryReflectionAt: NOW - 1 * MIN, lastArchiveWritingAt: NOW - 1 * MIN })],
+    ["memory", baseState({ lastWorldObservationAt: NOW - 1 * MIN, lastMemoryReflectionAt: NOW - 35 * MIN, lastArchiveWritingAt: NOW - 1 * MIN })],
+  ] as const) {
+    let judgmentCalls = 0;
+    await runAutonomyLoop(baseDeps({
+      state,
+      hasProactiveWork: () => false,
+      requestJudgment: async () => {
+        judgmentCalls += 1;
+        return { action: "do_nothing", reason: "模型说这轮算了" };
+      },
+    }));
+    assert.equal(judgmentCalls, 1, `${label} 到期时必须问模型`);
+  }
+});
+
+test("跳过的那一轮，trace 说的是真实原因，不是「模型选择优先做别的」", async () => {
+  const result = await runAutonomyLoop(baseDeps({
+    state: allIdleState(),
+    hasProactiveWork: () => false,
+  }));
+
+  assert.equal(result.checks.length, 4);
+  for (const check of result.checks) {
+    // 模型这一轮压根没被问过，任何暗示它做了选择的措辞都是在撒谎。
+    assert.equal(check.reason.includes("模型本轮选择优先做别的"), false);
+  }
+  const proactive = result.checks.find((check) => check.name === "group_proactive");
+  assert.match(proactive?.reason ?? "", /规则闸未通过/u);
+  // 三个定时候选各自带着自己的「还差多久到期」，这是排查时唯一有用的东西。
+  const world = result.checks.find((check) => check.name === "world_observation");
+  // waiting 而不是 deferred：这一轮没有任何「选择」发生，它就是在等到期而已。
+  assert.equal(world?.status, "waiting");
+  assert.notEqual(world?.nextEligibleAt, null);
+});
+
+test("短路不写状态：跳过的那一轮不该看起来像做过什么", async () => {
+  const state = allIdleState();
+  const before = JSON.stringify(state);
+  await runAutonomyLoop(baseDeps({ state, hasProactiveWork: () => false }));
+  assert.equal(JSON.stringify(state), before);
 });

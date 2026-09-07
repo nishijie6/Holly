@@ -147,6 +147,9 @@ export type AutonomyDeps = {
   writeArchive: (request: AutonomyArchiveWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
   requestJudgment: (request: AutonomyJudgmentRequest) => Promise<AutonomyJudgmentDecision>;
+  // 主动发言这条线此刻有没有事可做。确定性、无副作用，用来在三个定时候选都没到期时
+  // 省掉那次判断调用——见下面 runAutonomyLoop 里的短路。
+  hasProactiveWork: () => boolean;
   pendingReplyGroupCount: () => number;
   log: (kind: "status" | "error", title: string, body: string) => void;
   recordWorldObservation: (record: Record<string, unknown>) => void;
@@ -363,6 +366,31 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
   // itself (a dep implementation that throws instead of resolving). Either
   // way, one bad tick degrades to do_nothing instead of propagating up to
   // dispatchAutonomyTickDue's catch as a full tick failure.
+  // 什么都做不了的那一轮，不必花钱问模型该做什么。
+  //
+  // autonomy 每分钟醒一次，判断调用一天九百多次、每次七百来 token，而且短到够不着最小
+  // 可缓存长度——一个 token 的缓存都吃不上，那七百 token 每次都按未缓存全价重付。绝大
+  // 多数轮次三个定时候选都没到期、主动发言也在冷却里，那一轮无论模型答什么都只能落到
+  // do_nothing，这次调用纯属白花。
+  //
+  // 短路条件取得保守：只要还有任何一条线可能动，就照常问模型。尤其是主动发言，它的资格
+  // 由 proactive 那边的规则闸说了算（包括「有观察窗待结算」这种必须跑一趟的情况），所以
+  // 这里问的是 hasProactiveWork 而不是自己另写一套判断。判断权本身没有被拿走：模型仍然
+  // 是在「可做的事情」之间选，只是没有可选项时不再走一趟。
+  if (!worldEligible && !memoryEligible && !archiveEligible && !deps.hasProactiveWork()) {
+    return {
+      action: { type: "do_nothing", reason: "无候选到期，跳过判断调用" },
+      // 三个定时候选各自报自己真实的「为什么没到期」，主动发言报规则闸没过。都不写成
+      // 「模型本轮选择优先做别的」——模型这一轮压根没被问，那样写会让 trace 撒谎。
+      checks: [
+        worldNotDueCheck!,
+        memoryNotDueCheck!,
+        archiveNotDueCheck!,
+        ...deferredChecks(["group_proactive"], "群聊规则闸未通过（冷场时长/冷却/限流）"),
+      ],
+    };
+  }
+
   let rawDecision: AutonomyJudgmentDecision;
   try {
     rawDecision = await deps.requestJudgment({
