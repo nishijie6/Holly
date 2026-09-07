@@ -254,6 +254,8 @@ test("a call's cache hit rate is measured against the input it actually accounte
     accountedInputTokens: 1_000,
     hitRate: 0.8,
     minimumPrefixTokens: 1_024,
+    cacheablePrefixTokens: null,
+    uncacheableReason: null,
     belowMinimum: false,
   });
 });
@@ -273,6 +275,8 @@ test("a warm call that only writes cache reports a 0% hit rather than nothing", 
     accountedInputTokens: 54_643,
     hitRate: 0,
     minimumPrefixTokens: 1_024,
+    cacheablePrefixTokens: null,
+    uncacheableReason: null,
     belowMinimum: false,
   });
 });
@@ -453,4 +457,77 @@ test("uncacheable calls are counted but never diluted into the rate", async () =
   assert.equal(stat.uncacheableInputTokens, 260);
   assert.equal(stat.uncachedInputTokens, 0);
   assert.equal(stat.hitRate, null);
+});
+
+test("a large request with a tiny prefix is a fixable miss, not an excused one", async () => {
+  const { summarizePromptCacheCall } = await loadUsageModule();
+  // memory-reflection as it actually ran: 11k tokens on the wire, but the
+  // breakpoint sat on a 40-token system constant, so no entry could exist.
+  const summary = summarizePromptCacheCall({
+    inputTokens: 11_112,
+    uncachedInputTokens: 11_112,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 123,
+    cacheablePrefixTokens: 40,
+  }, "claude-opus-4-7");
+
+  assert.equal(summary?.uncacheableReason, "prefix-too-small");
+  assert.equal(summary?.cacheablePrefixTokens, 40);
+  // Still a miss: unlike a request that is simply too small, this one had 11k
+  // tokens a correctly placed breakpoint could have covered.
+  assert.equal(summary?.belowMinimum, false);
+  assert.equal(summary?.hitRate, 0);
+});
+
+test("a request under the minimum stays excused even when the prefix is measured", async () => {
+  const { summarizePromptCacheCall } = await loadUsageModule();
+  // autonomy-judgment: 711 tokens total, under sonnet-4-6's 1024. No breakpoint
+  // placement could rescue this one.
+  const summary = summarizePromptCacheCall({
+    inputTokens: 711,
+    uncachedInputTokens: 711,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 47,
+    cacheablePrefixTokens: 30,
+  }, "claude-sonnet-4-6");
+
+  assert.equal(summary?.uncacheableReason, "request-too-small");
+  assert.equal(summary?.belowMinimum, true);
+  assert.equal(summary?.hitRate, null);
+});
+
+test("a prefix that clears the minimum but missed is left as a plain miss", async () => {
+  const { summarizePromptCacheCall } = await loadUsageModule();
+  const summary = summarizePromptCacheCall({
+    inputTokens: 20_000,
+    uncachedInputTokens: 20_000,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 0,
+    outputTokens: 100,
+    cacheablePrefixTokens: 8_000,
+  }, "claude-opus-4-7");
+
+  // Nothing structural excuses this one — the prefix was big enough, so it
+  // really is drift, and the report should keep pointing there.
+  assert.equal(summary?.uncacheableReason, null);
+  assert.equal(summary?.hitRate, 0);
+});
+
+test("cache activity outranks the prefix estimate", async () => {
+  const { summarizePromptCacheCall } = await loadUsageModule();
+  // The estimate is deliberately coarse; a real cache read proves the request
+  // cleared the minimum whatever the arithmetic said.
+  const summary = summarizePromptCacheCall({
+    inputTokens: 5_000,
+    uncachedInputTokens: 1_000,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: 4_000,
+    outputTokens: 60,
+    cacheablePrefixTokens: 100,
+  }, "claude-opus-4-7");
+
+  assert.equal(summary?.uncacheableReason, null);
+  assert.equal(summary?.hitRate, 0.8);
 });

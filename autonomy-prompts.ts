@@ -45,52 +45,80 @@ export function buildWorldObservationBroadcastPrompt(
 export const MEMORY_REFLECTION_SYSTEM_PROMPT =
   "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.";
 
+// Split into the half that repeats between calls and the half that does not, so
+// the caller can put a cache breakpoint between them. The instructions and the
+// world observations are shared by consecutive ticks (observations arrive about
+// hourly, this runs about every half hour); now/reason and the memory and
+// conversation windows change on nearly every call, and used to sit *ahead* of
+// the material — a timestamp at the front of the prefix invalidates everything
+// after it, so the order matters as much as the split.
+export type SplitPrompt = { stable: string; volatile: string };
+
+const MEMORY_REFLECTION_INSTRUCTIONS = [
+  "You are Holly's private memory and reflection loop.",
+  "Decide whether there is one useful internal memory to write for Holly.",
+  "Good memories are compact, reusable, and about Holly's interests, observations, preferences, unfinished thoughts, or patterns in recent interactions.",
+  "Do not write a memory if the material is trivial, duplicate, or only a transient implementation detail.",
+  "Return JSON only with this shape:",
+  '{"should_write": true, "topic": "short topic", "memory": "one compact internal memory in Chinese or natural mixed Chinese/English", "reason": "short reason"}',
+  "If nothing is worth remembering, set should_write=false and leave topic/memory empty.",
+];
+
 export function buildMemoryReflectionPrompt(
   nowIso: string,
   reason: string,
-  material: readonly string[],
-): string {
-  return [
-    "You are Holly's private memory and reflection loop.",
-    "Decide whether there is one useful internal memory to write for Holly.",
-    "Good memories are compact, reusable, and about Holly's interests, observations, preferences, unfinished thoughts, or patterns in recent interactions.",
-    "Do not write a memory if the material is trivial, duplicate, or only a transient implementation detail.",
-    "Return JSON only with this shape:",
-    '{"should_write": true, "topic": "short topic", "memory": "one compact internal memory in Chinese or natural mixed Chinese/English", "reason": "short reason"}',
-    "If nothing is worth remembering, set should_write=false and leave topic/memory empty.",
-    "",
-    `now=${nowIso}`,
-    `reason=${reason}`,
-    "",
-    material.join("\n\n"),
-  ].join("\n");
+  stableMaterial: readonly string[],
+  volatileMaterial: readonly string[],
+): SplitPrompt {
+  return {
+    stable: [...MEMORY_REFLECTION_INSTRUCTIONS, "", stableMaterial.join("\n\n")]
+      .join("\n")
+      .trimEnd(),
+    volatile: [
+      `now=${nowIso}`,
+      `reason=${reason}`,
+      "",
+      volatileMaterial.join("\n\n"),
+    ].join("\n").trimEnd(),
+  };
 }
 
 export const ARCHIVE_COMPOSITION_SYSTEM_PROMPT =
   "You write Holly's private creative works. Be genuine and concrete; do not roleplay a public chat reply.";
 
+const ARCHIVE_COMPOSITION_INSTRUCTIONS = [
+  "You are Holly's creative writing impulse.",
+  "Decide whether Holly genuinely feels like writing a short article (文章) or a poem (诗) right now, inspired by the material below.",
+  "Only write when something in the material truly sparks it; most of the time nothing does — then set should_write=false.",
+  "If you write: write the complete work, in Chinese or natural mixed Chinese/English, in Holly's own voice.",
+  "A poem should keep its line breaks. An article should be a few coherent paragraphs, not a news digest.",
+  "Do not repeat a recent work's theme.",
+  "Return JSON only with this shape:",
+  '{"should_write": true, "kind": "article" | "poem", "title": "short title", "content": "the full work", "reason": "short reason"}',
+];
+
+// Same split as memory reflection, and for the same reason — these two routes
+// read the same world-observation window, so they churn on the same clock.
+// recentTitles joins the volatile half: it grows every time Holly writes.
 export function buildArchiveCompositionPrompt(
   nowIso: string,
   reason: string,
   recentTitles: readonly string[],
-  material: readonly string[],
-): string {
-  return [
-    "You are Holly's creative writing impulse.",
-    "Decide whether Holly genuinely feels like writing a short article (文章) or a poem (诗) right now, inspired by the material below.",
-    "Only write when something in the material truly sparks it; most of the time nothing does — then set should_write=false.",
-    "If you write: write the complete work, in Chinese or natural mixed Chinese/English, in Holly's own voice.",
-    "A poem should keep its line breaks. An article should be a few coherent paragraphs, not a news digest.",
-    "Do not repeat a recent work's theme.",
-    "Return JSON only with this shape:",
-    '{"should_write": true, "kind": "article" | "poem", "title": "short title", "content": "the full work", "reason": "short reason"}',
-    "",
-    `now=${nowIso}`,
-    `reason=${reason}`,
-    "",
-    recentTitles.length > 0 ? ["Recent works (avoid repeating):", ...recentTitles, ""].join("\n") : "",
-    material.join("\n\n"),
-  ].filter(Boolean).join("\n");
+  stableMaterial: readonly string[],
+  volatileMaterial: readonly string[],
+): SplitPrompt {
+  return {
+    stable: [...ARCHIVE_COMPOSITION_INSTRUCTIONS, "", stableMaterial.join("\n\n")]
+      .join("\n")
+      .trimEnd(),
+    volatile: [
+      `now=${nowIso}`,
+      `reason=${reason}`,
+      "",
+      recentTitles.length > 0 ? ["Recent works (avoid repeating):", ...recentTitles, ""].join("\n") : "",
+      volatileMaterial.join("\n\n"),
+    ].filter(Boolean).join("\n").trimEnd(),
+  };
 }
 
 export const AUTONOMY_JUDGMENT_SYSTEM_PROMPT =

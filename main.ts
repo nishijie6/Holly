@@ -1,3 +1,21 @@
+// Holly 的进程入口，也是整个程序唯一的接线层。
+//
+// 一句话概括：把 QQ（NapCat/OneBot 的 WebSocket）、几路 LLM 通道、几个自主循环
+// 和一个本地监控网页接到一起。真正的判断逻辑都不在这里——系统提示词在
+// decision-prompt.ts，上下文裁剪在 context-budget.ts，主动开口在
+// proactive-engine.ts，自主轮次在 autonomy-engine.ts。这个文件负责的是
+// 「谁在什么时候调用谁」，以及那些搬不走的进程级状态。
+//
+// 它之所以这么长，是因为它是历史沉淀下来的那一部分。已经抽出去的模块
+// （context-budget、model-decision、cache-prefix、log-retention、
+// conversation-ledger…）无一例外都是先在这里长出来、行为被测试钉住之后才搬走的。
+// 所以往这里加东西之前先问一句：这段逻辑能不能独立成模块、被单测覆盖？
+// 能，就别放在这里。
+//
+// 文件的后三分之一（UNIFIED_PAGE 起）是内嵌的监控页：一整张 HTML + CSS + Vue
+// 模板字符串。放在这里是刻意的——监控页没有构建步骤，进程起来就能开，
+// 代价是这个文件末尾有两千行不是 TypeScript。
+
 import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { randomUUID } from "node:crypto";
 import { mkdir, appendFile, readFile, writeFile, readdir, rm, stat } from "node:fs/promises";
@@ -44,7 +62,7 @@ import {
   type PromptCachePurposeStat,
   type PromptCacheSeriesPoint,
 } from "./token-usage.js";
-import { describeCachePrefixDrift } from "./cache-prefix.js";
+import { describeCachePrefixDrift, StablePrefixLedger } from "./cache-prefix.js";
 import { RouteQueue } from "./route-queue.js";
 import { AgentEventQueue, type AgentEvent } from "./agent-events.js";
 import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
@@ -207,10 +225,18 @@ import {
   type PrivateChatConfig,
 } from "./private-chat.js";
 
+// ---------- 监控页协议 ----------
+//
+// 下面这组类型是 main.ts 和内嵌监控页之间的全部约定：快照（snapshot）给刚连上
+// 的客户端补齐现状，事件（MonitorEvent）之后一条条推。两边都手写，没有代码
+// 生成，所以改任何一个字段都要同时改 UNIFIED_PAGE 里的 Vue 代码。
+
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
 type MonitorConnectionState = "connecting" | "open" | "closed" | "error";
 
+// 监控页左侧那条流水里的一行。body 是给人读的多行文本，不是结构化数据——
+// 这条流水的定位是「事后翻看」，不是可查询的日志。
 type MonitorEntry = {
   id: number;
   kind: MonitorEntryKind;
@@ -226,6 +252,8 @@ type MonitorStatus = {
   updatedAt: string;
 };
 
+// 「这一刻真正发给模型的上下文长什么样」。estimatedTokens / compressed 一起
+// 回答的是同一个问题：这次请求有没有被预算裁过、离上限还有多远。
 type MonitorConversationPreview = {
   groupId: string | null;
   updatedAt: string;
@@ -270,6 +298,8 @@ type PendingModelMessage = {
   context: ModelRequestContext;
 };
 
+// 「这条消息是在接哪一句」的打分明细。拆成几项而不是只留一个总分，是为了让
+// 判错的时候能看出是哪一项在带节奏（时间太宽？相似度太钝？），否则只能盲调阈值。
 type ThreadScoreBreakdown = {
   total: number;
   similarity: number;
@@ -292,6 +322,8 @@ type ConversationTurn = {
   messageId?: string | null;
 };
 
+// 上游历史接口回来的原始条目，形状随 NapCat 版本变。故意不收窄成具体类型：
+// 这里只做取字段 + 兜底，收窄了反而会在上游加字段时假报错。
 type GroupHistoryMessage = Record<string, unknown>;
 
 type MessageSegment = {
@@ -303,6 +335,9 @@ type OcrTextBlock = {
   text?: unknown;
 };
 
+// 一次「发出去、等回包」的 OneBot 调用。WebSocket 本身没有请求/响应配对，
+// 靠 echo 字段自己配——timer 是必须的：上游不回包时没有任何东西会让这个
+// Promise 落地。
 type PendingWsAction = {
   action: string;
   resolve: (payload: Record<string, unknown>) => void;
@@ -316,6 +351,9 @@ type RuntimeLlmConfig = {
   context_compress_target_tokens?: unknown;
 };
 
+// config.yaml 的顶层形状。除了 llm / fetch，其余都留成 Record<string, unknown>：
+// 各自的 parse 函数（loadAutonomyConfig、parseAdminPolicyConfig…）才是这些段
+// 落的真正契约，在这里重复一遍类型只会有两份定义、两处要改。
 type AppConfig = {
   llm?: RuntimeLlmConfig;
   fetch?: { proxy_url?: string };
@@ -342,6 +380,9 @@ type PreparedModelRequest = {
   usedCompression: boolean;
 };
 
+// 新客户端连上时的第一帧：把所有分散在进程里的当前状态凑成一整块发过去，
+// 之后就只靠 MonitorEvent 增量推。页面刷新一次就重来一遍，所以这里的每个字段
+// 都必须能从内存里当场算出来，不能依赖「客户端上次收到过什么」。
 type MonitorSnapshot = {
   type: "snapshot";
   target: string;
@@ -355,6 +396,8 @@ type MonitorSnapshot = {
   thoughts: ThoughtEntry[];
 };
 
+// 快照之后的增量事件。每种事件都对应页面上一块独立的区域，互不覆盖——
+// 这样任何一条事件丢了，页面也只是某一块停在旧值，不会整体错乱。
 type MonitorEvent =
   | {
       type: "entry";
@@ -415,6 +458,8 @@ type AutonomySidebarObservation = {
   pageErrors: string[];
 };
 
+// 自主状态在侧栏的投影。计数和「最近一条」都在这里算好再发，页面不做聚合：
+// 页面随时可能刷新，让它去累计就意味着刷新一次数字就归零。
 type AutonomySidebarSnapshot = {
   enabled: boolean;
   worldObservationEnabled: boolean;
@@ -439,6 +484,12 @@ type ArchiveWorkRecord = {
   file: string;
 };
 
+// ---------- 路径与常量 ----------
+//
+// 这一节里的数字全是「行为参数」，不是随手写的魔法值：改动它们会直接改变
+// Holly 的说话时机、花多少钱、以及崩溃后能恢复多少。凡是解释不清「为什么是
+// 这个值」的常量，都应该配一条注释说明它在跟什么权衡。
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 const APP_ROOT = existsSync(join(process.cwd(), "package.json")) ? process.cwd() : __dirname;
@@ -461,6 +512,8 @@ const VUE_RUNTIME_SOURCE = (() => {
     return "";
   }
 })();
+// 只监听回环地址。监控页没有任何鉴权——它能切换只读模式、能代 Holly 发消息，
+// 所以它必须只对本机开放；要远程看，用 SSH 端口转发，别改这里。
 const HTTP_PORT = 5000;
 const HTTP_HOST = "127.0.0.1";
 // Upstream OneBot/NapCat WebSocket target. Read synchronously at module load so
@@ -483,22 +536,46 @@ const UPSTREAM_WS = (() => {
 })();
 const WS_TARGET_URL = UPSTREAM_WS.url;
 const WS_ACCESS_TOKEN = UPSTREAM_WS.token;
+// 固定退避，不做指数退避：断线的常见原因是 NapCat 自己在重启，8 秒一次的
+// 重试既能很快跟上，又不会在对面没起来时刷屏。
 const WS_RECONNECT_DELAY_MS = 8000;
+// 监控页流水在内存里保留的条数。只影响「打开页面能往回翻多少」，完整历史在
+// logs/monitor.jsonl 里。
 const WS_HISTORY_LIMIT = 120;
+// 思考记录（Thoughts 面板）在内存里的上限，同时也是 /api/thoughts 的取值上限。
 const THOUGHT_HISTORY_LIMIT = 400;
+// 每次启动一个新 id：会话日志按它分文件，日志清理也按它认「哪个是当前会话，
+// 不能删」。
 const APP_SESSION_ID = randomUUID();
 const APP_SESSION_STARTED_AT = new Date().toISOString();
+// OneBot 调用等回包的上限。上游不回包时，只有这个超时能让调用方落地。
 const WS_ACTION_TIMEOUT_MS = 10_000;
+// 群消息里带链接时，Holly 会抓正文当上下文。三个数一起限制的是同一件事：
+// 一条消息最多让 Holly 分心多久——超时、最多抓几个、每个截多长。
+// 放宽任何一个，都会让一条含链接的消息拖慢整批消息的判断。
 const URL_FETCH_TIMEOUT_MS = 10_000;
 const URL_FETCH_MAX_PER_MESSAGE = 2;
 const URL_CONTENT_MAX_CHARS = 3000;
+// 组装提示词时回捞的记忆条数：外部记忆（群聊检索）8 条，内部记忆（Holly 自己
+// 写的反思）5 条。这两个数直接决定记忆段占多少 token，往上调之前先看
+// context-budget 的预算分配还有没有余量。
 const MEMORY_LOOKBACK_LIMIT = 8;
 const INTERNAL_MEMORY_LOOKBACK_LIMIT = 5;
+// 「这条消息在接哪一句」的判定参数（打分实现见 scoreThreadCandidate 一带）：
+//   CANDIDATE_LIMIT —— 往回看多少条候选，决定检索成本
+//   TIME_WINDOW     —— 这段时间内算「刚刚」，分数只轻微衰减
+//   HARD_CUTOFF     —— 超过这么久一律不算同一个话题，直接 0 分
+//   SCORE_THRESHOLD —— 低于这个总分就当作「没在接谁」，宁可判成新话题
+// 阈值调低会让 Holly 频繁「接错话」，调高则会把明显的追问也当成新话题。
 const THREAD_CANDIDATE_LIMIT = 24;
 const THREAD_TIME_WINDOW_MS = 15 * 60 * 1000;
 const THREAD_HARD_CUTOFF_MS = 60 * 60 * 1000;
 const THREAD_SCORE_THRESHOLD = 0.42;
+// 消息「新鲜」的上限。超过这个年龄的消息不再触发回复——群里五分钟前的话题
+// 早就过去了，这时候接话比不接更奇怪。断线重连后补推的旧消息也靠它拦住。
 const MESSAGE_REPLY_MAX_AGE_MS = 5 * 60 * 1000;
+// 未读消息攒批的节拍。Holly 不是收到一条判一条，而是每分钟把攒下的一起看：
+// 群聊本来就是成串来的，逐条判断既贵又容易打断别人正在说的话。
 const UNREAD_MODEL_FLUSH_INTERVAL_MS = 60 * 1000;
 // How long an ingested upstream message id is remembered for duplicate-delivery
 // suppression. Well beyond the staleness + retry window, so any reconnect re-push
@@ -537,10 +614,15 @@ const CONVERSATION_HISTORY_LIMIT = 50000;
 // The monitor only needs a recent slice; shipping the whole global context over
 // SSE on every request would bloat the payload and freeze the conversation panel.
 const MONITOR_PREVIEW_MESSAGE_LIMIT = 50;
+// 冷启动时向上游翻当天群历史的分页参数。MAX_PAGES 是保险丝而非目标：翻页在
+// 翻到今天之前就会停，这个上限只用来防止上游分页异常时无限翻下去。
 const GROUP_HISTORY_BOOTSTRAP_PAGE_SIZE = 50;
 const GROUP_HISTORY_BOOTSTRAP_MAX_PAGES = 200;
+// config.yaml 没写时的上下文预算兜底。真正生效的值由 loadContextBudgetConfig
+// 读配置得出，并会再跟模型自身的窗口取小——见 CONTEXT_MODEL_WINDOW_MARGIN_TOKENS。
 const DEFAULT_CONTEXT_LIMIT_TOKENS = 128000;
 const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
+// 下限只是防呆：把 limit 配成 0 或负数会让裁剪逻辑退化成「什么都放不下」。
 const MIN_CONTEXT_LIMIT_TOKENS = 128;
 // Headroom left below the model's input window for estimation drift + output.
 const CONTEXT_MODEL_WINDOW_MARGIN_TOKENS = 16_000;
@@ -637,6 +719,15 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
 };
 
 let sessionLogPath: string | null = null;
+// ---------- 进程级运行时状态 ----------
+//
+// 下面这些 let / Map 是整个程序的可变状态，全部是模块级单例。它们能这样写，
+// 前提是一个进程只连一个 QQ 帐号、只服务一个监控页；哪天要支持「一进程多帐号」，
+// 得先把这一整节收进某个实例里，而不是在别处再加一层 Map。
+//
+// 另一条隐含约定：这里除了 store 之外没有任何东西是持久的。进程重启后能回来的
+// 只有落过盘的部分（会话账本、群历史、记忆、token 统计），其余状态一律重新长出来。
+
 let monitorEntryId = 0;
 let wsClient: WebSocket | null = null;
 let wsReconnectTimer: NodeJS.Timeout | null = null;
@@ -653,6 +744,9 @@ let activeLlmLabel = "Assistant";
 // (a stale outbound connection in an otherwise-alive process) is a property
 // of the process, not of any one LLM profile. See connection-watchdog.ts.
 const connectionWatchdog = new ConnectionWatchdog();
+// 收到的群消息落库（SQLite + 可选 Qdrant 向量）。写入串在一条 Promise 链上，
+// 保证落库顺序跟收到顺序一致；sequence 是进程内自增号，用来在同一毫秒内的
+// 消息之间保持稳定顺序。
 let incomingMessageStore: IncomingMessageStore | null = null;
 let incomingMessageStoreQueue: Promise<void> = Promise.resolve();
 let incomingMessageSequence = 0;
@@ -684,11 +778,17 @@ let unreadModelMessagesByGroup = new Map<string, PendingModelMessage[]>();
 // reconnect), and without this guard a re-delivery would be queued and judged a
 // second time even though we already handled it. Bounded by TTL + a size sweep.
 let ingestedMessageAtMsById = new Map<string, number>();
+// 四个落盘 store，都在 bootstrap() 里装配，装配前一律为 null——所以每个使用点
+// 都得走可选链。这不是懒，是刻意的：让「还没起来」永远是一个可表达的状态，
+// 好过用一个半成品的空实例假装已经就绪。
 let hollyStateStore: HollyStateStore | null = null;
 let domainReputationStore: DomainReputationStore | null = null;
 let thoughtHistoryStore: ThoughtHistoryStore | null = null;
 let conversationContextStore: ConversationContextStore | null = null;
 let conversationHistoryPersistDirty = false;
+// 各段配置的当前值。都先取默认值，再在启动时被 config.yaml 覆盖，之后还会被
+// 文件监听热重载（见 startConfigWatcher）。因此读它们的代码不能把值缓存在
+// 别的地方——每次用都从这里取，否则改完配置只有一半生效。
 let autonomyConfig: AutonomyConfig = DEFAULT_AUTONOMY_CONFIG;
 let proactiveConfig: ProactiveConfig = DEFAULT_PROACTIVE_CONFIG;
 let searchConfig: SearchRuntimeConfig = DEFAULT_SEARCH_CONFIG;
@@ -706,6 +806,10 @@ let adminCodeRunner: AdminCodeImprovementRunner | null = null;
 let qqRuntimeMode: QqRuntimeMode = "offline";
 let browserObservationCache = new Map<string, { observedAtMs: number; observation: ProactiveWorldObservation }>();
 let browserObservationAttemptAtMs = new Map<string, number>();
+// 世界观察 / 内部记忆 / 归档作品的内存副本。三者都以磁盘（JSONL，记忆另有
+// Qdrant）为准，这里的数组只是为了「侧栏要立刻能显示」和「去重要能立刻查」，
+// 启动时从盘上重建。写归档同样串成一条链：一篇作品是「一条 JSONL + 一个 HTML
+// 文件」两次写，交错执行会让两者对不上。
 let worldObservationMemory: Array<{ observedAtMs: number; topic: string; observation: ProactiveWorldObservation }> = [];
 let hollyMemorySidebarRecords: AutonomySidebarMemory[] = [];
 let archiveWorks: ArchiveWorkRecord[] = [];
@@ -729,6 +833,9 @@ let dirtyGroupKeys = new Set<string>();
 // proactive). Keyed by route rather than group key so both sides go through
 // replyCacheRoute's private-chat normalization.
 let replyRouteLastReadAt = new Map<string, number>();
+// 每个群的「当天历史补齐」任务。存 Promise 而不是布尔标记，是为了让并发的
+// 第二个调用者能等同一次补齐，而不是各拉各的；按天记 key 则保证跨过零点后
+// 会为新的一天重新补一次。
 let conversationHistoryBootstrapByGroup = new Map<string, Promise<void>>();
 let conversationHistoryBootstrapDayByGroup = new Map<string, string>();
 let latestConversationPreview: MonitorConversationPreview | null = null;
@@ -758,6 +865,9 @@ const conversationLedger = new ConversationLedger({
 });
 const FOCUS_LEDGER_CACHE_ROUTE = "focus-ledger";
 let ledgerStore: LedgerStore | null = null;
+// 好友名单缓存：私聊只回好友，而好友列表要向上游要。缓存 + 单飞 Promise 是
+// 为了让密集的私聊消息不会每条都触发一次拉取；refreshPromise 非空即表示
+// 「已经有人在拉了，跟着等就行」。
 let privateFriendUserIds = new Set<string>();
 let privateFriendCacheUpdatedAtMs = 0;
 let privateFriendRefreshPromise: Promise<Set<string>> | null = null;
@@ -781,6 +891,15 @@ function getDecisionLlmClient(): LlmClient {
   return decisionLlmClient ?? getActiveLlmClient();
 }
 
+// ---------- 配置加载 ----------
+//
+// 这一节所有 load* / read* 遵守同一条约定：不抛异常，缺字段就退回默认值。
+// config.yaml 是人手改的文件，一个拼错的键、一个写成字符串的数字，不该让
+// Holly 起不来——宁可带着默认值跑起来、在监控页上把实际生效的值播报出来。
+//
+// 同样因为热重载的存在（startConfigWatcher），这些函数必须是纯读取：
+// 它们会被反复调用，不能有「只在第一次生效」的副作用。
+
 function normalizePositiveInteger(value: unknown): number | null {
   const numeric = typeof value === "number" ? value : Number(value);
   if (!Number.isFinite(numeric)) {
@@ -791,6 +910,8 @@ function normalizePositiveInteger(value: unknown): number | null {
   return normalized > 0 ? normalized : null;
 }
 
+// 三个值的关系是「上限 >= 触发线 >= 压缩目标」，函数里用 min/max 强行夹住而不是
+// 校验后报错：配歪了也要能跑，只是压缩会更激进一点。
 async function loadContextBudgetConfig(configPath: string): Promise<ContextBudgetConfig> {
   if (!existsSync(configPath)) {
     return {
@@ -1059,6 +1180,15 @@ async function loadFocusModeConfig(configPath: string): Promise<FocusModeConfig>
   }
 }
 
+// ---------- QQ 参与度的四个闸门 ----------
+//
+// Holly 会不会开口，由两个独立的开关叠加决定：qqRuntimeMode 是她自己在启动时
+// 判断的「今天要不要参与」（offline/observe/active），readOnlyMode 是人从监控页
+// 摁下的硬停。任何一个不允许，就不发消息。
+//
+// 拆成四个小函数而不是散在各处写 if，是因为「能不能发」这个判断在代码里出现
+// 十几次，一旦有一处漏判 readOnlyMode，Holly 就会在人以为她闭嘴的时候说话——
+// 这是最不能出的一类错。
 function isQqConnectedMode(): boolean {
   return qqRuntimeMode !== "offline";
 }
@@ -1075,6 +1205,8 @@ function isPrivateAdminReplyEnabled(): boolean {
   return qqRuntimeMode === "observe" && adminPolicyConfig.replyWhileObserving;
 }
 
+// 管理员私聊是唯一能穿透 observe 模式的通道（且仍受 readOnlyMode 管辖）：
+// 观察模式下 Holly 不在群里说话，但主人问她话总得答。
 function isReplyEnabledForBatch(isAdminBatch: boolean): boolean {
   return isQqParticipationEnabled() || (isAdminBatch && isPrivateAdminReplyEnabled());
 }
@@ -1187,6 +1319,10 @@ async function loadAiToneConfig(configPath: string): Promise<AiToneRuntimeConfig
   };
 }
 
+// 代理设置必须在任何一次 fetch 之前完成，所以它是 bootstrap 的第一步。
+// 这里改的是进程环境变量而不是某个 client 的参数——因为要影响的是所有出网调用
+// （Anthropic、Serper、Qdrant Cloud、网页抓取），它们分散在各个模块里，
+// 各自持有自己的 fetch。
 async function applyProxyConfig(configPath: string): Promise<void> {
   if (!existsSync(configPath)) return;
   const raw = await readFile(configPath, "utf-8");
@@ -1219,6 +1355,17 @@ async function applyProxyConfig(configPath: string): Promise<void> {
     process.env.no_proxy = mergedNoProxy;
   }
 }
+
+// ---------- 上下文预算：把无限长的群聊塞进有限的窗口 ----------
+//
+// 这一节回答的问题只有一个：这次请求要发给模型的东西超预算了，砍哪里。
+// 顺序是固定的——先砍最老的对话（折成话题块），再砍记忆，最后才动当前这条
+// 消息本身。当前消息永远最后被动，因为砍掉它就等于没在回答任何人。
+//
+// 另一条贯穿始终的约束：系统提示词和对话时间线必须逐字节稳定，否则
+// prompt cache 前缀失效、每次请求都按全价重算。所以所有「每次都不一样」的
+// 内容（记忆、本批指令、跨群摘要）一律塞进最后那条 user 消息里，
+// 而不是插进系统提示词或历史中间。
 
 function formatConversationTurnsForModel(turns: readonly ConversationTurn[]): LlmMessage[] {
   return sanitizeConversationMessages(turns.map(formatConversationTurnForModel));
@@ -1271,6 +1418,12 @@ function formatTopicLine(turn: ConversationTurn, lineBudget: number): string {
   return `- ${label} ${compactTextToTokenBudget(compactSameGroupConversationContent(turn.content), lineBudget)}`;
 }
 
+// 把一段旧对话折成「话题块」文本。每个话题只留头三条 + 尾几条，中间抽掉——
+// 群聊里一个话题的信息量通常集中在开头（谁提的）和结尾（结论是什么），
+// 中间的附和删掉不影响后面读懂。
+//
+// 预算是层层往下分的：总预算 → 每个话题段 → 段内每一行。任何一层放不下就
+// 停在那里，宁可少几个话题，也不生成一个超预算的摘要——超了就得再压一轮。
 function buildTopicSummary(turns: readonly ConversationTurn[], budgetTokens: number): string {
   if (turns.length === 0 || budgetTokens <= 0) {
     return "";
@@ -1312,6 +1465,12 @@ function buildTopicSummary(turns: readonly ConversationTurn[], budgetTokens: num
   return result === header ? "" : result;
 }
 
+// 对话压缩的入口：装得下就原样返回，装不下才折叠。
+// 结果形状固定是「一条话题摘要 + 最近若干条原文」——最近的对话必须逐字保留，
+// 因为 Holly 要接的就是这几句；再往前的只需要知道「聊过什么」。
+//
+// 最后那个兜底分支（只留最后一条并截断）是给极端情况准备的：预算小到连一条
+// 消息都放不下。它保证这个函数永远不会返回超预算的结果。
 function compressConversationTurns(turns: readonly ConversationTurn[], budgetTokens: number): LlmMessage[] {
   const formatted = formatConversationTurnsForModel(turns);
   if (formatted.length === 0 || budgetTokens <= 0) {
@@ -1357,6 +1516,11 @@ function compressConversationTurns(turns: readonly ConversationTurn[], budgetTok
   }];
 }
 
+// 在「记忆」和「对话」之间分配同一份可变预算。
+//
+// 为什么要试三轮：两边都按分配额压过之后，实际结果仍可能超——压缩本身是有
+// 下限的（一条消息压不到 0），所以先按分配额各压一次，超了就把没用完的额度
+// 让给对方再压一次。三轮之后不再纠结，交给调用方的下一级兜底。
 function fitVariableContextToBudget(
   memoryPrompt: string,
   conversationTurns: readonly ConversationTurn[],
@@ -1413,6 +1577,16 @@ function fitVariableContextToBudget(
   };
 }
 
+// 组装一次模型请求的最终形状，并保证它落在预算内。
+//
+// 四级降级瀑布，一级不够才进下一级：
+//   1. 超过「压缩触发线」→ 压到压缩目标（不是压回触发线，留出生长空间，
+//      否则下一条消息立刻又触发一次压缩）
+//   2. 仍超过硬上限     → 按硬上限再压一次
+//   3. 还超            → 开始截当前这条消息
+//   4. 依然超          → 丢掉全部历史与记忆，只留被截短的当前消息
+// 第 4 级意味着这次回复几乎没有上下文，但仍然是一次合法请求——宁可答得差，
+// 也不能因为超窗直接报错。
 function prepareModelRequest(
   baseSystemPrompt: string,
   rawMemoryPrompt: string,
@@ -1540,6 +1714,17 @@ function handleConnectionWatchdogStuck(context: { lastError: unknown }): void {
 // of which call site triggered it (reply generation, cache warming,
 // proactive revival, ...). Data fields (profileName/provider/model/...) pass
 // through untouched; only the two network-calling methods are intercepted.
+// ---------- LLM 客户端的装配与热切换 ----------
+
+// 给 client 的三个出网方法都套上看门狗计数。
+//
+// 三段代码几乎一样，没有抽成公共包装：三个方法的返回类型各不相同
+// （有返回值 / 有返回值 / void），抽出来要么丢类型，要么加一层泛型体操，
+// 换来的只是省下二十行——不值。
+//
+// 注意 shouldCountTowardConnectionWatchdog 那一支：不是所有失败都算「卡住」。
+// 模型拒答、参数错误这类失败说明连接是通的，反而要当成一次成功来清计数，
+// 否则看门狗会因为一串正常的业务失败去重启进程。
 function watchLlmClient(client: LlmClient): LlmClient {
   return {
     ...client,
@@ -1628,6 +1813,10 @@ const reportCachePrefixInspection: CachePrefixObserver = (event) => {
   pushMonitorEntry("error", "Prompt Cache Prefix Drift", detail, event.model);
 };
 
+// 从监控页切换模型档位。串行化是必须的：两次并发切换会让 config.yaml 的写入
+// 和 activeLlmClient 的赋值交错，最后落到「配置里写着 A、内存里跑着 B」。
+// 队列在失败后要继续可用，所以每次都接一个吞掉异常的 catch——否则一次切换失败
+// 会让后面所有切换都卡在一个已 reject 的 Promise 上。
 async function switchActiveProfile(profileName: string): Promise<LlmClient> {
   const target = profileName.trim();
   if (!target) {
@@ -1656,6 +1845,11 @@ async function switchActiveProfile(profileName: string): Promise<LlmClient> {
   return nextClient;
 }
 
+// 热重载：把 config.yaml 的每一段重新读一遍，然后一次性换掉所有运行时配置。
+//
+// 写法上刻意分成「先全部 await 出 next*，再集中赋值」两段。因为中间任何一步
+// 失败都会抛出去，此时一个字段都还没改——要么整份新配置生效，要么保持原样，
+// 不会留下一半新一半旧的状态。
 async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const envProfile = process.env.LLM_PROFILE?.trim();
   const currentProfile = activeLlmClient?.profileName ?? (envProfile || undefined);
@@ -1707,6 +1901,8 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   );
 }
 
+// 300ms 防抖。编辑器保存一次文件常常触发多个 change 事件（写入 + 重命名），
+// 不防抖就会连着重载好几次，每次都要重建 LLM client。
 function scheduleConfigReload(reason: string): void {
   if (configReloadTimer) {
     clearTimeout(configReloadTimer);
@@ -1787,6 +1983,12 @@ async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   return raw ? JSON.parse(raw) : {};
 }
 
+// ---------- 花了多少钱，以及缓存有没有在干活 ----------
+//
+// 两套统计，回答两个不同的问题：token 表回答「花了多少」，缓存序列回答
+// 「这一刻缓存还灵不灵」。后者必须按小时留，因为缓存前缀一旦被破坏，
+// 日总计只会显示一个平淡的低命中率，看不出是几点开始坏的。
+
 const TOKEN_STATS_PATH = join(LOG_DIR, "token-usage.json");
 // The daily table answers "how many tokens", which is not the same question as
 // "is the cache working right now": a day that ends at 37% hides the hour the
@@ -1837,6 +2039,9 @@ async function loadPromptCacheStats(): Promise<void> {
   }
 }
 
+// 写盘时才做裁剪（而不是在内存里定期清理）：内存里的 Map 本来就有天然上限
+// （小时数、天数），真正需要设防的是文件无限增长。顺带，落盘串在一条 Promise
+// 链上，避免两次写入交错产生半个 JSON。
 function persistPromptCacheStats(): void {
   promptCacheSaveQueue = promptCacheSaveQueue
     .then(async () => {
@@ -1866,6 +2071,9 @@ function persistPromptCacheStats(): void {
     });
 }
 
+// 每次模型调用都记两份：按小时（看趋势）和按用途（看是谁在烧钱——回复、
+// 预热、自主判断各记各的）。同一次调用同时进两张表，所以两张表的总量应该
+// 对得上，对不上就说明有调用路径漏了记账。
 function recordPromptCacheSample(usage: CallTokenUsage, summary: PromptCacheCallSummary): void {
   const hour = localHourKey(new Date());
   promptCacheByHour.set(
@@ -1982,6 +2190,8 @@ function getTokenStatsHistory(limit = 60): { days: DailyTokenStats[]; grandTotal
   return { days, grandTotal };
 }
 
+// ---------- HTTP / WebSocket 的琐碎工具 ----------
+
 function sendJson(res: ServerResponse, statusCode: number, payload: unknown): void {
   const body = JSON.stringify(payload);
   res.writeHead(statusCode, {
@@ -2003,6 +2213,8 @@ function getRequestUrl(req: IncomingMessage): URL {
   return new URL(req.url || "/", `http://${HTTP_HOST}:${HTTP_PORT}`);
 }
 
+// ws 的 RawData 有三种形态（Buffer / ArrayBuffer / Buffer[]），分片消息就是
+// 数组那种。所有解析入口都先过这里，免得每处各判一遍还漏掉分片。
 function toBuffer(data: RawData): Buffer {
   if (Array.isArray(data)) {
     return Buffer.concat(data);
@@ -2031,6 +2243,12 @@ function asDisplayText(value: unknown, fallback: string): string {
 
   return fallback;
 }
+
+// ---------- 解析上游（NapCat / OneBot）推来的东西 ----------
+//
+// 这一节的共同前提：上游的字段名和形状会随版本变，而且没有稳定的 schema。
+// 所以这里所有函数都是「多候选 + 兜底」的写法，宁可返回 null 也不抛异常——
+// 一条解析不了的消息应该被跳过，而不该让整条 WebSocket 处理链断掉。
 
 function extractIncomingDisplayMessage(data: RawData, isBinary: boolean): string | null {
   const content = describeSocketMessage(data, isBinary);
@@ -2117,6 +2335,9 @@ function readUpstreamMessageId(record: Record<string, unknown>): string | null {
   return null;
 }
 
+// 依次试四个可能的时间字段，还要同时兼容秒和毫秒——用 10^10 当分界线：
+// 秒级时间戳到 2286 年才会超过它，毫秒级从 1970 年起就一直大于它，
+// 所以这个判断在可预见的时间内不会误判。
 function readMessageTimestampMs(record: Record<string, unknown>): number | null {
   const candidates = [
     record.msgTime,
@@ -2190,6 +2411,10 @@ function decodeHtmlEntities(text: string): string {
     .replace(/&comma;/g, ",");
 }
 
+// 判断一个字符串是不是「能拿去 OCR 的图片来源」。白名单式匹配：http(s)、
+// file、base64、data URI、Windows 盘符路径、UNC 路径、绝对路径。
+// 认不出来一律返回 null——NapCat 有时给的是纯文件名（要靠上游自己解析），
+// 把这种当 URL 传下去只会换来一次必然失败的抓取。
 function normalizeNapCatImageSource(value: string | null): string | null {
   if (!value) {
     return null;
@@ -2215,6 +2440,8 @@ function normalizeNapCatImageSource(value: string | null): string | null {
   return null;
 }
 
+// 从 CQ 码文本里抠图片。url 和 file 两个字段都试，因为不同 NapCat 版本、
+// 不同图片来源（本地发送 / 转发 / 表情）填的字段不一样，只认一个就会漏。
 function extractImageSourcesFromRawMessage(rawMessage: string | null): string[] {
   if (!rawMessage) {
     return [];
@@ -2300,6 +2527,11 @@ function formatOcrTextBlocks(data: unknown): string {
   return texts.join("\n").trim();
 }
 
+// 对上游发起一次「要回包」的调用（发消息、拉历史、取好友列表都走这里）。
+//
+// OneBot 的 WebSocket 是全双工的裸消息流，没有请求/响应配对，靠自己塞一个
+// echo 字段、收到时按 echo 找回调（见 handleWsActionResponse）。
+// 超时定时器不是可选项：上游不回包时，没有任何别的东西会让这个 Promise 落地。
 async function sendWsAction(action: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
   const client = wsClient;
   if (!client || client.readyState !== WebSocket.OPEN) {
@@ -2491,6 +2723,9 @@ async function fetchUrlContent(url: string): Promise<string> {
   }
 }
 
+// https 抓不动时降级成 http 再试一次。这不是安全上的妥协，而是现实：群里
+// 转来的链接常常来自证书过期或不支持 TLS 的小站，抓正文只是为了给模型当上下文，
+// 抓不到就等于 Holly 看不懂这条消息在说什么。
 function toHttpFallbackUrl(url: string): string | null {
   return /^https:\/\//i.test(url) ? url.replace(/^https:\/\//i, "http://") : null;
 }
@@ -2603,6 +2838,9 @@ function isHollyMessage(message: ParsedIncomingMessage): boolean {
   );
 }
 
+// 把一帧原始 WebSocket 数据翻译成 Holly 能处理的消息记录。
+// 这是所有入站消息的唯一入口，后面每一层（去重、入库、判断、回复）拿到的都是
+// 它的输出——所以它只做翻译，不做任何判断：能不能回、要不要回，是后面的事。
 function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingMessage {
   const buffer = toBuffer(data);
   const receivedAt = new Date().toISOString();
@@ -2716,6 +2954,15 @@ function parseIncomingMessage(data: RawData, isBinary: boolean): ParsedIncomingM
     return fallback;
   }
 }
+
+// ---------- 会话历史：合并、去重、落盘、冷启动补齐 ----------
+//
+// 同一条群消息可能从两条路进来：实时 WebSocket 推送，和重启后向上游翻当天历史。
+// 两条路给出的时间戳格式、内容前缀都不一样，所以这一节的核心就是让同一条消息
+// 无论从哪条路来都只留一份（靠上游 message_id 认人，见 getConversationTurnKey）。
+//
+// 「天」一律按本地时区算，不用 UTC：Holly 的作息是按人的作息走的，
+// 跨零点补历史这种事必须跟人看到的日期一致。
 
 function getLocalDayRange(referenceTime: string): { startMs: number; endMs: number } {
   const referenceTs = parseIsoTimestamp(referenceTime) ?? Date.now();
@@ -2902,11 +3149,18 @@ async function persistWorldObservation(record: WorldObservationMemoryRecord): Pr
   await run;
 }
 
+// ---------- 推给监控页 ----------
+//
+// 传输用的是 SSE（不是 WebSocket）：这条链路只需要服务端单向推，SSE 断线由浏览器
+// 自动重连，比自己维护一条 WebSocket 少一半代码。
+
 function writeMonitorEvent(res: ServerResponse, payload: MonitorSnapshot | MonitorEvent, eventName = "message"): void {
   res.write(`event: ${eventName}\n`);
   res.write(`data: ${JSON.stringify(payload)}\n\n`);
 }
 
+// 广播给所有已连接的监控页。写失败不做任何处理——客户端随时可能关掉页面，
+// 一个写不进去的连接会在它自己的 close 回调里被摘掉。
 function broadcastMonitorEvent(payload: MonitorEvent): void {
   for (const stream of monitorStreams) {
     writeMonitorEvent(stream, payload);
@@ -3072,6 +3326,11 @@ function parsePositiveOneBotId(value: string | null | undefined, label: string):
   return numeric;
 }
 
+// 裁掉「比当前正在处理的这条消息还新」的历史。
+//
+// 这不是性能优化，是正确性：补历史和实时推送是并发的，处理一条五分钟前的消息时，
+// 内存里可能已经有了更新的对话。把它们一起喂给模型，模型就会看到自己「将要」
+// 说的话——回复会变得莫名其妙。
 function pruneConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
   const referenceTs = parseIsoTimestamp(referenceTime);
   const filtered = referenceTs === null
@@ -3111,6 +3370,9 @@ function getConversationTurnKey(turn: ConversationTurn): string {
   ].join("\u0000");
 }
 
+// 去重 + 按时间排序 + 裁剪，三件事一起做。用 Map 去重意味着后来的同 key 记录会
+// 覆盖先来的——这是有意的：day-history 补齐拿到的版本字段更全，应该赢过实时
+// 推送那份。
 function mergeConversationTurns(turns: ConversationTurn[], referenceTime: string): ConversationTurn[] {
   const deduped = new Map<string, ConversationTurn>();
   for (const turn of turns) {
@@ -3130,6 +3392,11 @@ function mergeConversationTurns(turns: ConversationTurn[], referenceTime: string
   return pruneConversationTurns(sorted, referenceTime);
 }
 
+// 往某个群的历史尾部追加一轮对话，并顺带做三件事：标记该群「有新内容、
+// 下次预热要带上」、标记全局待落盘、把这一轮推给监控页。
+//
+// 注意它总是走一遍 merge：即使是纯追加，也要经过去重，因为同一条消息可能刚好
+// 在补历史的过程中又被实时推了一次。
 function appendConversationTurn(turn: ConversationTurn): void {
   const groupKey = normalizeConversationGroupKey(turn.groupId);
   const content = turn.content.trim();
@@ -3318,6 +3585,13 @@ async function restoreConversationContext(store: ConversationContextStore): Prom
   );
 }
 
+// 向上游翻当天的群历史，补进上下文。
+//
+// 翻页是「从最新往回翻，翻到今天之前就停」：上游只提供按 message_seq 往回翻，
+// 没有按时间范围查询的接口。每页都要检查最老那条的时间，一旦越过今天零点就收工。
+//
+// 两个 break 是防死循环的：拿不到新的 sequence、或者 sequence 跟上一页一样，
+// 都说明上游分页出了问题，这时候必须停——否则会一直翻下去直到撞上页数上限。
 async function bootstrapTodayGroupHistoryContext(groupId: string, referenceTime: string): Promise<void> {
   const groupKey = normalizeConversationGroupKey(groupId);
   if (!groupKey) {
@@ -3707,6 +3981,10 @@ function computeParticipantLinkScore(context: ModelRequestContext, candidate: St
   return Math.min(score, 1);
 }
 
+// 把一句话拆成用于比相似度的「单元」集合。中文按单字 + 相邻二字组（bigram）拆，
+// 英文数字按词拆——中文没有空格分词，二字组是不引入分词器的前提下最省事的
+// 近似：「这个模型」和「那个模型」能共享 c:模 c:型 b:模型，而不至于像纯单字
+// 那样把「的」「了」这类字也算成相似证据。
 function buildSimilarityUnits(text: string): string[] {
   const normalized = stripConversationPrefix(text)
     .toLowerCase()
@@ -3736,6 +4014,8 @@ function buildSimilarityUnits(text: string): string[] {
   return Array.from(units);
 }
 
+// Jaccard 相似度：交集除以并集。选它而不是向量相似度，是因为这个判断要在
+// 每条消息、每个候选上跑几十次，必须是本地纯计算、零网络、零模型。
 function computeTokenJaccard(left: string, right: string): number {
   const leftUnits = buildSimilarityUnits(left);
   const rightUnits = buildSimilarityUnits(right);
@@ -3756,6 +4036,11 @@ function computeTokenJaccard(left: string, right: string): number {
   return union === 0 ? 0 : intersection / union;
 }
 
+// 时间接近度，分两段衰减：
+//   15 分钟以内 —— 从 1 缓慢降到 0.65，这段时间里「刚刚说的」基本同等新鲜
+//   15 分钟到 1 小时 —— 从 0.65 线性降到 0，越久越不像在接同一句
+//   超过 1 小时 —— 直接 0，并且外层会因此短路，连相似度都不算了
+// 未来时间（delta < 0）也算 0：那是时钟或补历史造成的乱序，不该参与判断。
 function computeTimeScore(currentReceivedAt: string, candidateReceivedAt: string | null): number {
   const currentTs = parseIsoTimestamp(currentReceivedAt);
   const candidateTs = parseIsoTimestamp(candidateReceivedAt);
@@ -3776,6 +4061,8 @@ function computeTimeScore(currentReceivedAt: string, candidateReceivedAt: string
   return remainingWindow <= 0 ? 0 : 0.65 * (1 - (deltaMs - THREAD_TIME_WINDOW_MS) / remainingWindow);
 }
 
+// 「这句话是冲着谁说的」。@Holly 给最高分——群里点名叫她，几乎一定是在跟她说话；
+// 候选也 @ 了 Holly 说明两条消息在同一段对话里；同一个人连着说则再加一点。
 function computeDirectedScore(context: ModelRequestContext, candidate: StoredMemoryRecord): number {
   const currentText = context.rawMessage?.trim() || "";
   const candidateText = candidate.rawMessage?.trim() || candidate.displayText?.trim() || "";
@@ -3801,6 +4088,18 @@ function computeDirectedScore(context: ModelRequestContext, candidate: StoredMem
   return Math.min(score, 1);
 }
 
+// 综合打分：这条新消息在接哪一句旧消息。
+//
+// 权重按「哪个信号更可信」排：内容相似 0.42 > 时间接近 0.25 > 有没有点名 0.15
+// > 参与者关联 0.13 > 同一个人 0.05。相似度权重最高，因为它是唯一能区分
+// 「同时在聊的两个话题」的信号，其余几项在同一时段内对所有候选都差不多。
+//
+// 时间分为 0 时直接短路返回：超过一小时的消息不管多像都不算在接它——
+// 群里一小时前的话题早翻篇了，接上去只会显得突兀。
+//
+// 最后那个 max(…, 0.68) 是一条兜底规则：参与者高度关联且时间够近时，
+// 哪怕字面完全不像也认为是同一段对话（「嗯」「对啊」这类回应没有任何
+// 可比的内容，但它们恰恰是最典型的接话）。
 function computeConversationThreadScore(
   context: ModelRequestContext,
   currentMessage: string,
@@ -3863,6 +4162,13 @@ function computeConversationThreadScore(
   };
 }
 
+// 组装「相关记忆」段：从同群最近的消息里挑出跟当前这批最像是同一段对话的几条，
+// 外加 Holly 自己写的内部记忆。
+//
+// 检索是本地打分而不是向量召回：候选只有最近 24 条，逐条算分比查一次向量库更快，
+// 而且分数可解释——判错的时候能从监控页看出是哪一项在带节奏。
+// excludedMessages 用来排除当前这批消息自身，否则模型会看到同一句话出现两遍
+// （一次在「当前消息」，一次在「相关记忆」），容易误以为对方说了两次。
 async function buildMemoryPrompt(
   context: ModelRequestContext,
   currentMessage: string,
@@ -4647,6 +4953,22 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
   }
 }
 
+// ---------- 反应式主路径：把攒下的未读消息交给模型判断 ----------
+//
+// 这是 Holly 回一句话要走的全程，顺序如下：
+//   1. 丢掉已经过期的消息（管理员消息除外，主人问话不设保质期）
+//   2. 组装上下文：相关记忆 + 本群历史 + 跨群动态，交给预算裁剪
+//   3. 让判断模型出 JSON 决定：要不要回、回什么、想了什么
+//   4. 模型说要查资料就先搜再问一遍
+//   5. 校验决定：JSON 合不合法、回复是不是半句话、管理员契约有没有违反；
+//      不合格就带着「你上次错在哪」原地重试，最多两次
+//   6. 需要的话把定稿交给回复模型润色
+//   7. 一路闸门：上一条已经是自己说的就不接着说、只读模式不发、observe 模式不发
+//   8. 真发出去，并把这句话记回历史
+//
+// 关键设计：失败的批次原地重试，绝不放回未读队列。放回去会让同一批消息在后面
+// 每一轮扫描里反复出现、反复判断（历史上真出过这个 bug）。消息本身留在历史里，
+// 所以下一条新消息来时模型仍有机会重新看待它们。
 async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
   const messages = pendingMessages
     .map((item) => ({
@@ -4975,6 +5297,8 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
   );
 }
 
+// 把一批未读消息投递到模型队列上。真正的排队/并发控制在 RouteQueue 里，
+// 这里只负责挂上错误兜底——队列上的任务抛异常不会有人接，必须就地吞掉并上报。
 function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
   // Every message in a batch was queued under the same group key (see
   // queueUnreadMessageForModel), so the first is representative of them all.
@@ -4991,6 +5315,16 @@ function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
       await sendAdminFailureReply(messages, "处理消息时发生内部错误，无法可靠执行这条消息。");
     });
 }
+
+// ---------- 缓存预热：花小钱，省大钱 ----------
+//
+// Anthropic 的 prompt cache 有 1 小时的存活期，写入价是基础价的 2 倍、读取价是
+// 0.1 倍。所以预热是一笔明确的赌注：只有当这条缓存在过期前真的被人读到，
+// 这 2 倍的写入才划算。
+//
+// 由此推出这一节的全部行为：只预热「最近真的产生过回复」的群（收到消息 ≠
+// 值得预热），预热请求要跟真实回复共用同一条 route（否则两者并发会互相打掉
+// 对方的缓存），预热失败要重新排队（否则一次失败就让一个安静的群一直冷着）。
 
 async function warmGroupContext(groupKey: string): Promise<void> {
   const client = decisionLlmClient;
@@ -5085,6 +5419,12 @@ function dispatchContextWarmDue(groupKey: string): void {
       console.error(`Context warm failed for group ${groupKey}:`, error);
     });
 }
+
+// ---------- 影子信号：只观察，不干预 ----------
+//
+// 「AI 味」打分属于还在标定期的功能：它现在对 Holly 那种短而技术的回复误报偏高，
+// 所以只写日志、不参与任何决定。这是这个项目里引入新判断的固定做法——
+// 先让它在真实流量上跑一段时间、能翻出记录来对比，再考虑让它有发言权。
 
 const AI_TONE_SHADOW_LOG_PATH = join(LOG_DIR, "ai-tone.jsonl");
 
@@ -5282,6 +5622,13 @@ async function loadHollyMemorySidebarRecords(): Promise<void> {
   }
   hollyMemorySidebarRecords = loaded.slice(-12);
 }
+
+// ---------- 世界观察：Holly 自己上网看看 ----------
+//
+// 一次观察 = 搜索 + 抓几个页面 + 让模型读出一段摘要。这条链路是全程序最贵、
+// 最容易失败的一段（外网、反爬、超时、页面是空的），所以处处是节流：
+// 同一个查询有冷却期（命中冷却直接复用旧结果），失败也有独立的重试间隔
+// （失败比成功更要防止重试风暴——失败通常意味着这个主题当前就是抓不动）。
 
 function compactBrowserQueryText(text: string): string {
   return text
@@ -5583,25 +5930,43 @@ function broadcastLatestLlmUsage(client: LlmClient): void {
 // that question: a warm call that writes 55k tokens only pays off if the reply
 // that follows reads them back. The purpose comes from the request itself (see
 // LlmCallPurpose), so it cannot drift from the call that earned the numbers.
-// A call whose whole request was shorter than the model's minimum cacheable
-// prefix reports no percentage at all. 0% would read as "the prefix broke" and
-// send someone hunting for drift that does not exist; the fix for these routes
-// is length or model choice, not prefix hygiene.
+// A bare "0% hit" is only honest when a cache entry could have existed and did
+// not get read. The two ways that assumption fails each get said out loud
+// instead, because they send you to opposite places:
+//   request-too-small — nothing to fix in the prefix; the route is smaller than
+//     the model's minimum. Reported as n/a and kept out of the hit rate.
+//   prefix-too-small — a large request whose breakpoint sits near the front, so
+//     almost all of it was never cacheable. Still a 0% miss, but the fix is
+//     where the breakpoint sits, not prefix drift.
 function pushPromptCacheEntry(usage: CallTokenUsage, summary: PromptCacheCallSummary): void {
   const count = (value: number) => value.toLocaleString("en-US");
-  const title = summary.belowMinimum
-    ? `Prompt Cache - n/a (< ${count(summary.minimumPrefixTokens ?? 0)} min)`
-    : `Prompt Cache - ${Math.round((summary.hitRate ?? 0) * 100)}% hit`;
+  const minimum = count(summary.minimumPrefixTokens ?? 0);
+  const title = summary.uncacheableReason === "request-too-small"
+    ? `Prompt Cache - n/a (< ${minimum} min)`
+    : summary.uncacheableReason === "prefix-too-small"
+      ? "Prompt Cache - 0% hit (prefix too short)"
+      : `Prompt Cache - ${Math.round((summary.hitRate ?? 0) * 100)}% hit`;
   const lines = [
     `purpose=${usage.purpose}`,
     `cache_read=${count(summary.cacheReadInputTokens)} cache_write=${count(summary.cacheCreationInputTokens)} uncached=${count(summary.uncachedInputTokens)}`,
     `input=${count(usage.inputTokens)} output=${count(usage.outputTokens)}`,
   ];
-  if (summary.belowMinimum) {
+  if (summary.cacheablePrefixTokens !== null) {
+    lines.push(`cacheable_prefix≈${count(summary.cacheablePrefixTokens)} (min ${minimum})`);
+  }
+  if (summary.uncacheableReason === "request-too-small") {
     lines.push(
       `This request (${count(summary.accountedInputTokens)} tokens) is below ${usage.model}'s `
-      + `${count(summary.minimumPrefixTokens ?? 0)}-token minimum cacheable prefix, so no cache entry `
+      + `${minimum}-token minimum cacheable prefix, so no cache entry `
       + "could exist. Excluded from the hit rate.",
+    );
+  } else if (summary.uncacheableReason === "prefix-too-small") {
+    lines.push(
+      `Only ~${count(summary.cacheablePrefixTokens ?? 0)} tokens sit ahead of the cache breakpoint, `
+      + `below ${usage.model}'s ${minimum}-token minimum, so no entry could be created — the other `
+      + `${count(Math.max(0, summary.accountedInputTokens - (summary.cacheablePrefixTokens ?? 0)))} `
+      + "tokens are past the breakpoint and are reread at full price every call. "
+      + "This is breakpoint placement, not prefix drift.",
     );
   }
 
@@ -5903,6 +6268,13 @@ async function notifyWorldObservationFailure(topic: string, reason: string): Pro
   }
 }
 
+// 看到了不等于要说。这个函数是「说出去」前的一排闸门，任何一道不过就把观察
+// 留在记忆里、不发群：
+//   - 只读 / observe 模式
+//   - 目标群号没配或不合法
+//   - 群里还在聊天（没冷场就别插话——新闻可以等下一轮）
+//   - 内容跟最近播报过的重复
+// 顺序是有讲究的：先判便宜的本地条件，最后才做要花模型的去重与改写。
 async function maybeBroadcastWorldObservation(
   topic: string,
   observation: ProactiveWorldObservation,
@@ -6147,6 +6519,12 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
   );
 }
 
+// The autonomy routes cache a rolling world-observation window, so their prefix
+// legitimately rebuilds whenever a new observation arrives — roughly hourly.
+// Unannounced, each of those would reach the monitor as an error telling
+// someone to hunt for a volatile value that broke the prefix.
+const autonomyStablePrefixes = new StablePrefixLedger();
+
 function formatWorldObservationsForReflection(nowMs: number): string[] {
   return [...worldObservationMemory]
     .filter((item) => nowMs - item.observedAtMs <= 24 * 60 * 60 * 1000)
@@ -6230,6 +6608,11 @@ function parseMemoryReflection(raw: string): { topic: string; content: string; r
   };
 }
 
+// ---------- 记忆反思：Holly 自己回头看 ----------
+//
+// 素材分成「稳定」和「易变」两段传给模型，不是为了好看：generateText 只把最后
+// 一条消息标记为易变，缓存断点就落在两段之间。合成一条的话前面没有任何稳定内容
+// 可供缓存，每次反思那一万多 token 都要按全价重读一遍。
 async function reflectMemoryForAutonomy(
   request: AutonomyMemoryReflectionRequest,
 ): Promise<AutonomyMemoryWriteRequest | null> {
@@ -6240,19 +6623,33 @@ async function reflectMemoryForAutonomy(
   const worldBlocks = formatWorldObservationsForReflection(Number.isFinite(nowMs) ? nowMs : Date.now());
   const internalBlocks = await formatInternalMemoriesForReflection();
   const conversationBlocks = formatRecentTurnsForReflection();
-  const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
-  if (material.length === 0) return null;
+  const stableMaterial = worldBlocks.filter(Boolean);
+  const volatileMaterial = [...internalBlocks, ...conversationBlocks].filter(Boolean);
+  if (stableMaterial.length === 0 && volatileMaterial.length === 0) return null;
 
-  const prompt = buildMemoryReflectionPrompt(request.nowIso, request.reason, material);
+  // Two messages, not one: generateText marks only the last one volatile, so
+  // the breakpoint lands between the world-observation window and everything
+  // that changes per tick. As one message there was nothing stable for it to
+  // sit on and the whole 11k request was reread at full price.
+  const prompt = buildMemoryReflectionPrompt(
+    request.nowIso,
+    request.reason,
+    stableMaterial,
+    volatileMaterial,
+  );
 
   let reply: string;
   try {
     reply = await client.generateText({
       purpose: "memory-reflection",
       systemPrompt: MEMORY_REFLECTION_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: prompt }],
+      messages: [
+        { role: "user", content: prompt.stable },
+        { role: "user", content: prompt.volatile },
+      ],
       jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
       cacheRoute: "memory-reflection",
+      expectRebuild: autonomyStablePrefixes.changed("memory-reflection", prompt.stable),
     });
   } catch (error) {
     pushMonitorEntry("error", "Autonomy Reflection Model Error", error instanceof Error ? error.message : String(error));
@@ -6299,6 +6696,15 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
     console.error("Failed to broadcast memory reflection:", error);
   }
 }
+
+// ---------- 开机自省：Holly 醒过来的那一分钟 ----------
+//
+// 进程起来之后，先把记忆、群历史、世界观察都恢复完，再让 Holly 自己看一眼
+// 「我上次是什么时候睡的、这段时间发生了什么」，然后由她自己决定今天以什么
+// 姿态上线（offline / observe / active）。
+//
+// 这一步在整个启动链里是最后一环，顺序不能调换：她要基于恢复完的记忆做判断，
+// 而不是基于一个空的进程。
 
 function recordBootstrapLlmUsage(client: LlmClient): void {
   broadcastLatestLlmUsage(client);
@@ -6554,6 +6960,9 @@ async function applyQqModeDecision(decision: QqModeDecision): Promise<void> {
   scheduleQqModeReconsideration(decision.reconsiderAfterMs);
 }
 
+// 开机流程的编排：记一次启动 → 攒素材 → （可选）写一条开机记忆 → 决定今天的
+// QQ 参与模式。lifecycle 在最开始就写盘一次，所以哪怕后面的自省崩了，
+// 「这次启动发生过」这件事也已经留下了记录。
 async function runHollyBootstrap(): Promise<void> {
   const store = hollyStateStore;
   if (!store) throw new Error("Holly state is unavailable during bootstrap.");
@@ -6598,6 +7007,12 @@ async function runHollyBootstrap(): Promise<void> {
   );
 }
 
+// ---------- 归档：Holly 写的东西 ----------
+//
+// 她偶尔会写点文章或诗。每篇同时落两份：archive.jsonl 里一条记录（程序读），
+// 外加一个独立的 HTML 文件（人读）。留 HTML 是刻意的——这些东西应该在 Holly
+// 这个程序不在了之后依然能打开，所以那个页面自带样式、不依赖任何外部资源。
+
 const ARCHIVE_LOG_PATH = join(ARCHIVE_DIR, "archive.jsonl");
 const ARCHIVE_MEMORY_LIMIT = 400;
 const ARCHIVE_TITLE_MAX_CHARS = 120;
@@ -6639,47 +7054,140 @@ function archiveKindLabel(kind: ArchiveWorkKind): string {
 
 function renderArchiveWorkHtml(work: ArchiveWorkRecord): string {
   const writtenAt = new Date(work.ts).toLocaleString("zh-CN");
+  // 跟监控台同一套双皮肤：日间是 Slate Glass（冷灰蓝画布上一张白色圆角纸），
+  // 夜间是 Painted Ledger（黑底上钉一张 2px 硬线的纸）。
+  // 独立页没有主题开关，直接跟随系统 prefers-color-scheme。
   return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>${escapeHtml(work.title)} · Holly Archive</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Literata:wght@400;600&family=JetBrains+Mono:wght@400;700&display=swap">
   <style>
+    :root {
+      --background: 210 36.4% 95.7%;
+      --background-2: 212.3 39.4% 93.5%;
+      --canvas: linear-gradient(135deg, hsl(var(--background)), hsl(var(--background-2)));
+      --foreground: 217.2 32.6% 17.5%;
+      --card: 0 0% 100%;
+      --card-a: 0.92;
+      --muted-foreground: 215.4 16.3% 46.9%;
+      --hairline: 215 20.2% 65.1%;
+      --edge-c: var(--hairline);
+      --edge-a: 0.28;
+
+      --kind-article-bg: #ccfbf1;  --kind-article-fg: #0f766e;
+      --kind-poem-bg: #ffe4e6;     --kind-poem-fg: #be123c;
+
+      --rule: 1px;
+      --radius: 14px;
+      --radius-pill: 999px;
+      --paper-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      --paper-blur: blur(8px);
+      --pad: 40px 44px;
+      --h1-size: 26px;
+      --h1-weight: 700;
+      --kind-bd: 0px;
+      --font-sans: "Segoe UI", system-ui, sans-serif;
+      --font-read: Georgia, "Noto Serif SC", serif;
+      --font-mono: Consolas, ui-monospace, "SF Mono", Menlo, monospace;
+      color-scheme: light;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --background: 33.3 27.3% 6.5%;
+        --background-2: 33.3 27.3% 6.5%;
+        --canvas: hsl(var(--background));
+        --foreground: 41.5 40.6% 87.5%;
+        --card: 35 23.1% 10.2%;
+        --card-a: 1;
+        --muted-foreground: 34 11.8% 49.8%;
+        --hairline: 32.7 24.4% 17.6%;
+        --edge-c: var(--foreground);
+        --edge-a: 1;
+
+        /* 体裁是一枚填实颜料块：诗 = 正红，文章 = 正绿 */
+        --kind-article-bg: hsl(140 45.5% 45.3%);  --kind-article-fg: hsl(33.3 27.3% 6.5%);
+        --kind-poem-bg: hsl(6.1 80.2% 54.5%);     --kind-poem-fg: hsl(33.3 27.3% 6.5%);
+
+        --rule: 2px;
+        --radius: 0px;
+        --radius-pill: 0px;
+        --paper-shadow: none;
+        --paper-blur: none;
+        --pad: 44px 48px;
+        --h1-size: 34px;
+        --h1-weight: 600;
+        --kind-bd: 2px;
+        --font-sans: "Literata", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+        --font-read: "Fraunces", "Noto Serif SC", "Songti SC", "STSong", Georgia, serif;
+        --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, monospace;
+        color-scheme: dark;
+      }
+    }
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       min-height: 100vh; padding: 48px 20px;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      color: #1e293b;
-      background: linear-gradient(135deg, #f0f4f8, #e8eef5);
+      font-family: var(--font-sans);
+      color: hsl(var(--foreground));
+      background: var(--canvas);
+      background-attachment: fixed;
       display: flex; justify-content: center;
+      -webkit-font-smoothing: antialiased;
     }
     .work {
       width: 100%; max-width: 720px;
-      background: rgba(255,255,255,0.92);
-      border: 1px solid rgba(148,163,184,0.28);
-      border-radius: 14px;
-      box-shadow: 0 2px 8px rgba(0,0,0,0.05);
-      padding: 40px 44px;
+      background: hsl(var(--card) / var(--card-a));
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-radius: var(--radius);
+      box-shadow: var(--paper-shadow);
+      backdrop-filter: var(--paper-blur);
+      padding: var(--pad);
+      height: fit-content;
     }
+    /* 日间是一枚淡色胶囊，夜间是填实颜料块 */
     .kind {
-      display: inline-block; padding: 4px 10px; border-radius: 999px;
-      font-size: 11px; font-weight: 700; background: #ccfbf1; color: #0f766e;
+      display: inline-block; padding: 4px 10px;
+      border: var(--kind-bd) solid hsl(var(--foreground));
+      border-radius: var(--radius-pill);
+      font-family: var(--font-mono);
+      font-size: 11px; font-weight: 700; letter-spacing: 0.1em;
+      background: var(--kind-article-bg); color: var(--kind-article-fg);
       margin-bottom: 14px;
     }
-    h1 { font-size: 26px; letter-spacing: -0.02em; margin-bottom: 8px; }
-    .meta { font-size: 12px; color: #64748b; margin-bottom: 28px; }
+    .kind.poem { background: var(--kind-poem-bg); color: var(--kind-poem-fg); }
+    h1 {
+      font-family: var(--font-sans);
+      font-size: var(--h1-size); font-weight: var(--h1-weight);
+      letter-spacing: -0.02em; line-height: 1.25; margin-bottom: 8px;
+    }
+    .meta {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+      font-size: 12px; color: hsl(var(--muted-foreground)); margin-bottom: 28px;
+    }
     .content {
       white-space: pre-wrap; word-break: break-word;
-      font-family: Georgia, "Noto Serif SC", serif;
+      font-family: var(--font-read);
       font-size: 16px; line-height: 1.9;
     }
-    .footer { margin-top: 32px; padding-top: 14px; border-top: 1px solid rgba(148,163,184,0.28); font-size: 11px; color: #94a3b8; }
+    .footer {
+      margin-top: 32px; padding-top: 14px;
+      border-top: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      font-family: var(--font-mono);
+      font-size: 11px; color: hsl(var(--muted-foreground));
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.01ms !important; transition-duration: 0.01ms !important; }
+    }
   </style>
 </head>
 <body>
   <article class="work">
-    <span class="kind">${escapeHtml(archiveKindLabel(work.kind))}</span>
+    <span class="kind ${work.kind === "poem" ? "poem" : "article"}">${escapeHtml(archiveKindLabel(work.kind))}</span>
     <h1>${escapeHtml(work.title)}</h1>
     <div class="meta">Holly · ${escapeHtml(writtenAt)}${work.reason ? ` · ${escapeHtml(work.reason)}` : ""}</div>
     <div class="content">${escapeHtml(work.content)}</div>
@@ -6689,7 +7197,6 @@ function renderArchiveWorkHtml(work: ArchiveWorkRecord): string {
 </html>
 `;
 }
-
 function coerceArchiveWork(value: unknown): ArchiveWorkRecord | null {
   if (!value || typeof value !== "object") return null;
   const v = value as Record<string, unknown>;
@@ -6763,19 +7270,32 @@ async function composeArchiveForAutonomy(
   const internalBlocks = await formatInternalMemoriesForReflection();
   const conversationBlocks = formatRecentTurnsForReflection();
   const recentTitles = archiveWorks.slice(-8).map((work) => `- [${work.kind}] ${work.title}`);
-  const material = [...worldBlocks, ...internalBlocks, ...conversationBlocks].filter(Boolean);
-  if (material.length === 0) return null;
+  const stableMaterial = worldBlocks.filter(Boolean);
+  const volatileMaterial = [...internalBlocks, ...conversationBlocks].filter(Boolean);
+  if (stableMaterial.length === 0 && volatileMaterial.length === 0) return null;
 
-  const prompt = buildArchiveCompositionPrompt(request.nowIso, request.reason, recentTitles, material);
+  // Same two-message split as memory reflection — both routes read the same
+  // world-observation window, so both get their breakpoint in the same place.
+  const prompt = buildArchiveCompositionPrompt(
+    request.nowIso,
+    request.reason,
+    recentTitles,
+    stableMaterial,
+    volatileMaterial,
+  );
 
   let reply: string;
   try {
     reply = await client.generateText({
       purpose: "archive-composition",
       systemPrompt: ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: prompt }],
+      messages: [
+        { role: "user", content: prompt.stable },
+        { role: "user", content: prompt.volatile },
+      ],
       jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,
       cacheRoute: "archive-composition",
+      expectRebuild: autonomyStablePrefixes.changed("archive-composition", prompt.stable),
     });
   } catch (error) {
     pushMonitorEntry("error", "Autonomy Archive Model Error", error instanceof Error ? error.message : String(error));
@@ -7012,6 +7532,9 @@ function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
 // the hard backstop for "the model can't pick an ineligible candidate" —
 // enforced by the schema itself, not by asking the model to read a note and
 // comply. runAutonomyLoop still double-checks defensively regardless.
+// 每轮由模型自己判断该做什么（而不是按固定优先级轮询）。schema 里的候选动作
+// 是动态生成的：只把「此刻真的可做」的动作列进去，这样模型不会选中一个
+// 因为冷却期或开关而根本执行不了的动作。
 function buildAutonomyJudgmentSchema(eligibleActions: readonly string[]): Record<string, unknown> {
   return {
     type: "object",
@@ -7089,6 +7612,12 @@ async function requestAutonomyJudgment(request: AutonomyJudgmentRequest): Promis
     return fallback;
   }
 }
+
+// ---------- 自主轮次：每分钟问一次「现在该做点什么吗」 ----------
+//
+// 判断逻辑全在 autonomy-engine.ts 里，这里只负责把它需要的能力打包递过去。
+// 这个 deps 对象就是两边的契约：引擎不认识 main.ts 的任何全局变量，
+// 只认识这十几个函数——所以引擎能被单测完整驱动，不用起一个真进程。
 
 function buildAutonomyDeps() {
   const store = hollyStateStore;
@@ -7199,6 +7728,12 @@ function claimIncomingMessageId(messageId: string | null): boolean {
   return true;
 }
 
+// ---------- 未读消息的攒批与投递 ----------
+//
+// 消息不是来一条判一条：先按群攒着，等定时器到点（或达到某些条件）再整批交给
+// 模型。这既省钱，也更像人——群里连着说三句话，正常人是听完再回，
+// 而不是每句都接一下。
+
 function queueUnreadMessageForModel(message: string, context: ModelRequestContext): number | null {
   // Observe/read-only: the message is already stored and in context; just never
   // hand it to the reply model. An authenticated administrator private message
@@ -7273,6 +7808,9 @@ function flushUnreadMessagesToModel(): void {
 // (route-serialized) model call. Every trigger in the process — the 60s
 // unread-batch timer, the 20min context-warm timer, the forced-admin
 // immediate-reply path, the 60s autonomy timer — funnels through here.
+// 所有定时器和 WebSocket 触发都只往事件队列里塞一个类型化事件，由这里统一分发。
+// 这样「什么时候该做」和「做什么」是分开的两件事：定时器不需要知道预热怎么跑，
+// 分发器不需要知道它是被谁唤醒的。
 function dispatchAgentEvent(event: AgentEvent): void {
   switch (event.type) {
     case "message_batch_ready":
@@ -7310,6 +7848,13 @@ function handleMonitorStream(req: IncomingMessage, res: ServerResponse): void {
   });
 }
 
+// ---------- 与 NapCat 的连接 ----------
+//
+// 这条 WebSocket 是 Holly 唯一的耳朵和嘴。它同时承载三种流量：上游推来的群消息
+// 事件、我们主动发起的调用（发消息/拉历史，靠 echo 配对回包）、以及心跳。
+// 所以 message 回调里第一件事永远是分流——先看是不是回包，再看是不是心跳，
+// 剩下的才当作真正的消息处理。
+
 function scheduleWebSocketReconnect(reason: string): void {
   if (!isQqConnectedMode() || wsReconnectTimer) {
     return;
@@ -7338,6 +7883,11 @@ function disconnectWebSocketClient(reason: string): void {
   pushMonitorEntry("status", "QQ Connection Offline", reason);
 }
 
+// 建立（或重建）到 NapCat 的连接。
+//
+// 每个回调开头那句 `if (wsClient !== client) return;` 是关键防线：强制重连会造出
+// 一个新 client，而旧 client 的回调可能还在路上。不做这个判断，一个已经被换掉的
+// 连接仍然能往下游灌消息、甚至覆盖新连接的状态。
 function connectWebSocketClient(forceReconnect = false): void {
   if (!isQqConnectedMode()) {
     updateMonitorStatus("closed", `QQ mode is offline; not connecting to ${WS_TARGET_URL}`);
@@ -7633,227 +8183,860 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Holly</title>
+  <!-- 拉丁字体走 Google Fonts；CJK 交给系统宋体 / 黑体（不拉 Noto SC 的大字重包）。
+       离线时整条 link 静默失败，回落到 Georgia / PingFang / SF Mono，版式不塌。 -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,500;9..144,600;9..144,700&family=Literata:wght@400;600;700&family=JetBrains+Mono:wght@400;700&display=swap">
+  <!-- 主题在首帧前定下来，避免深色用户看到一闪的浅色画布 -->
+  <script>
+    (function () {
+      try {
+        var saved = localStorage.getItem('holly-theme');
+        var dark = saved ? saved === 'dark' : window.matchMedia('(prefers-color-scheme: dark)').matches;
+        document.documentElement.setAttribute('data-theme', dark ? 'dark' : 'light');
+      } catch (e) {
+        document.documentElement.setAttribute('data-theme', 'light');
+      }
+    })();
+  </script>
   <style>
+    /* ==========================================================
+       Holly · The Painted Ledger
+       视觉语言移植自 kagami 的设计系统（kagami/DESIGN.md）：
+       蒙德里安骨架 —— 2px 骨黑硬线 / 0 圆角 / 饱和原色填实块。
+       颜料盘按 HSL 通道三元组存放，用 hsl(var(--x) / a) 取透明度。
+       颜色是结构不是配给：语义色以填实块 + 大号 mono 数字上墙，
+       中性只留给底色与长正文；色块内永不渐变、不加阴影。
+
+       Holly 的语义映射（一块色 = 一种含义）：
+         正红 signal    错误 · 主动事件 · Holly 发言
+         正蓝 llm       LLM 推理 · assistant 输出 · context
+         正黄 scheduler 等待 · pending · 每分钟自主检查 · 选中
+         正绿 story     记忆 · recall · 归档 · 已连接
+         玫红 cost      token 成本 · 用量
+       ========================================================== */
+    /* ==========================================================
+       两套皮肤共用一份骨架：颜色与「形」都收在变量里。
+
+       日间 = Slate Glass（重设计之前的旧观感）
+         冷灰蓝渐变画布 · 白色半透明毛玻璃面板 · 14px 圆角
+         1px 淡线 · 胶囊按钮 · teal #0f766e 主色 · 条目用淡色底区分
+
+       夜间 = The Painted Ledger（移植自 kagami/DESIGN.md）
+         蒙德里安骨架 —— 2px 骨黑硬线 / 0 圆角 / 饱和原色填实块
+         一块色 = 一种含义：
+           正红 signal / 正蓝 llm / 正黄 scheduler / 正绿 story / 玫红 cost
+
+       约定：三元组变量（H S% L%）配 hsl(var(--x) / a) 取透明度；
+       名字带 -fill / -on-fill / -tint 的是成品色值，直接 var() 用。
+       ========================================================== */
     :root {
-      --sidebar-w: 220px;
-      --sidebar-bg: #18202e;
-      --sidebar-text: #8899b0;
-      --panel: rgba(255,255,255,0.92);
-      --ink: #1e293b;
-      --muted: #64748b;
-      --line: rgba(148,163,184,0.28);
+      /* ---- 中性：冷灰蓝画布 + 白面板 ---- */
+      --background: 210 36.4% 95.7%;
+      --background-2: 212.3 39.4% 93.5%;
+      --canvas: linear-gradient(135deg, hsl(var(--background)), hsl(var(--background-2)));
+      --foreground: 217.2 32.6% 17.5%;
+      --card: 0 0% 100%;
+      --card-a: 0.92;
+      --raised: 210 40% 98%;
+      --raised-a: 0.9;
+      --muted-foreground: 215.4 16.3% 46.9%;
+      --hairline: 215 20.2% 65.1%;
+
+      /* 边线：日间是淡灰细线，夜间是骨黑硬线 */
+      --edge-c: var(--hairline);
+      --edge-a: 0.28;
+      --edge-soft-c: var(--hairline);
+      --edge-soft-a: 0.28;
+
+      /* ---- 语义实色（点 / 左条 / 小强调）---- */
+      --signal: 0 84.2% 60.2%;
+      --signal-foreground: 0 0% 100%;
+      --llm: 258.3 89.5% 66.3%;
+      --llm-foreground: 0 0% 100%;
+      --scheduler: 45.4 93.4% 47.5%;
+      --scheduler-foreground: 217.2 32.6% 17.5%;
+      --story: 142.1 70.6% 45.3%;
+      --story-foreground: 0 0% 100%;
+      --cost: 175.4 77.5% 26.1%;
+      --cost-foreground: 0 0% 100%;
+
+      /* ---- 语义色块：日间是淡底深字，夜间才填实原色 ---- */
+      --signal-fill: #ffe4e6;      --signal-on-fill: #be123c;
+      --llm-fill: #f5f3ff;         --llm-on-fill: #6d28d9;
+      --scheduler-fill: #fef3c7;   --scheduler-on-fill: #92400e;
+      --story-fill: #dcfce7;       --story-on-fill: #166534;
+      --cost-fill: rgba(248,250,252,0.9); --cost-on-fill: #1e293b;
+      --neutral-fill: #e2e8f0;     --neutral-on-fill: #334155;
+
+      /* ---- 主色 / 交互 ---- */
       --accent: #0f766e;
-      --accent-h: #0d5e57;
+      --link: #0f766e;
+      --focus: #0f766e;
+      --bar-fill: #0f766e;
+      --btn-bg: #0f766e;
+      --btn-fg: #ffffff;
+      --btn-bd: transparent;
+      --btn-hover-bg: #0d5e57;
+      --btn-hover-fg: #ffffff;
+      --btn-sec-bg: #e2e8f0;
+      --btn-sec-fg: #1e293b;
+      --btn-sec-hover-bg: #cbd5e1;
+      --btn-sec-hover-fg: #1e293b;
+      --field-bg: rgba(255,255,255,0.94);
+
+      /* ---- 条目底色：日间靠淡色块分辨，夜间靠左侧颜料条 ---- */
+      --tint-in: #ecfeff;
+      --tint-out: #ecfdf5;
+      --tint-status: #eff6ff;
+      --tint-error: #fff1f2;
+      --tint-error-fg: hsl(var(--foreground));
+      --tint-assistant: #f5f3ff;
+      --tint-user: rgba(224,242,254,0.9);
+      --tint-ci-system: rgba(240,249,255,0.9);
+      --tint-empty: rgba(255,255,255,0.6);
+      --entry-bg: #ffffff;
+      --entry-bd-c: var(--edge-c);
+      --entry-bd-a: var(--edge-a);
+      --bar-in: hsl(var(--edge-c) / var(--edge-a));
+      --bar-out: hsl(var(--edge-c) / var(--edge-a));
+      --bar-assistant: hsl(var(--edge-c) / var(--edge-a));
+      --bar-status: hsl(var(--edge-c) / var(--edge-a));
+      --bar-story: hsl(var(--edge-c) / var(--edge-a));
+      --th-bar-w: 4px;
+      --gap-sm: 5px;
+      --gi-active-bg: #ecfeff;
+      --gi-active-fg: hsl(var(--foreground));
+      --gi-active-bd: #67e8f9;
+
+      /* 思考卡左条：沿用旧版那五支笔 */
+      --th-default: #8b5cf6;
+      --th-bootstrap: #0f766e;
+      --th-qq: #0284c7;
+      --th-proactive: #d97706;
+      --th-autonomy: #16a34a;
+
+      /* 群聊消息行 */
+      --msg-user-bg: #f0f9ff;      --msg-user-bar: #38bdf8;  --msg-user-fg: #0369a1;
+      --msg-asst-bg: #f5f3ff;      --msg-asst-bar: #a78bfa;  --msg-asst-fg: #7c3aed;
+      --msg-sys-bg: #f8fafc;       --msg-sys-bar: #94a3b8;   --msg-sys-fg: #64748b;
+      --msg-bar-w: 3px;
+
+      /* 侧栏：深蓝灰竖栏 + 半透明白选中块 */
+      --sidebar: 218.2 31.4% 13.7%;
+      --sidebar-foreground: 214.5 20.2% 61.2%;
+      --sidebar-brand: 0 0% 100%;
+      --sidebar-hover-fg: 211 35.8% 84.1%;
+      --sidebar-active: 216 16.9% 23.1%;
+      --sidebar-active-foreground: 0 0% 100%;
+      --sidebar-border: 218.2 31.4% 13.7%;
+      --sidebar-line: rgba(255,255,255,0.07);
+      --nav-pad: 14px 10px;
+      --nav-gap: 3px;
+      --nav-item-pad: 10px 12px;
+      --nav-bar-w: 0px;
+      --brand-size: 18px;
+      --brand-weight: 800;
+      --brand-sub-size: 11px;
+      --brand-sub-track: 0;
+      --brand-sub-case: none;
+      --switch-w: 30px;
+      --switch-h: 16px;
+      --switch-knob: 12px;
+      --switch-x: 16px;
+      --switch-bd: 0px;
+      --switch-bg: #334155;
+      --switch-on-bg: #b45309;
+      --switch-knob-c: #94a3b8;
+      --switch-on-knob-c: #fde68a;
+      --mode-on-fg: #fbbf24;
+      --radius-bar: 2px;
+      --usage-accent: var(--accent);
+      --resizer-on: #6366f1;
+      --pill-fg: var(--neutral-on-fill);
+      --pill-on-bg: #ccfbf1;
+      --pill-on-fg: #0f766e;
+
+      /* 统计卡：日间一律白卡淡边，语义只走数字与眉字，不填实块 */
+      --statcard-bg: rgba(255,255,255,0.72);
+      --statcard-fg: hsl(var(--foreground));
+      --statcard-label-fg: hsl(var(--muted-foreground));
+      --statcard-sub-a: 1;
+      --cache-track: rgba(226,232,240,0.55);
+      --cache-track-idle: rgba(226,232,240,0.5);
+
+      /* 元信息小标签：日间是无边淡灰药丸 */
+      --tag-bg: #eef2f7;
+      --tag-bd: transparent;
+      --tag-fg: hsl(var(--muted-foreground));
+
+      /* 面板头：日间不另铺底，跟卡面共用同一张白 */
+      --ph2-bg: transparent;
+
+      /* 拟回复：日间是淡紫笺，夜间才上正红 */
+      --answer-bg: #f5f3ff;
+      --answer-bd: #ede9fe;
+      --answer-bd-w: var(--rule);
+      --answer-bar: #ede9fe;
+      --answer-bar-w: var(--rule);
+      --answer-fg: #7c3aed;
+
+      /* ---- 形：圆角 / 线宽 / 阴影 / 间距 ---- */
+      --sidebar-w: 220px;
+      --rule: 1px;
       --radius: 14px;
-      --entry-in: #ecfeff;
-      --entry-out: #ecfdf5;
-      --entry-status: #eff6ff;
-      --entry-error: #fff1f2;
-      --entry-assistant: #f5f3ff;
+      --radius-sm: 9px;
+      --radius-xs: 10px;
+      --radius-pill: 999px;
+      --panel-shadow: 0 2px 8px rgba(0,0,0,0.05);
+      --panel-blur: blur(8px);
+      --bite: 0px;                        /* 夜间用负边距让相邻块共享一条黑线 */
+      --gap: 8px;
+      --gap-lg: 16px;
+      --bar-w: var(--rule);               /* 左侧颜料条：日间不用，退回普通边框 */
+      --bar-w-sm: var(--rule);
+      --main-pad: 24px;
+      --main-max: none;
+
+      /* ---- 字号 / 字体 ---- */
+      --h1-size: 24px;
+      --h1-weight: 800;
+      --h2-size: 14px;
+      --h2-weight: 700;
+      --stat-size: 20px;
+      --stat-big: 24px;
+      --title-size: 14px;
+      --title-weight: 800;
+      --eye-bg: transparent;
+      --eye-fg: #0f766e;
+      --eye-pad: 0;
+      --eye-track: 0.1em;
+      --th-head-bg: transparent;
+      --th-head-fg: hsl(var(--muted-foreground));
+      --font-serif: "Segoe UI", system-ui, sans-serif;
+      --font-sans: "Segoe UI", system-ui, sans-serif;
+      --font-mono: Consolas, ui-monospace, "SF Mono", Menlo, monospace;
+      --font-read: Georgia, "Noto Serif SC", serif;
+      color-scheme: light;
     }
+
+    /* 守夜 · 夜间画室：黑底点亮原色（非反相），亮原色一律配骨黑字 */
+    [data-theme="dark"] {
+      --background: 33.3 27.3% 6.5%;
+      --background-2: 33.3 27.3% 6.5%;
+      --canvas: hsl(var(--background));
+      --foreground: 41.5 40.6% 87.5%;
+      --card: 35 23.1% 10.2%;
+      --card-a: 1;
+      --raised: 33.3 27.3% 12.9%;
+      --raised-a: 1;
+      --muted-foreground: 34 11.8% 49.8%;
+      --hairline: 32.7 24.4% 17.6%;
+
+      --edge-c: var(--foreground);
+      --edge-a: 1;
+      --edge-soft-c: var(--hairline);
+      --edge-soft-a: 1;
+
+      --signal: 6.1 80.2% 54.5%;
+      --signal-foreground: 33.3 27.3% 6.5%;
+      --llm: 223.2 73.5% 62.9%;
+      --llm-foreground: 33.3 27.3% 6.5%;
+      --scheduler: 46.2 96.5% 55.1%;
+      --scheduler-foreground: 33.3 27.3% 6.5%;
+      --story: 140 45.5% 45.3%;
+      --story-foreground: 33.3 27.3% 6.5%;
+      --cost: 345 67.4% 65.1%;
+      --cost-foreground: 33.3 27.3% 6.5%;
+
+      --signal-fill: hsl(var(--signal));       --signal-on-fill: hsl(var(--signal-foreground));
+      --llm-fill: hsl(var(--llm));             --llm-on-fill: hsl(var(--llm-foreground));
+      --scheduler-fill: hsl(var(--scheduler)); --scheduler-on-fill: hsl(var(--scheduler-foreground));
+      --story-fill: hsl(var(--story));         --story-on-fill: hsl(var(--story-foreground));
+      --cost-fill: hsl(var(--cost));           --cost-on-fill: hsl(var(--cost-foreground));
+      --neutral-fill: hsl(var(--raised));      --neutral-on-fill: hsl(var(--foreground));
+
+      --accent: hsl(var(--llm));
+      --link: hsl(var(--llm));
+      --focus: hsl(var(--llm));
+      --bar-fill: hsl(var(--llm));
+      --btn-bg: hsl(var(--foreground));
+      --btn-fg: hsl(var(--background));
+      --btn-bd: hsl(var(--foreground));
+      --btn-hover-bg: hsl(var(--llm));
+      --btn-hover-fg: hsl(var(--llm-foreground));
+      --btn-sec-bg: hsl(var(--card));
+      --btn-sec-fg: hsl(var(--foreground));
+      --btn-sec-hover-bg: hsl(var(--scheduler));
+      --btn-sec-hover-fg: hsl(var(--scheduler-foreground));
+      --field-bg: hsl(var(--card));
+
+      --tint-in: hsl(var(--card));
+      --tint-out: hsl(var(--card));
+      --tint-status: hsl(var(--raised));
+      --tint-error: hsl(var(--signal));
+      --tint-error-fg: hsl(var(--signal-foreground));
+      --tint-assistant: hsl(var(--card));
+      --tint-user: hsl(var(--card));
+      --tint-ci-system: hsl(var(--raised));
+      --tint-empty: transparent;
+      --entry-bg: hsl(var(--card));
+      --entry-bd-c: var(--foreground);
+      --entry-bd-a: 1;
+      --bar-in: hsl(var(--foreground));
+      --bar-out: hsl(var(--signal));
+      --bar-assistant: hsl(var(--llm));
+      --bar-status: hsl(var(--hairline));
+      --bar-story: hsl(var(--story));
+      --th-bar-w: 10px;
+      --gap-sm: 0px;
+      --gi-active-bg: hsl(var(--scheduler));
+      --gi-active-fg: hsl(var(--scheduler-foreground));
+      --gi-active-bd: hsl(var(--foreground));
+
+      --th-default: hsl(var(--llm));
+      --th-bootstrap: hsl(var(--story));
+      --th-qq: hsl(var(--foreground));
+      --th-proactive: hsl(var(--signal));
+      --th-autonomy: hsl(var(--scheduler));
+
+      --msg-user-bg: hsl(var(--card));   --msg-user-bar: hsl(var(--foreground)); --msg-user-fg: hsl(var(--foreground));
+      --msg-asst-bg: transparent;        --msg-asst-bar: hsl(var(--llm));        --msg-asst-fg: hsl(var(--llm));
+      --msg-sys-bg: hsl(var(--raised));  --msg-sys-bar: hsl(var(--hairline));    --msg-sys-fg: hsl(var(--muted-foreground));
+      --msg-bar-w: 6px;
+
+      --sidebar: 35 23.1% 10.2%;
+      --sidebar-foreground: 37.1 16.3% 59.2%;
+      --sidebar-brand: 41.5 40.6% 87.5%;
+      --sidebar-hover-fg: 41.5 40.6% 87.5%;
+      --sidebar-active: 46.2 96.5% 55.1%;
+      --sidebar-active-foreground: 33.3 27.3% 6.5%;
+      --sidebar-border: 32.7 24.4% 17.6%;
+      --sidebar-line: hsl(var(--sidebar-foreground) / 0.24);
+      --nav-pad: 10px 0;
+      --nav-gap: 0px;
+      --nav-item-pad: 10px 16px;
+      --nav-bar-w: 4px;
+      --brand-size: 26px;
+      --brand-weight: 600;
+      --brand-sub-size: 10px;
+      --brand-sub-track: 0.14em;
+      --brand-sub-case: uppercase;
+      --switch-w: 28px;
+      --switch-h: 14px;
+      --switch-knob: 8px;
+      --switch-x: 15px;
+      --switch-bd: var(--rule);
+      --switch-bg: transparent;
+      --switch-on-bg: hsl(var(--sidebar-active) / 0.28);
+      --switch-knob-c: currentColor;
+      --switch-on-knob-c: currentColor;
+      --mode-on-fg: hsl(var(--sidebar-active));
+      --radius-bar: 0px;
+      --usage-accent: hsl(var(--cost));
+      --resizer-on: hsl(var(--scheduler));
+      --pill-fg: hsl(var(--muted-foreground));
+      --pill-on-bg: var(--story-fill);
+      --pill-on-fg: var(--story-on-fill);
+
+      --statcard-bg: var(--neutral-fill);
+      --statcard-fg: var(--neutral-on-fill);
+      --statcard-label-fg: currentColor;
+      --statcard-sub-a: 0.85;
+      --cache-track: hsl(var(--raised) / var(--raised-a));
+      --cache-track-idle: hsl(var(--hairline) / 0.5);
+
+      --tag-bg: hsl(var(--raised) / var(--raised-a));
+      --tag-bd: hsl(var(--edge-soft-c) / var(--edge-soft-a));
+      --tag-fg: hsl(var(--muted-foreground));
+
+      --ph2-bg: hsl(var(--raised) / var(--raised-a));
+
+      --answer-bg: hsl(var(--signal) / 0.09);
+      --answer-bd: transparent;
+      --answer-bd-w: 0px;
+      --answer-bar: hsl(var(--signal));
+      --answer-bar-w: 3px;
+      --answer-fg: hsl(var(--signal));
+
+      --sidebar-w: 208px;
+      --rule: 2px;
+      --radius: 0px;
+      --radius-sm: 0px;
+      --radius-xs: 0px;
+      --radius-pill: 0px;
+      --panel-shadow: none;
+      --panel-blur: none;
+      --bite: calc(var(--rule) * -1);
+      --gap: 0px;
+      --gap-lg: 0px;
+      --bar-w: 10px;
+      --bar-w-sm: 8px;
+      --main-pad: 28px;
+      --main-max: 1236px;
+
+      --h1-size: 34px;
+      --h1-weight: 600;
+      --h2-size: 17px;
+      --h2-weight: 600;
+      --stat-size: 34px;
+      --stat-big: 34px;
+      --title-size: 20px;
+      --title-weight: 600;
+      --eye-bg: hsl(var(--foreground));
+      --eye-fg: hsl(var(--background));
+      --eye-pad: 3px 8px;
+      --eye-track: 0.14em;
+      --th-head-bg: hsl(var(--foreground));
+      --th-head-fg: hsl(var(--background));
+      --font-serif: "Fraunces", "Noto Serif SC", "Songti SC", "STSong", Georgia, serif;
+      --font-sans: "Literata", "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+      --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      --font-read: var(--font-serif);
+      color-scheme: dark;
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
       display: flex; min-height: 100vh; width: 100%;
-      font-family: "Segoe UI", system-ui, sans-serif;
-      color: var(--ink);
-      background: linear-gradient(135deg, #f0f4f8, #e8eef5);
+      font-family: var(--font-sans);
+      font-size: 13px;
+      color: hsl(var(--foreground));
+      background: var(--canvas);
+      background-attachment: fixed;
+      -webkit-font-smoothing: antialiased;
+      text-rendering: optimizeLegibility;
     }
+    /* 标题走衬线：拉丁 Fraunces，中文宋体——像 Holly 在写日记 */
+    h1, .ph-title, .ph2-title, .brand-name, .thought-title, .reflect-topic, .usage-date {
+      font-family: var(--font-serif);
+    }
+    /* 数据是笔触：所有等宽一律 tabular-nums，ID / token / 时间戳列不抖动 */
+    pre, code, .mono, input, select,
+    .ph-eye, .entry-h, .ci-h, .mi-h, .msg-name, .msg-time, .badge, .thought-time,
+    .reflect-time, .reflect-stat b, .cache-head b, .cache-axis, .usage-table,
+    .meta-tag, .gi-meta, .brand-sub {
+      font-family: var(--font-mono);
+      font-variant-numeric: tabular-nums;
+    }
+
     #app { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+
+    /* ---------- 侧栏：钉在画布边上的黑竖栏 ---------- */
     .sidebar {
       width: var(--sidebar-w); min-height: 100vh;
-      background: var(--sidebar-bg);
+      background: hsl(var(--sidebar));
+      border-right: var(--rule) solid hsl(var(--sidebar-border));
       display: flex; flex-direction: column; flex-shrink: 0;
       position: fixed; left: 0; top: 0; bottom: 0; z-index: 10;
     }
-    .brand { padding: 22px 18px 18px; border-bottom: 1px solid rgba(255,255,255,0.07); }
-    .brand-name { font-size: 18px; font-weight: 800; color: #fff; letter-spacing: -0.02em; }
-    .brand-sub { font-size: 11px; color: var(--sidebar-text); margin-top: 2px; }
-    .nav { flex: 1; padding: 14px 10px; display: flex; flex-direction: column; gap: 3px; list-style: none; }
+    .brand { padding: 22px 16px 18px; border-bottom: var(--rule) solid var(--sidebar-line); }
+    .brand-name { font-size: var(--brand-size); font-weight: var(--brand-weight); color: hsl(var(--sidebar-brand)); letter-spacing: -0.01em; line-height: 1.1; }
+    .brand-sub { font-size: var(--brand-sub-size); color: hsl(var(--sidebar-foreground)); margin-top: 4px; letter-spacing: var(--brand-sub-track); text-transform: var(--brand-sub-case); }
+    .nav { flex: 1; padding: var(--nav-pad); display: flex; flex-direction: column; gap: var(--nav-gap); list-style: none; }
     .nav-item {
       display: flex; align-items: center; gap: 10px;
-      padding: 10px 12px; border-radius: 9px; cursor: pointer;
-      color: var(--sidebar-text); font-size: 13px; font-weight: 500;
-      transition: background 0.12s, color 0.12s; user-select: none;
+      padding: var(--nav-item-pad); cursor: pointer; border-radius: var(--radius-sm);
+      color: hsl(var(--sidebar-foreground)); font-size: 13px; font-weight: 500;
+      transition: background 80ms ease-out, color 80ms ease-out; user-select: none;
+      border-left: var(--nav-bar-w) solid transparent;
     }
-    .nav-item:hover { background: rgba(255,255,255,0.06); color: #c8d6e5; }
-    .nav-item.active { background: rgba(255,255,255,0.11); color: #fff; }
+    .nav-item:hover { background: hsl(var(--sidebar-foreground) / 0.1); color: hsl(var(--sidebar-hover-fg)); }
+    /* 日间 = 半透明白块，夜间 = 钉在黑栏上的正黄填实块（黑字） */
+    .nav-item.active,
+    .nav-item.active:hover {
+      background: hsl(var(--sidebar-active));
+      color: hsl(var(--sidebar-active-foreground));
+      border-left-color: hsl(var(--sidebar-active-foreground));
+      font-weight: 700;
+    }
     .nav-item svg { width: 16px; height: 16px; flex-shrink: 0; }
-    .mode-row {
-      padding: 12px 18px; border-top: 1px solid rgba(255,255,255,0.07);
-      display: flex; align-items: center; gap: 8px;
-      font-size: 11px; color: var(--sidebar-text);
+    .mode-row, .theme-row {
+      padding: 11px 16px; border-top: var(--rule) solid var(--sidebar-line);
+      display: flex; align-items: center; gap: 9px;
+      font-size: 11px; color: hsl(var(--sidebar-foreground));
       cursor: pointer; user-select: none;
+      transition: color 80ms ease-out;
     }
-    .mode-row:hover { color: #c8d6e5; }
-    .mode-row.on { color: #fbbf24; }
-    .mode-switch { width: 30px; height: 16px; border-radius: 999px; background: #334155; position: relative; transition: background 0.15s; flex-shrink: 0; }
-    .mode-switch::after { content: ''; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px; border-radius: 50%; background: #94a3b8; transition: left 0.15s, background 0.15s; }
-    .mode-switch.on { background: #b45309; }
-    .mode-switch.on::after { left: 16px; background: #fde68a; }
+    .mode-row:hover, .theme-row:hover { color: hsl(var(--sidebar-hover-fg)); }
+    .mode-row.on { color: var(--mode-on-fg); }
+    /* 日间是胶囊拨杆，夜间是矩形：蒙德里安不做胶囊 */
+    .mode-switch {
+      width: var(--switch-w); height: var(--switch-h); position: relative; flex-shrink: 0;
+      background: var(--switch-bg); border-radius: var(--radius-pill);
+      border: var(--switch-bd) solid currentColor; transition: background 100ms ease-out;
+    }
+    .mode-switch::after {
+      content: ''; position: absolute; top: 1px; left: 1px;
+      width: var(--switch-knob); height: var(--switch-knob);
+      background: var(--switch-knob-c); border-radius: var(--radius-pill);
+      transition: left 100ms ease-in-out, background 100ms ease-out;
+    }
+    .mode-switch.on { background: var(--switch-on-bg); }
+    .mode-switch.on::after { left: var(--switch-x); background: var(--switch-on-knob-c); }
     .ws-status {
-      padding: 14px 18px; border-top: 1px solid rgba(255,255,255,0.07);
-      display: flex; align-items: center; gap: 8px;
-      font-size: 11px; color: var(--sidebar-text);
+      padding: 13px 16px; border-top: var(--rule) solid var(--sidebar-line);
+      display: flex; align-items: center; gap: 9px;
+      font-size: 11px; color: hsl(var(--sidebar-foreground));
     }
-    .dot { width: 7px; height: 7px; border-radius: 50%; background: #475569; flex-shrink: 0; }
-    .dot.open { background: #22c55e; }
-    .dot.connecting { background: #eab308; animation: pulse 1.2s infinite; }
-    .dot.error { background: #ef4444; }
-    @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
-    .main { margin-left: var(--sidebar-w); flex: 1; padding: 24px; min-height: 100vh; min-width: 0; width: calc(100% - var(--sidebar-w)); }
-    .ph { margin-bottom: 18px; }
-    .ph-eye { font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--accent); margin-bottom: 3px; }
-    .ph-title { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
-    .ph-desc { font-size: 13px; color: var(--muted); margin-top: 3px; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius); backdrop-filter: blur(8px); box-shadow: 0 2px 8px rgba(0,0,0,0.05); }
-    .ph2 { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 14px 18px; border-bottom: 1px solid var(--line); }
-    .ph2-title { font-size: 14px; font-weight: 700; }
-    .pb { padding: 16px 18px; }
-    .g2 { display: grid; grid-template-columns: minmax(0,1.6fr) minmax(260px,0.75fr); gap: 16px; }
-    .g2l { display: grid; grid-template-columns: 200px 1fr; gap: 16px; }
-    .badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 700; background: #e2e8f0; color: #334155; }
-    .badge.open { background: #dcfce7; color: #166534; }
-    .badge.connecting { background: #fef3c7; color: #92400e; }
-    .badge.error { background: #ffe4e6; color: #be123c; }
-    .bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 10px; }
-    .url-tag { flex: 1 1 180px; padding: 8px 11px; border-radius: 9px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-family: Consolas,monospace; font-size: 11px; color: #0f172a; word-break: break-all; }
-    button { border: 0; border-radius: 999px; padding: 9px 15px; font: inherit; font-size: 12px; font-weight: 700; cursor: pointer; color: #fff; background: var(--accent); transition: background 0.12s; }
-    button:hover { background: var(--accent-h); }
-    button:disabled { opacity: 0.55; cursor: not-allowed; }
-    button.sec { color: var(--ink); background: #e2e8f0; }
-    button.sec:hover { background: #cbd5e1; }
+    /* 日间是圆点，夜间是方块 */
+    .dot { width: 9px; height: 9px; border-radius: var(--radius-pill); background: hsl(var(--sidebar-foreground) / 0.5); flex-shrink: 0; }
+    .dot.open { background: hsl(var(--story)); }
+    .dot.connecting { background: hsl(var(--scheduler)); animation: pulse 1.2s steps(2, end) infinite; }
+    .dot.error { background: hsl(var(--signal)); }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
+    /* ---------- 画布 ---------- */
+    .main {
+      margin-left: var(--sidebar-w); flex: 1; padding: var(--main-pad);
+      min-height: 100vh; min-width: 0; width: calc(100% - var(--sidebar-w)); max-width: var(--main-max);
+    }
+    .ph { margin-bottom: 16px; }
+    /* 日间是 teal 小眉字，夜间是一枚填实颜料块 */
+    .ph-eye {
+      display: inline-block; margin-bottom: 4px; padding: var(--eye-pad);
+      font-size: 10px; font-weight: 700; letter-spacing: var(--eye-track); text-transform: uppercase;
+      background: var(--eye-bg); color: var(--eye-fg);
+    }
+    /* 语义填实块是夜间的语言；日间眉字一律留 teal 细字 */
+    [data-theme="dark"] .ph-eye.llm { background: var(--llm-fill); color: var(--llm-on-fill); }
+    [data-theme="dark"] .ph-eye.story { background: var(--story-fill); color: var(--story-on-fill); }
+    [data-theme="dark"] .ph-eye.signal { background: var(--signal-fill); color: var(--signal-on-fill); }
+    [data-theme="dark"] .ph-eye.scheduler { background: var(--scheduler-fill); color: var(--scheduler-on-fill); }
+    [data-theme="dark"] .ph-eye.cost { background: var(--cost-fill); color: var(--cost-on-fill); }
+    .ph-title { font-size: var(--h1-size); font-weight: var(--h1-weight); letter-spacing: -0.02em; line-height: 1.2; }
+    .ph-desc { font-size: 13px; color: hsl(var(--muted-foreground)); margin-top: 4px; max-width: 76ch; line-height: 1.6; }
+
+    /* 日间是毛玻璃圆角卡，夜间面板边界即构图：2px 骨黑硬线，0 圆角 */
+    .panel {
+      background: hsl(var(--card) / var(--card-a));
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-radius: var(--radius);
+      backdrop-filter: var(--panel-blur);
+      box-shadow: var(--panel-shadow);
+    }
+    .ph2 {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px;
+      padding: 12px 16px; background: var(--ph2-bg);
+      border-bottom: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-radius: var(--radius) var(--radius) 0 0;
+    }
+    .ph2-title { font-size: var(--h2-size); font-weight: var(--h2-weight); }
+    .pb { padding: 16px; }
+    .g2l { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: var(--gap-lg); }
+    /* 夜间相邻面板共享同一条黑线：负外边距咬合，不留缝 */
+    .g2l > .panel + .panel { margin-left: var(--bite); }
+
+    .badge {
+      display: inline-flex; align-items: center; padding: 4px 10px;
+      border: var(--rule) solid transparent; border-radius: var(--radius-pill);
+      font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+      background: var(--neutral-fill); color: var(--neutral-on-fill);
+    }
+    .badge.open { background: var(--story-fill); color: var(--story-on-fill); }
+    .badge.connecting { background: var(--scheduler-fill); color: var(--scheduler-on-fill); }
+    .badge.error { background: var(--signal-fill); color: var(--signal-on-fill); }
+
+    button {
+      border: var(--rule) solid var(--btn-bd); border-radius: var(--radius-pill);
+      padding: 9px 15px; font: inherit; font-family: var(--font-sans);
+      font-size: 12px; font-weight: 700; letter-spacing: 0.04em; cursor: pointer;
+      color: var(--btn-fg); background: var(--btn-bg);
+      transition: background 80ms ease-out, color 80ms ease-out;
+    }
+    button:hover { background: var(--btn-hover-bg); color: var(--btn-hover-fg); }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button:disabled:hover { background: var(--btn-bg); color: var(--btn-fg); }
+    button.sec { color: var(--btn-sec-fg); background: var(--btn-sec-bg); }
+    button.sec:hover { background: var(--btn-sec-hover-bg); color: var(--btn-sec-hover-fg); }
     button.sm { padding: 6px 11px; font-size: 11px; }
-    .log { min-height: 380px; max-height: 66vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding-right: 3px; }
-    .group-log { min-height: 180px; max-height: 260px; }
-    .entry { border-radius: 10px; border: 1px solid var(--line); padding: 10px 13px; background: #fff; flex-shrink: 0; }
-    .entry.incoming { background: var(--entry-in); }
-    .entry.outgoing { background: var(--entry-out); }
-    .entry.status { background: var(--entry-status); }
-    .entry.error { background: var(--entry-error); }
-    .entry.assistant { background: var(--entry-assistant); }
-    .entry-h { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px; font-size: 13px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
-    .entry pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 13px; line-height: 1.5; }
-    .empty { border: 1px dashed var(--line); border-radius: 10px; padding: 18px; color: var(--muted); background: rgba(255,255,255,0.6); text-align: center; font-size: 13px; }
-    .stack { display: flex; flex-direction: column; gap: 10px; }
-    select { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
-    .meta-tag { padding: 8px 11px; border-radius: 9px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-family: Consolas,monospace; font-size: 11px; color: #0f172a; }
-    .conv-box { border-top: 1px solid var(--line); margin-top: 8px; padding-top: 12px; }
-    .conv-log { display: flex; flex-direction: column; gap: 7px; max-height: 260px; overflow-y: auto; margin-top: 8px; }
-    .ci { border-radius: 9px; border: 1px solid var(--line); padding: 9px 11px; background: rgba(255,255,255,0.8); }
-    .ci.user { background: rgba(224,242,254,0.9); }
-    .ci.assistant { background: rgba(237,233,254,0.9); }
-    .ci.system { background: rgba(240,249,255,0.9); }
-    .ci-h { display: flex; justify-content: space-between; font-size: 9px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
-    .ci pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 11px; line-height: 1.4; }
-    .usage-total-row { display: flex; justify-content: space-between; align-items: baseline; padding: 12px 16px; margin-bottom: 14px; border-radius: 10px; background: rgba(248,250,252,0.9); border: 1px solid var(--line); font-size: 14px; font-weight: 700; color: var(--ink); }
-    .usage-day { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: rgba(255,255,255,0.7); }
-    .usage-day-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-    .usage-date { font-size: 13px; font-weight: 700; color: var(--ink); }
-    .usage-day-total { font-size: 13px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--accent); }
-    .usage-table { width: 100%; border-collapse: collapse; font-size: 12px; }
-    .usage-table th { text-align: right; font-weight: 600; color: var(--muted); padding: 4px 6px; border-bottom: 1px solid var(--line); }
+
+    input, select {
+      width: 100%; border-radius: var(--radius-sm);
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      padding: 9px 11px; font-size: 13px;
+      color: hsl(var(--foreground)); background: var(--field-bg);
+    }
+    input:focus-visible, select:focus-visible, button:focus-visible, .nav-item:focus-visible {
+      outline: 2px solid var(--focus); outline-offset: 2px;
+    }
+    label { display: flex; flex-direction: column; gap: 5px; font-size: 11px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase; color: hsl(var(--muted-foreground)); }
+
+    /* ---------- 读取流：日间是淡色圆角条，夜间是账簿式咬合堆叠 ---------- */
+    .stack { display: flex; flex-direction: column; gap: var(--gap); }
+    .entry {
+      border: var(--rule) solid hsl(var(--entry-bd-c) / var(--entry-bd-a));
+      border-left-width: var(--bar-w); border-radius: var(--radius-xs);
+      padding: 10px 13px; background: var(--entry-bg); flex-shrink: 0;
+      margin-bottom: var(--bite);
+    }
+    .entry.incoming { border-left-color: var(--bar-in); background: var(--tint-in); }
+    .entry.outgoing { border-left-color: var(--bar-out); background: var(--tint-out); }
+    .entry.assistant { border-left-color: var(--bar-assistant); background: var(--tint-assistant); }
+    .entry.status { border-left-color: var(--bar-status); background: var(--tint-status); }
+    /* 日间是淡红底，夜间直接上墙：整块填实正红 */
+    .entry.error { background: var(--tint-error); color: var(--tint-error-fg); }
+    .entry.error .entry-h { color: var(--tint-error-fg); }
+    .entry-h {
+      display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px;
+      font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
+      color: hsl(var(--muted-foreground));
+    }
+    .entry pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.55; }
+    .empty {
+      border: var(--rule) dashed hsl(var(--edge-soft-c) / var(--edge-soft-a)); padding: 18px;
+      border-radius: var(--radius-xs);
+      color: hsl(var(--muted-foreground)); background: var(--tint-empty); text-align: center;
+      font-family: var(--font-mono); font-size: 12px;
+    }
+    .meta-tag {
+      padding: 8px 11px; background: hsl(var(--raised) / var(--raised-a));
+      border: var(--rule) solid hsl(var(--edge-soft-c) / var(--edge-soft-a));
+      border-radius: var(--radius-sm);
+      font-size: 11px; color: hsl(var(--foreground)); word-break: break-all;
+    }
+    .conv-box { border-top: var(--rule) solid hsl(var(--edge-soft-c) / var(--edge-soft-a)); margin-top: 10px; padding-top: 12px; }
+    .conv-log { display: flex; flex-direction: column; gap: var(--gap); max-height: 260px; overflow-y: auto; margin-top: 8px; }
+    .ci {
+      border: var(--rule) solid hsl(var(--entry-bd-c) / var(--entry-bd-a));
+      border-left-width: var(--bar-w-sm); border-radius: var(--radius-sm);
+      padding: 9px 11px; background: var(--entry-bg);
+      margin-bottom: var(--bite);
+    }
+    .ci.user { border-left-color: var(--bar-in); background: var(--tint-user); }
+    .ci.assistant { border-left-color: var(--bar-assistant); background: var(--tint-assistant); }
+    .ci.system { border-left-color: var(--bar-status); background: var(--tint-ci-system); }
+    .ci-h {
+      display: flex; justify-content: space-between; font-size: 10px; font-weight: 700;
+      letter-spacing: 0.08em; text-transform: uppercase; color: hsl(var(--muted-foreground)); margin-bottom: 4px;
+    }
+    .ci pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 11px; line-height: 1.45; }
+
+    /* ---------- Usage：日间是浅底统计条，夜间一律做成填实大色块 ---------- */
+    .usage-total-row {
+      display: flex; justify-content: space-between; align-items: baseline; gap: 12px;
+      padding: 14px 18px; margin-bottom: 14px; border-radius: var(--radius-xs);
+      background: var(--cost-fill); color: var(--cost-on-fill);
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      font-size: 14px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+    }
+    .usage-total-row b { font-family: var(--font-mono); font-size: var(--stat-big); font-weight: 700; letter-spacing: -0.02em; }
+    .usage-day {
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a)); border-radius: var(--radius-xs);
+      padding: 12px 14px; margin-bottom: var(--bite); background: hsl(var(--card) / var(--card-a));
+    }
+    .usage-day-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+    .usage-date { font-size: var(--title-size); font-weight: var(--title-weight); }
+    .usage-day-total { font-family: var(--font-mono); font-size: 15px; font-weight: 700; font-variant-numeric: tabular-nums; color: var(--usage-accent); }
+    .usage-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+    /* 日间是淡线表头，夜间是一条黑带 */
+    .usage-table th {
+      text-align: right; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+      color: var(--th-head-fg); background: var(--th-head-bg); padding: 6px 7px;
+      border-bottom: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+    }
     .usage-table th:first-child { text-align: left; }
-    .usage-table td { text-align: right; padding: 4px 6px; font-variant-numeric: tabular-nums; color: var(--ink); border-bottom: 1px solid rgba(226,232,240,0.5); }
-    .usage-table td:first-child { text-align: left; font-family: Consolas,monospace; color: var(--muted); word-break: break-all; }
+    .usage-table td { text-align: right; padding: 5px 7px; color: hsl(var(--foreground)); border-bottom: 1px solid hsl(var(--edge-soft-c) / var(--edge-soft-a)); }
+    .usage-table td:first-child { text-align: left; color: hsl(var(--muted-foreground)); word-break: break-all; }
     .usage-table tr:last-child td { border-bottom: 0; }
-    .cache-bars { display: flex; align-items: flex-end; gap: 2px; height: 90px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,0.7); overflow-x: auto; }
-    .cache-bar { flex: 1 0 4px; min-width: 4px; display: flex; align-items: flex-end; height: 100%; border-radius: 2px; background: rgba(226,232,240,0.55); }
-    .cache-bar i { display: block; width: 100%; border-radius: 2px; background: var(--accent); }
-    .cache-bar.idle { background: repeating-linear-gradient(45deg, rgba(226,232,240,0.5) 0 3px, transparent 3px 6px); }
-    .cache-axis { display: flex; justify-content: space-between; margin-top: 5px; font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
-    .cache-heads { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
-    .cache-head { flex: 1 1 150px; border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: rgba(255,255,255,0.72); }
-    .cache-head span { display: block; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 4px; }
-    .cache-head b { font-size: 19px; color: var(--ink); font-variant-numeric: tabular-nums; }
-    .cache-head small { display: block; margin-top: 3px; font-size: 11px; color: var(--muted); }
-    .reflect-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }
-    .reflect-stat { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(255,255,255,0.72); }
-    .reflect-stat-label { display: block; margin-bottom: 5px; font-size: 10px; font-weight: 800; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); }
-    .reflect-stat b { display: block; font-size: 20px; line-height: 1.2; color: var(--ink); font-variant-numeric: tabular-nums; }
-    .reflect-stat small { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.35; word-break: break-word; }
-    .reflect-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
-    .reflect-list { display: flex; flex-direction: column; gap: 10px; }
-    .reflect-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; background: rgba(255,255,255,0.78); }
-    .reflect-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 7px; }
-    .reflect-topic { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 800; color: var(--ink); }
-    .reflect-time { flex-shrink: 0; color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
-    .reflect-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; color: var(--muted); font-size: 11px; }
-    .reflect-meta span { border-radius: 999px; padding: 3px 8px; background: #eef2f7; }
-    .reflect-body { white-space: pre-wrap; word-break: break-word; color: var(--ink); font-size: 13px; line-height: 1.55; }
+
+    .cache-bars {
+      display: flex; align-items: flex-end; gap: 2px; height: 108px; padding: 10px;
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a)); border-radius: var(--radius-xs);
+      background: hsl(var(--card) / var(--card-a)); overflow-x: auto;
+    }
+    .cache-bar { flex: 1 0 5px; min-width: 5px; display: flex; align-items: flex-end; height: 100%; background: var(--cache-track); border-radius: var(--radius-bar); }
+    .cache-bar i { display: block; width: 100%; background: var(--bar-fill); border-radius: var(--radius-bar); }
+    .cache-bar.idle { background: repeating-linear-gradient(45deg, var(--cache-track-idle) 0 3px, transparent 3px 6px); }
+    .cache-axis { display: flex; justify-content: space-between; margin-top: 6px; font-size: 10px; color: hsl(var(--muted-foreground)); }
+    /* 日间是三格浅底卡，夜间是填实块咬合成一条色带 */
+    .cache-heads { display: flex; flex-wrap: wrap; gap: var(--gap-lg); margin-bottom: 14px; }
+    .cache-head {
+      flex: 1 1 150px; border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-radius: var(--radius-xs);
+      padding: 12px 14px; margin-right: var(--bite);
+      background: var(--statcard-bg); color: var(--statcard-fg);
+    }
+    [data-theme="dark"] .cache-head.llm { background: var(--llm-fill); color: var(--llm-on-fill); }
+    [data-theme="dark"] .cache-head.scheduler { background: var(--scheduler-fill); color: var(--scheduler-on-fill); }
+    [data-theme="dark"] .cache-head.cost { background: var(--cost-fill); color: var(--cost-on-fill); }
+    .cache-head span { display: block; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--statcard-label-fg); opacity: var(--statcard-sub-a); margin-bottom: 6px; }
+    .cache-head b { font-size: var(--stat-size); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; }
+    .cache-head small { display: block; margin-top: 4px; font-size: 11px; color: var(--statcard-label-fg); opacity: var(--statcard-sub-a); }
+
+    /* ---------- Reflect：日间是四张浅底卡，夜间是四块大色块 ---------- */
+    .reflect-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--gap-lg); margin-bottom: 16px; }
+    .reflect-stat {
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a)); padding: 12px 14px;
+      border-radius: var(--radius-xs); margin-right: var(--bite);
+      background: var(--statcard-bg); color: var(--statcard-fg);
+    }
+    [data-theme="dark"] .reflect-stat.scheduler { background: var(--scheduler-fill); color: var(--scheduler-on-fill); }
+    [data-theme="dark"] .reflect-stat.story { background: var(--story-fill); color: var(--story-on-fill); }
+    [data-theme="dark"] .reflect-stat.llm { background: var(--llm-fill); color: var(--llm-on-fill); }
+    [data-theme="dark"] .reflect-stat.signal { background: var(--signal-fill); color: var(--signal-on-fill); }
+    .reflect-stat-label { display: block; margin-bottom: 5px; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: var(--statcard-label-fg); opacity: var(--statcard-sub-a); }
+    .reflect-stat b { display: block; font-size: var(--stat-size); font-weight: 700; line-height: 1.2; letter-spacing: -0.02em; }
+    .reflect-stat small { display: block; margin-top: 4px; font-size: 11px; color: var(--statcard-label-fg); opacity: var(--statcard-sub-a); line-height: 1.4; word-break: break-word; }
+    .reflect-split { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: var(--gap-lg); }
+    .reflect-split > .panel + .panel { margin-left: var(--bite); }
+    .reflect-list { display: flex; flex-direction: column; gap: var(--gap); }
+    .reflect-card {
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-left-width: var(--bar-w-sm); border-left-color: var(--bar-story);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px; background: hsl(var(--card) / var(--card-a));
+      margin-bottom: var(--bite);
+    }
+    .reflect-card-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+    .reflect-topic { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--h2-size); font-weight: var(--title-weight); }
+    .reflect-time { flex-shrink: 0; color: hsl(var(--muted-foreground)); font-size: 11px; }
+    .reflect-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; font-size: 11px; }
+    .reflect-meta span { padding: 3px 8px; border-radius: var(--radius-pill); background: var(--tag-bg); border: 1px solid var(--tag-bd); color: var(--tag-fg); }
+    .reflect-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.65; }
     .reflect-links { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; }
-    .reflect-links a { color: var(--accent); font-size: 11px; word-break: break-all; text-decoration: none; }
+    .reflect-links a { color: var(--link); font-family: var(--font-mono); font-size: 11px; word-break: break-all; text-decoration: none; }
     .reflect-links a:hover { text-decoration: underline; }
-    .reflect-pill { border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 800; background: #e2e8f0; color: #334155; }
-    .reflect-pill.on { background: #ccfbf1; color: #0f766e; }
+    .reflect-pill {
+      padding: 4px 10px; font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+      letter-spacing: 0.06em; text-transform: uppercase; border-radius: var(--radius-pill);
+      border: var(--rule) solid transparent;
+      background: var(--neutral-fill); color: var(--pill-fg);
+    }
+    .reflect-pill.on { background: var(--pill-on-bg); color: var(--pill-on-fg); }
+
+    /* ---------- Thoughts：左侧颜料条 = 这一轮在想什么 ---------- */
     .thought-toolbar { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; }
-    .thought-toolbar select { width: auto; min-width: 160px; }
-    .thought-list { display: flex; flex-direction: column; gap: 12px; }
-    .thought-card { border: 1px solid var(--line); border-left: 4px solid #8b5cf6; border-radius: 11px; padding: 14px 16px; background: rgba(255,255,255,0.82); }
-    .thought-card.bootstrap { border-left-color: #0f766e; }
-    .thought-card.qq_mode { border-left-color: #0284c7; }
-    .thought-card.proactive { border-left-color: #d97706; }
-    .thought-card.autonomy { border-left-color: #16a34a; }
+    .thought-toolbar select { width: auto; min-width: 170px; }
+    .thought-list { display: flex; flex-direction: column; gap: var(--gap); }
+    .thought-card {
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-left: var(--th-bar-w) solid var(--th-default);
+      border-radius: var(--radius-sm);
+      padding: 14px 16px; background: hsl(var(--card) / var(--card-a));
+      margin-bottom: var(--bite);
+    }
+    .thought-card.bootstrap { border-left-color: var(--th-bootstrap); }
+    .thought-card.qq_mode { border-left-color: var(--th-qq); }
+    .thought-card.proactive { border-left-color: var(--th-proactive); }
+    .thought-card.autonomy { border-left-color: var(--th-autonomy); }
     .thought-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
-    .thought-title { font-size: 14px; font-weight: 800; color: var(--ink); }
-    .thought-time { flex-shrink: 0; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .thought-title { font-size: var(--title-size); font-weight: var(--title-weight); line-height: 1.3; }
+    .thought-time { flex-shrink: 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
     .thought-meta { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
-    .thought-meta span { border-radius: 999px; padding: 3px 8px; background: #eef2f7; color: #475569; font-size: 11px; }
-    .thought-summary { white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.65; color: var(--ink); }
-    .thought-answer { margin-top: 11px; padding: 10px 12px; border-radius: 9px; background: #f5f3ff; border: 1px solid #ede9fe; }
-    .thought-answer-label { display: block; margin-bottom: 4px; color: #7c3aed; font-size: 10px; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
-    .thought-answer-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.55; }
-    .archive-body { font-family: Georgia, "Noto Serif SC", serif; font-size: 14px; line-height: 1.85; max-height: 340px; overflow-y: auto; }
-    .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0,1fr)) auto; gap: 10px; align-items: end; }
-    label { display: flex; flex-direction: column; gap: 4px; font-size: 11px; font-weight: 700; color: var(--muted); }
-    input { width: 100%; border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font: inherit; font-size: 13px; color: var(--ink); background: rgba(255,255,255,0.94); }
-    .mem-meta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; margin-top: 10px; }
-    .mem-list { display: flex; flex-direction: column; gap: 9px; }
-    .mi { border: 1px solid var(--line); border-radius: 11px; padding: 13px 15px; background: #fff; }
-    .mi-h { display: flex; flex-wrap: wrap; gap: 6px; justify-content: space-between; margin-bottom: 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #475467; }
-    .mi-m { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 7px; color: var(--muted); font-size: 11px; }
-    pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: Consolas,monospace; font-size: 12px; line-height: 1.55; }
-    .glist { display: flex; flex-direction: column; gap: 5px; }
-    .gi { padding: 11px 13px; border-radius: 9px; border: 1px solid var(--line); background: #fff; cursor: pointer; transition: background 0.12s; }
-    .gi:hover { background: #f1f5f9; }
-    .gi.active { background: #ecfeff; border-color: #67e8f9; }
-    .gi-name { font-size: 13px; font-weight: 600; }
-    .gi-meta { font-size: 11px; color: var(--muted); margin-top: 2px; }
-    /* Group Talk full-height layout */
-    .group-view { display: flex; flex-direction: column; height: calc(100vh - 48px); gap: 0; width: 100%; }
+    .thought-meta span {
+      padding: 3px 8px; border-radius: var(--radius-pill);
+      background: var(--tag-bg); border: 1px solid var(--tag-bd);
+      color: var(--tag-fg); font-family: var(--font-mono); font-size: 11px;
+    }
+    .thought-summary { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.7; }
+    /* 拟回复 = Holly 要说的话：日间是淡紫笺，夜间才上正红 */
+    .thought-answer {
+      margin-top: 12px; padding: 10px 12px; border-radius: var(--radius-sm);
+      background: var(--answer-bg);
+      border: var(--answer-bd-w) solid var(--answer-bd);
+      border-left: var(--answer-bar-w) solid var(--answer-bar);
+    }
+    .thought-answer-label { display: block; margin-bottom: 5px; color: var(--answer-fg); font-family: var(--font-mono); font-size: 10px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; }
+    .thought-answer-body { white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.6; }
+    .archive-body { font-family: var(--font-read); font-size: 15px; line-height: 1.9; max-height: 340px; overflow-y: auto; }
+
+    /* ---------- Memory ---------- */
+    .fgrid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)) auto; gap: 10px; align-items: end; }
+    .mem-meta { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; color: hsl(var(--muted-foreground)); font-size: 11px; margin-top: 12px; }
+    .mem-list { display: flex; flex-direction: column; gap: var(--gap); }
+    .mi {
+      border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-left-width: var(--bar-w-sm); border-left-color: var(--bar-story);
+      border-radius: var(--radius-sm);
+      padding: 13px 15px; background: hsl(var(--card) / var(--card-a));
+      margin-bottom: var(--bite);
+    }
+    .mi-h { display: flex; flex-wrap: wrap; gap: 6px; justify-content: space-between; margin-bottom: 7px; font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: hsl(var(--muted-foreground)); }
+    .mi-m { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 7px; color: hsl(var(--muted-foreground)); font-size: 11px; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--font-mono); font-size: 12px; line-height: 1.55; }
+    .hint { font-size: 12px; color: hsl(var(--muted-foreground)); line-height: 1.65; }
+
+    /* ---------- Group Talk ---------- */
+    .glist { display: flex; flex-direction: column; gap: var(--gap-sm); }
+    .gi {
+      padding: 11px 13px; border: var(--rule) solid hsl(var(--edge-c) / var(--edge-a));
+      border-radius: var(--radius-sm);
+      background: hsl(var(--card) / var(--card-a)); cursor: pointer;
+      margin-bottom: var(--bite);
+      transition: background 80ms ease-out;
+    }
+    .gi:hover { background: hsl(var(--raised) / var(--raised-a)); }
+    /* 日间是淡青选中块，夜间是正黄块——与侧栏同一套语言 */
+    .gi.active, .gi.active:hover { background: var(--gi-active-bg); color: var(--gi-active-fg); border-color: var(--gi-active-bd); }
+    .gi-name { font-size: 13px; font-weight: 700; }
+    .gi-meta { font-size: 11px; color: hsl(var(--muted-foreground)); margin-top: 3px; }
+    .gi.active .gi-meta { color: var(--gi-active-fg); opacity: 0.75; }
+    .group-view { display: flex; flex-direction: column; height: calc(100vh - 56px); gap: 0; width: 100%; }
     .gp-live { flex: none; min-height: 80px; }
-    .gp-resizer { flex: none; height: 6px; cursor: row-resize; background: transparent; position: relative; z-index: 10; transition: background 0.15s; }
-    .gp-resizer:hover, .gp-resizer.dragging { background: #6366f1; }
-    .gp-resizer::before { content: ''; position: absolute; left: 50%; transform: translateX(-50%); top: 2px; width: 36px; height: 2px; border-radius: 2px; background: #cbd5e1; pointer-events: none; }
-    .gp-resizer:hover::before, .gp-resizer.dragging::before { background: #fff; }
-    .gp-bottom { flex: 1; min-height: 0; width: 100%; grid-template-rows: 1fr; margin-top: 16px; }
+    .gp-resizer { flex: none; height: 10px; cursor: row-resize; background: transparent; position: relative; z-index: 10; }
+    .gp-resizer::before {
+      content: ''; position: absolute; left: 0; right: 0; top: 4px; height: var(--rule);
+      background: hsl(var(--edge-soft-c) / var(--edge-soft-a)); pointer-events: none; transition: background 80ms ease-out;
+    }
+    .gp-resizer:hover::before, .gp-resizer.dragging::before { background: var(--resizer-on); }
+    .gp-bottom { flex: 1; min-height: 0; width: 100%; grid-template-rows: 1fr; margin-top: 6px; }
     .gp-panel { display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
-    .gp-scroll { flex: 1; overflow-y: auto; padding: 12px 14px; min-height: 0; }
-    .chat-scroll { flex: 1; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; gap: 2px; }
-    /* Full-width message rows */
-    .msg-entry { width: 100%; padding: 10px 16px; border-left: 3px solid transparent; transition: background 0.1s; }
-    .msg-entry:hover { filter: brightness(0.97); }
-    .msg-entry.user { background: #f0f9ff; border-left-color: #38bdf8; }
-    .msg-entry.assistant { background: #f5f3ff; border-left-color: #a78bfa; }
-    .msg-entry.system { background: #f8fafc; border-left-color: #94a3b8; }
+    .gp-scroll { flex: 1; overflow-y: auto; padding: 12px; min-height: 0; }
+    .chat-scroll { flex: 1; overflow-y: auto; min-height: 0; display: flex; flex-direction: column; }
+    /* 整行消息：左侧颜料条分辨说话的人 */
+    .msg-entry {
+      width: 100%; padding: 10px 16px;
+      border-left: var(--msg-bar-w) solid transparent;
+      border-bottom: 1px solid hsl(var(--edge-soft-c) / var(--edge-soft-a));
+      transition: background 100ms ease-out;
+    }
+    .msg-entry:hover { filter: brightness(0.985); }
+    .msg-entry.user { background: var(--msg-user-bg); border-left-color: var(--msg-user-bar); }
+    .msg-entry.assistant { background: var(--msg-asst-bg); border-left-color: var(--msg-asst-bar); }
+    .msg-entry.system { background: var(--msg-sys-bg); border-left-color: var(--msg-sys-bar); }
     .msg-head { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; margin-bottom: 4px; }
-    .msg-name { font-size: 13px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
-    .msg-entry.user .msg-name { color: #0369a1; }
-    .msg-entry.assistant .msg-name { color: #7c3aed; }
-    .msg-entry.system .msg-name { color: #64748b; }
-    .msg-time { font-size: 12px; color: var(--muted); flex-shrink: 0; }
-    .msg-body { font-size: 16px; line-height: 1.6; word-break: break-word; white-space: pre-wrap; color: var(--ink); }
-    .hint { font-size: 12px; color: var(--muted); line-height: 1.6; }
+    .msg-name { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; }
+    .msg-entry.user .msg-name { color: var(--msg-user-fg); }
+    .msg-entry.assistant .msg-name { color: var(--msg-asst-fg); }
+    .msg-entry.system .msg-name { color: var(--msg-sys-fg); }
+    .msg-time { font-size: 11px; color: hsl(var(--muted-foreground)); flex-shrink: 0; }
+    .msg-body { font-size: 15px; line-height: 1.65; word-break: break-word; white-space: pre-wrap; color: hsl(var(--foreground)); }
+
+    /* 滚动条也归到颜料盘里 */
+    ::-webkit-scrollbar { width: 10px; height: 10px; }
+    ::-webkit-scrollbar-track { background: hsl(var(--raised) / var(--raised-a)); }
+    ::-webkit-scrollbar-thumb {
+      background: hsl(var(--foreground) / 0.35); border-radius: var(--radius-pill);
+      border: 2px solid hsl(var(--raised) / var(--raised-a));
+    }
+    ::-webkit-scrollbar-thumb:hover { background: hsl(var(--foreground) / 0.6); }
+
     @media (max-width: 900px) {
-      .g2, .g2l, .reflect-split { grid-template-columns: 1fr; }
+      .g2l, .reflect-split { grid-template-columns: 1fr; }
+      .g2l > .panel + .panel, .reflect-split > .panel + .panel { margin-left: 0; margin-top: var(--bite); }
       .reflect-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .fgrid { grid-template-columns: 1fr 1fr; }
+      .ph-title { font-size: calc(var(--h1-size) * 0.8); }
     }
     @media (max-width: 640px) {
-      :root { --sidebar-w: 58px; }
-      .brand-name, .brand-sub, .nav-label, .mode-label, .ws-status span:last-child { display: none; }
-      .nav-item { justify-content: center; }
+      :root { --sidebar-w: 56px; }
+      .brand-name { font-size: 18px; }
+      .brand-sub, .nav-label, .mode-label, .theme-label, .ws-status span:last-child { display: none; }
+      .nav-item { justify-content: center; padding: 12px 0; border-left-width: 0; }
       .reflect-grid { grid-template-columns: 1fr; }
+      .reflect-stat { margin-right: 0; margin-bottom: var(--bite); }
       .fgrid { grid-template-columns: 1fr; }
+      .main { padding: 16px; }
+    }
+    /* 尊重系统「减少动态效果」：动效是 minimal-functional，可安全关停 */
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after {
+        animation-duration: 0.01ms !important; animation-iteration-count: 1 !important;
+        transition-duration: 0.01ms !important; scroll-behavior: auto !important;
+      }
     }
   </style>
 </head>
@@ -7925,6 +9108,11 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       <span class="mode-switch" :class="{on: readOnly}"></span>
       <span class="mode-label">{{ readOnly ? '只读模式' : '正常模式' }}{{ modeSwitching ? ' …' : '' }}</span>
     </div>
+    <div class="theme-row" @click="toggleTheme"
+      :title="theme === 'dark' ? '守夜：黑底上点亮原色' : '日间：石膏暖白底上的原色块'">
+      <span class="mode-switch" :class="{on: theme === 'dark'}"></span>
+      <span class="theme-label">{{ theme === 'dark' ? '守夜 · 深色' : '日间 · 浅色' }}</span>
+    </div>
     <div class="ws-status">
       <span class="dot" :class="wsStatus.state"></span>
       <span>{{ wsStatusLabel }}</span>
@@ -7935,7 +9123,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Agent -->
     <div v-if="tab === 'agent'">
       <div class="ph">
-        <div class="ph-eye">WebSocket &#8594; LLM</div>
+        <div class="ph-eye llm">WebSocket &#8594; LLM</div>
         <div class="ph-title">Agent Monitor</div>
         <div class="ph-desc">Model profile configuration and latest request payload.</div>
       </div>
@@ -7944,11 +9132,11 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <div class="pb">
             <div class="stack">
               <p class="hint">Switch the active LLM profile. Changes apply immediately and are written to config.yaml.</p>
-              <div v-if="claudeUsage" style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:var(--muted,#64748b);">
+              <div v-if="claudeUsage" style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:hsl(var(--muted-foreground));">
                 <span>Subscription Usage</span>
                 <div style="display:flex;align-items:center;gap:6px;">
                   <span style="width:18px;">5h</span>
-                  <div style="width:100px;height:6px;background:#eef2f7;border-radius:4px;overflow:hidden;">
+                  <div style="width:110px;height:8px;background:hsl(var(--raised));border:1px solid hsl(var(--hairline));overflow:hidden;">
                     <div :style="{ width: usageWidth(claudeUsage.fiveHourUtilization), height: '100%', background: usageColor(claudeUsage.fiveHourUtilization) }"></div>
                   </div>
                   <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.fiveHourUtilization) }}</span>
@@ -7956,7 +9144,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
                 </div>
                 <div style="display:flex;align-items:center;gap:6px;">
                   <span style="width:18px;">7d</span>
-                  <div style="width:100px;height:6px;background:#eef2f7;border-radius:4px;overflow:hidden;">
+                  <div style="width:110px;height:8px;background:hsl(var(--raised));border:1px solid hsl(var(--hairline));overflow:hidden;">
                     <div :style="{ width: usageWidth(claudeUsage.sevenDayUtilization), height: '100%', background: usageColor(claudeUsage.sevenDayUtilization) }"></div>
                   </div>
                   <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.sevenDayUtilization) }}</span>
@@ -7964,13 +9152,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
                 </div>
                 <span style="opacity:.7;">Updated {{ fmtTime(new Date(claudeUsage.capturedAt).toISOString()) }}</span>
               </div>
-              <div v-if="tokenStats && tokenStats.models && tokenStats.models.length" style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:var(--muted,#64748b);margin-top:4px;">
+              <div v-if="tokenStats && tokenStats.models && tokenStats.models.length" style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:hsl(var(--muted-foreground));margin-top:4px;">
                 <span>Token Usage &middot; {{ tokenStats.date }}</span>
                 <div v-for="m in tokenStats.models" :key="m.model" style="display:flex;justify-content:space-between;gap:8px;">
                   <span style="opacity:.85;">{{ m.model }}</span>
                   <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(m.totalTokens) }}</span>
                 </div>
-                <div style="display:flex;justify-content:space-between;gap:8px;border-top:1px solid #eef2f7;padding-top:2px;font-weight:600;">
+                <div style="display:flex;justify-content:space-between;gap:8px;border-top:1px solid hsl(var(--hairline));padding-top:2px;font-weight:600;">
                   <span>Total</span>
                   <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(tokenStats.totalTokens) }}</span>
                 </div>
@@ -8004,13 +9192,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Thoughts -->
     <div v-else-if="tab === 'thoughts'">
       <div class="ph">
-        <div class="ph-eye">Holly · Live</div>
+        <div class="ph-eye scheduler">Holly · Live</div>
         <div class="ph-title">思考时间线</div>
         <div class="ph-desc">实时展示模型判断摘要和每分钟自主检查结果；不包含模型供应商隐藏的推理链。</div>
       </div>
       <div class="panel">
         <div class="ph2">
-          <span class="ph2-title">Thoughts <span style="color:var(--muted);font-weight:600;">&middot; {{ filteredThoughts.length }}/{{ thoughts.length }}</span></span>
+          <span class="ph2-title">Thoughts <span style="color:hsl(var(--muted-foreground));font-weight:600;">&middot; {{ filteredThoughts.length }}/{{ thoughts.length }}</span></span>
           <button class="sec sm" @click="loadThoughts">Refresh</button>
         </div>
         <div class="pb">
@@ -8053,7 +9241,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Memory -->
     <div v-else-if="tab === 'memory'">
       <div class="ph">
-        <div class="ph-eye">Memory</div>
+        <div class="ph-eye story">Memory</div>
         <div class="ph-title">Memory</div>
         <div class="ph-desc">短期记忆（会话历史·内存，重启会丢） 与 长期记忆（Qdrant·持久化保留）。</div>
       </div>
@@ -8065,13 +9253,13 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </div>
         <div class="pb">
           <p class="hint">模型每次回复时直接看到的近期对话上下文，按群存在内存里，重启后丢失。</p>
-          <label style="display:block;margin-top:8px;font-size:12px;color:var(--muted);">Group
+          <label style="display:block;margin-top:8px;">Group
             <select v-model="selGroupId" @change="onPickShortTermGroup" style="margin-top:4px;">
               <option :value="null">Select a group</option>
               <option v-for="g in groups" :key="g.groupId" :value="g.groupId">{{ g.groupId }} ({{ g.turnCount }} turns)</option>
             </select>
           </label>
-          <div class="chat-scroll" style="margin-top:10px;max-height:340px;border:1px solid #eef2f7;border-radius:8px;">
+          <div class="chat-scroll" style="margin-top:10px;max-height:340px;border:2px solid hsl(var(--foreground));">
             <div v-if="!selGroupId" class="empty" style="margin:16px;">Select a group to view its short-term conversation.</div>
             <div v-else-if="!groupTurns.length" class="empty" style="margin:16px;">No short-term messages for this group.</div>
             <template v-else>
@@ -8088,7 +9276,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </div>
 
       <div class="ph" style="margin-top:18px;">
-        <div class="ph-eye">Qdrant</div>
+        <div class="ph-eye story">Qdrant</div>
         <div class="ph-title">长期记忆 &middot; Stored Memories</div>
         <div class="ph-desc">Browse recent records saved from the upstream WebSocket stream.</div>
       </div>
@@ -8148,7 +9336,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <span class="ph2-title">Live Messages</span>
           <button class="sec sm" @click="clearEntries">Clear</button>
         </div>
-        <div class="chat-scroll" style="padding:10px 12px;gap:8px;">
+        <div class="chat-scroll" style="padding:12px;">
           <div v-if="!entries.length" class="empty" style="margin:8px;">Waiting for messages&hellip;</div>
           <template v-else>
             <article v-for="e in entries" :key="e.id" class="entry" :class="e.kind">
@@ -8208,29 +9396,29 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Reflect -->
     <div v-else-if="tab === 'reflect'">
       <div class="ph">
-        <div class="ph-eye">Holly</div>
+        <div class="ph-eye signal">Holly</div>
         <div class="ph-title">Reflect</div>
         <div class="ph-desc">Autonomy reflection state, recent internal memories, and world observations.</div>
       </div>
       <div v-if="!autonomySidebar" class="empty">Waiting for autonomy snapshot...</div>
       <template v-else>
         <div class="reflect-grid">
-          <div class="reflect-stat">
+          <div class="reflect-stat scheduler">
             <span class="reflect-stat-label">Autonomy</span>
             <b>{{ autonomySidebar.enabled ? 'On' : 'Off' }}</b>
             <small>world {{ autonomySidebar.worldObservationEnabled ? 'on' : 'off' }} &middot; reflect {{ autonomySidebar.memoryReflectionEnabled ? 'on' : 'off' }}</small>
           </div>
-          <div class="reflect-stat">
+          <div class="reflect-stat story">
             <span class="reflect-stat-label">Reflect today</span>
             <b>{{ autonomySidebar.memoryReflectionDailyCount }}</b>
             <small>last {{ autonomySidebar.lastMemoryReflectionAtIso ? fmtTime(autonomySidebar.lastMemoryReflectionAtIso) : '-' }}</small>
           </div>
-          <div class="reflect-stat">
+          <div class="reflect-stat llm">
             <span class="reflect-stat-label">World today</span>
             <b>{{ autonomySidebar.worldObservationDailyCount }}</b>
             <small>last {{ autonomySidebar.lastWorldObservationAtIso ? fmtTime(autonomySidebar.lastWorldObservationAtIso) : '-' }}</small>
           </div>
-          <div class="reflect-stat">
+          <div class="reflect-stat signal">
             <span class="reflect-stat-label">Stored here</span>
             <b>{{ reflectMemories.length + reflectWorldObservations.length }}</b>
             <small>{{ reflectMemories.length }} memories &middot; {{ reflectWorldObservations.length }} observations</small>
@@ -8300,7 +9488,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </div>
       <div class="panel">
         <div class="ph2">
-          <span class="ph2-title">Works <span v-if="archiveItems.length" style="color:var(--muted);font-weight:600;">&middot; {{ archiveItems.length }}</span></span>
+          <span class="ph2-title">Works <span v-if="archiveItems.length" style="color:hsl(var(--muted-foreground));font-weight:600;">&middot; {{ archiveItems.length }}</span></span>
           <button class="sec sm" @click="loadArchive">Refresh</button>
         </div>
         <div class="pb">
@@ -8330,7 +9518,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     <!-- Usage -->
     <div v-else-if="tab === 'usage'">
       <div class="ph">
-        <div class="ph-eye">Cache</div>
+        <div class="ph-eye llm">Cache</div>
         <div class="ph-title">Prompt Cache 命中率</div>
         <div class="ph-desc">命中率 = 缓存读取 ÷ (读取 + 写入 + 未命中)，由后端统一派生。低于模型最小可缓存长度的请求不进分母，单独计入 Too short。</div>
       </div>
@@ -8343,17 +9531,17 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <div v-if="!cacheHours.length" class="empty">No prompt cache samples yet.</div>
           <template v-else>
             <div class="cache-heads">
-              <div class="cache-head">
+              <div class="cache-head llm">
                 <span>Window hit rate</span>
                 <b>{{ fmtPct(cacheWindowHitRate) }}</b>
                 <small>{{ fmtNum(cacheWindowCalls) }} calls</small>
               </div>
-              <div class="cache-head">
+              <div class="cache-head scheduler">
                 <span>Latest hour</span>
                 <b>{{ fmtPct(cacheLatestHitRate) }}</b>
                 <small>{{ cacheHours.length ? cacheHours[cacheHours.length - 1].bucket : '' }}</small>
               </div>
-              <div class="cache-head">
+              <div class="cache-head cost">
                 <span>Uncacheable</span>
                 <b>{{ fmtNum(cacheWindowUncacheable) }}</b>
                 <small>tokens below the model minimum</small>
@@ -8390,7 +9578,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </div>
       </div>
       <div class="ph">
-        <div class="ph-eye">Token</div>
+        <div class="ph-eye cost">Token</div>
         <div class="ph-title">每日 Token 用量</div>
         <div class="ph-desc">按日期与模型拆分普通输入、缓存写入、缓存读取及输出；历史聚合输入保留为 Unknown。</div>
       </div>
@@ -8404,7 +9592,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           <template v-else>
             <div class="usage-total-row">
               <span>合计 &middot; 最近 {{ usageHistory.length }} 天</span>
-              <span style="font-variant-numeric:tabular-nums;">{{ fmtNum(usageGrandTotal) }} tokens</span>
+              <b>{{ fmtNum(usageGrandTotal) }}<span style="font-size:13px;margin-left:6px;">tokens</span></b>
             </div>
             <div v-for="day in usageHistory" :key="day.date" class="usage-day">
               <div class="usage-day-head">
@@ -8447,6 +9635,16 @@ var computed = _Vue.computed;
 var onMounted = _Vue.onMounted;
 var onUnmounted = _Vue.onUnmounted;
 var watch = _Vue.watch;
+
+// ---------- 监控页的前端 ----------
+//
+// 刻意写成 ES5 风格（var / function，没有箭头函数、没有解构、没有构建步骤）：
+// 这一整块是拼进 HTML 字符串里直接发给浏览器的，没有转译环节，
+// 所以语法必须保守到「任何浏览器打开就能跑」。
+//
+// 数据流只有一条：后端 SSE 推来 snapshot（补全现状）和一串增量事件，
+// handlePayload 按类型分发到各自的 ref。页面自己不保存任何状态——
+// 刷新一次就重新从 snapshot 长出来。
 
 createApp({
   setup: function() {
@@ -8526,6 +9724,14 @@ createApp({
     var archiveItems = ref([]);
     var archiveLoading = ref(false);
     var archiveErr = ref('');
+
+    // Theme state (日间 / 守夜) — 初值由 <head> 的免闪脚本写在 data-theme 上
+    var theme = ref(document.documentElement.getAttribute('data-theme') === 'dark' ? 'dark' : 'light');
+    function toggleTheme() {
+      theme.value = theme.value === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', theme.value);
+      try { localStorage.setItem('holly-theme', theme.value); } catch (e) { /* 隐私模式下不持久化，本次会话仍生效 */ }
+    }
 
     // Read-only mode state
     var readOnly = ref(false);
@@ -8617,10 +9823,10 @@ createApp({
       return Math.max(0, Math.min(100, u * 100)).toFixed(1) + '%';
     }
     function usageColor(u) {
-      if (typeof u !== 'number') return '#cbd5e1';
-      if (u >= 0.9) return '#ef4444';
-      if (u >= 0.6) return '#f59e0b';
-      return '#10b981';
+      if (typeof u !== 'number') return 'hsl(var(--hairline))';
+      if (u >= 0.9) return 'hsl(var(--signal))';
+      if (u >= 0.6) return 'hsl(var(--scheduler))';
+      return 'hsl(var(--story))';
     }
     function fmtReset(ms) {
       if (typeof ms !== 'number') return '-';
@@ -8636,6 +9842,8 @@ createApp({
       return 'in ' + days + 'd' + (remH ? ' ' + remH + 'h' : '');
     }
 
+    // 用 id 去重：SSE 断线重连后浏览器会重新拿一次 snapshot，里面必然包含
+    // 已经显示过的条目。上限 120 条跟后端内存里保留的条数一致。
     function pushEntry(entry) {
       if (renderedIds.has(entry.id)) return;
       renderedIds.add(entry.id);
@@ -8657,6 +9865,8 @@ createApp({
       for (var i = 0; i < visible.length; i++) pushThought(visible[i]);
     }
 
+    // 收到快照 = 整页重置。所有 ref 一次性覆盖，包括清空已渲染 id——
+    // 快照代表「后端此刻的完整现状」，页面上比它旧的东西一律作废。
     function renderSnapshot(payload) {
       renderedIds.clear();
       wsStatus.value = payload.status;
@@ -8685,6 +9895,9 @@ createApp({
       if (payload.type === 'entry') { pushEntry(payload.entry); }
     }
 
+    // 断线重连交给浏览器：EventSource 原生就会自动重连，这里只负责在状态变化时
+    // 往流水里记一笔，让人知道刚才断过。streamConn 是为了避免重连过程中
+    // 反复刷「已连接/已断开」。
     function connectES() {
       if (es) { es.close(); }
       es = new EventSource('/api/ws/events');
@@ -8963,6 +10176,7 @@ createApp({
       autonomySidebar, reflectMemories, reflectWorldObservations,
       archiveItems, archiveLoading, archiveErr,
       readOnly, modeSwitching, toggleReadOnly,
+      theme, toggleTheme,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
       fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
@@ -8976,6 +10190,16 @@ createApp({
 </html>
 `;
 
+// ---------- 启动 ----------
+//
+// 顺序是有硬依赖的，不能随意调换：
+//   1. 代理 —— 必须在任何一次出网调用之前，否则第一次请求就走错了出口
+//   2. 统计、配置、LLM client、各个 store —— 纯装配，互不依赖
+//   3. 恢复账本与会话历史 —— 必须在连上 WebSocket 之前完成，否则第一条进来的
+//      消息会在一个空上下文里被判断
+//   4. 开机自省 —— 基于恢复完的记忆决定今天以什么姿态上线；连不连 QQ 就是
+//      这一步的结果（applyQqModeDecision 里决定连接还是保持离线）
+//   5. 开各种定时器、起 HTTP 服务 —— 最后才开始按节拍工作
 async function bootstrap(): Promise<void> {
   await applyProxyConfig(CONFIG_PATH);
   await loadTokenStats();

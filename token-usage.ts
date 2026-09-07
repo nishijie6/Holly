@@ -25,7 +25,37 @@ export type TokenUsageBreakdown = {
   cacheCreationInputTokens: number;
   cacheReadInputTokens: number;
   outputTokens: number;
+  // Estimated size of the prefix in front of the last cache_control breakpoint
+  // — the only part of the request a cache entry can ever cover. Absent for
+  // providers that report no breakpoint (Codex) and for rows written before
+  // this was measured; those fall back to judging by whole-request size, which
+  // is what made a 40-token prefix inside an 11k request read as prefix drift.
+  cacheablePrefixTokens?: number;
 };
+
+// Deliberately an estimate, not a tokenizer: it decides whether a prefix is on
+// the right side of a 512/1024/2048/4096 threshold, and a prefix that lands
+// close enough to the line for the error to matter is one to fix by design
+// rather than to measure more precisely. CJK counts as roughly one token per
+// character, everything else as roughly four characters per token.
+export function estimatePromptTokens(text: string): number {
+  let cjk = 0;
+  let total = 0;
+  for (const char of text) {
+    total += 1;
+    const code = char.codePointAt(0) ?? 0;
+    if (
+      (code >= 0x4e00 && code <= 0x9fff)
+      || (code >= 0x3400 && code <= 0x4dbf)
+      || (code >= 0x3040 && code <= 0x30ff)
+      || (code >= 0xac00 && code <= 0xd7af)
+      || (code >= 0xf900 && code <= 0xfaff)
+    ) {
+      cjk += 1;
+    }
+  }
+  return Math.round(cjk + (total - cjk) / 4);
+}
 
 export type CallTokenUsage = TokenUsageBreakdown & {
   model: string;
@@ -81,6 +111,9 @@ export class TokenUsageQueue {
       cacheCreationInputTokens: tokenCount(usage.cacheCreationInputTokens),
       cacheReadInputTokens: tokenCount(usage.cacheReadInputTokens),
       outputTokens: tokenCount(usage.outputTokens),
+      ...(typeof usage.cacheablePrefixTokens === "number"
+        ? { cacheablePrefixTokens: tokenCount(usage.cacheablePrefixTokens) }
+        : {}),
       capturedAt: this.now(),
     });
   }
@@ -203,6 +236,19 @@ export function minimumCacheablePrefixTokens(model: string): number | null {
   return null;
 }
 
+// Why a call could not have cached, when it could not. The two are different
+// problems with different fixes, and collapsing them is what sent someone
+// hunting for prefix drift in a route whose prefix was 40 tokens long:
+//   request-too-small — the entire request is under the model's minimum. The
+//     route is inherently uncacheable at this size; the fix is length, model
+//     choice, or call frequency, not prefix hygiene. Stays out of the hit rate.
+//   prefix-too-small — the request is large, but the part in front of the
+//     breakpoint is not. A cache entry was never possible, yet almost all of
+//     the request is content a correctly placed breakpoint could have covered.
+//     This is a fixable misconfiguration, so it stays in the hit rate as the 0%
+//     it really is.
+export type PromptCacheUncacheableReason = "request-too-small" | "prefix-too-small";
+
 export type PromptCacheCallSummary = {
   cacheReadInputTokens: number;
   cacheCreationInputTokens: number;
@@ -216,10 +262,14 @@ export type PromptCacheCallSummary = {
   // The model's minimum cacheable prefix, or null when the model is not in the
   // table above.
   minimumPrefixTokens: number | null;
-  // The whole request was shorter than that minimum, so no cache entry could
-  // exist no matter how stable the prefix was. Reporting 0% for these calls
-  // blames prefix drift for a length problem and buries the routes that are
-  // genuinely missing.
+  // Estimated size of the prefix ahead of the breakpoint, or null when the
+  // request did not report one.
+  cacheablePrefixTokens: number | null;
+  // Set when no cache entry could have existed for this call. See the reason
+  // codes above for which of the two situations it was.
+  uncacheableReason: PromptCacheUncacheableReason | null;
+  // Kept as the narrow "excuse this call from the hit rate" flag it always was:
+  // true only for request-too-small. A prefix-too-small call is a real miss.
   belowMinimum: boolean;
 };
 
@@ -240,12 +290,27 @@ export function summarizePromptCacheCall(
   }
 
   const minimumPrefixTokens = minimumCacheablePrefixTokens(model);
+  const prefixTokens = typeof usage.cacheablePrefixTokens === "number"
+    ? Math.max(0, usage.cacheablePrefixTokens)
+    : null;
   // Any cache activity at all proves the request cleared the minimum, whatever
   // the table says — trust the measurement over the table.
-  const belowMinimum = minimumPrefixTokens !== null
-    && cacheReadInputTokens === 0
-    && cacheCreationInputTokens === 0
-    && accountedInputTokens < minimumPrefixTokens;
+  const noCacheActivity = cacheReadInputTokens === 0 && cacheCreationInputTokens === 0;
+
+  // What a cache entry could have covered is the prefix ahead of the
+  // breakpoint, never the whole request — so that is what gets compared to the
+  // minimum whenever the request told us how long it was. Falling back to the
+  // whole request when it did not is the old, coarser test: it can only miss
+  // this diagnosis, never invent one.
+  let uncacheableReason: PromptCacheUncacheableReason | null = null;
+  if (minimumPrefixTokens !== null && noCacheActivity) {
+    if (accountedInputTokens < minimumPrefixTokens) {
+      uncacheableReason = "request-too-small";
+    } else if (prefixTokens !== null && prefixTokens < minimumPrefixTokens) {
+      uncacheableReason = "prefix-too-small";
+    }
+  }
+  const belowMinimum = uncacheableReason === "request-too-small";
 
   return {
     cacheReadInputTokens,
@@ -254,6 +319,8 @@ export function summarizePromptCacheCall(
     accountedInputTokens,
     hitRate: belowMinimum ? null : cacheReadInputTokens / accountedInputTokens,
     minimumPrefixTokens,
+    cacheablePrefixTokens: prefixTokens,
+    uncacheableReason,
     belowMinimum,
   };
 }

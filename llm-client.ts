@@ -8,7 +8,12 @@ import path from "node:path";
 import YAML from "yaml";
 
 import { LlmHttpError, ProviderRateLimitGate } from "./connection-watchdog.js";
-import { TokenUsageQueue, type LlmCallPurpose, type TokenUsageBreakdown } from "./token-usage.js";
+import {
+  TokenUsageQueue,
+  estimatePromptTokens,
+  type LlmCallPurpose,
+  type TokenUsageBreakdown,
+} from "./token-usage.js";
 import {
   CachePrefixTracker,
   buildCachePrefixDigest,
@@ -258,7 +263,9 @@ function describePrefixBlock(block: Record<string, unknown>): string {
   return typeof block.text === "string" ? block.text : "";
 }
 
-export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
+function collectClaudeCachedPrefixTexts(
+  body: Record<string, unknown>,
+): { systemTexts: string[]; blockTexts: string[] } {
   const systemTexts: string[] = [];
   const system = Array.isArray(body.system) ? body.system : [];
   for (const block of system) {
@@ -290,7 +297,20 @@ export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePr
     }
   }
 
+  return { systemTexts, blockTexts };
+}
+
+export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
+  const { systemTexts, blockTexts } = collectClaudeCachedPrefixTexts(body);
   return buildCachePrefixDigest(systemTexts, blockTexts);
+}
+
+// How much of this request a cache entry could cover at all. Everything past
+// the breakpoint is reread at full price no matter how stable it is, so this —
+// not the request size — is the number to compare against the model's minimum.
+export function measureClaudeCachedPrefixTokens(body: Record<string, unknown>): number {
+  const { systemTexts, blockTexts } = collectClaudeCachedPrefixTexts(body);
+  return estimatePromptTokens([...systemTexts, ...blockTexts].join("\n"));
 }
 
 // Two shapes of the same thing: the proxy dropped this attempt. undici reports a
@@ -1352,7 +1372,7 @@ async function requestClaudeMessage(
     const data = await res.json() as Record<string, unknown>;
     const tokens = readClaudeUsageTokens(data);
     if (tokens) {
-      recordUsage(tokens);
+      recordUsage({ ...tokens, cacheablePrefixTokens: measureClaudeCachedPrefixTokens(body) });
     }
     return data;
   }

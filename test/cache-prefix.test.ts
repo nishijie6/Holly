@@ -138,3 +138,39 @@ test("the digest covers exactly the blocks inside the breakpoint", () => {
   const b = digestClaudeCachedPrefix(replyRequest(["历史一", "历史二"], "当前消息 B"));
   assert.deepEqual(a, b);
 });
+
+test("StablePrefixLedger tells a deliberate prefix change from a surprise", async () => {
+  const { StablePrefixLedger } = await import("../cache-prefix.js");
+  const ledger = new StablePrefixLedger();
+
+  // First call on a route has no history — the inspection reports "fresh", not
+  // "rebuilt", so there is nothing to excuse.
+  assert.equal(ledger.changed("memory-reflection", "window A"), false);
+  // Same rolling window on the next tick: a rebuild here would be real drift.
+  assert.equal(ledger.changed("memory-reflection", "window A"), false);
+  // A new observation arrived and the window moved — we caused this one.
+  assert.equal(ledger.changed("memory-reflection", "window B"), true);
+  assert.equal(ledger.changed("memory-reflection", "window B"), false);
+});
+
+test("StablePrefixLedger keeps routes apart", async () => {
+  const { StablePrefixLedger } = await import("../cache-prefix.js");
+  const ledger = new StablePrefixLedger();
+
+  assert.equal(ledger.changed("memory-reflection", "window A"), false);
+  assert.equal(ledger.changed("archive-composition", "window A"), false);
+  assert.equal(ledger.changed("memory-reflection", "window B"), true);
+  // The other route never saw window B, so its own history is untouched.
+  assert.equal(ledger.changed("archive-composition", "window A"), false);
+});
+
+test("StablePrefixLedger is bounded and forgets the oldest route first", async () => {
+  const { StablePrefixLedger } = await import("../cache-prefix.js");
+  const ledger = new StablePrefixLedger(2);
+
+  ledger.changed("a", "x");
+  ledger.changed("b", "x");
+  ledger.changed("c", "x");   // evicts "a"
+  // "a" was dropped, so it reads as a first call again rather than a change.
+  assert.equal(ledger.changed("a", "y"), false);
+});
