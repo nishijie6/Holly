@@ -80,6 +80,9 @@ export type FocusBatchMessage = {
 
 export type FocusInjectionInput = {
   conversationLabel: string;
+  // 注入这一刻当前打开的会话,也就是 send_message 的目标;还没打开过任何会话时为 null。
+  // 前台路径里它就等于 conversationLabel(系统刚替模型切过去),后台通知里常常不等。
+  openConversationLabel: string | null;
   reason: FocusDecision["reason"];
   currentTime: string;
   // 会话最近若干条消息,已按时间线格式渲染。仅前台路径使用。
@@ -107,12 +110,21 @@ function renderBatchLine(message: FocusBatchMessage, maxChars: number): string |
   return message.senderLabel ? `${message.senderLabel} ${clipped}` : clipped;
 }
 
-// 每轮都变的那几个值(当前时间、群号、管理员名单)。它们跟着注入文本一起追加到
+// 每轮都变的那几个值(当前时间、会话、管理员名单)。它们跟着注入文本一起追加到
 // ledger 尾部,所以不影响缓存前缀;但也因此会永久留在 ledger 里,所以只放模型真正
-// 要用的三项,老管线那段 "Scheduled reply scan for this conversation:" 的完整
+// 要用的几项,老管线那段 "Scheduled reply scan for this conversation:" 的完整
 // 元数据块不往这里搬。
+//
+// 会话必须拆成「消息来自」和「当前打开」两项写。这里原本只有一个 conversation: 群X,
+// 后台通知里它指的是消息来自哪,模型却读成了「我现在在 X」,没打开就 send_message,
+// 话进了焦点实际停着的另一个群(2026-09-10,20000003 的复读发进了 20000001)。
+// 前台路径里两项相同也照写:同一个字段在两种注入里意思不同,正是那次误读的来源。
 function renderRoundMetadata(input: FocusInjectionInput): string[] {
-  const lines = [`current_time: ${input.currentTime}`, `conversation: ${input.conversationLabel}`];
+  const lines = [
+    `current_time: ${input.currentTime}`,
+    `消息来自: ${input.conversationLabel}`,
+    `当前打开: ${input.openConversationLabel ?? "无"}`,
+  ];
   if (input.adminUserIds.length > 0) {
     lines.push(`管理员消息,发送人 user_id: ${Array.from(new Set(input.adminUserIds)).join(", ")}`);
     if (input.codeJobId) {

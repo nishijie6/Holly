@@ -4730,7 +4730,10 @@ async function sendToConversationKey(groupKey: string, message: string): Promise
   return sendGroupMessage(parsePositiveOneBotId(groupKey, "reply group_id"), message);
 }
 
-function buildFocusToolRunner(): (call: LlmToolUseBlock) => Promise<string> {
+// roundConversationId 是唤起这一轮的会话，qq-tools 拿它识别过期焦点。这也是 runner
+// 必须每轮现建、不能缓存复用的原因：「本轮打开过会话」的记录活在 runner 里，复用
+// 就会让上一轮的一次打开放行这一轮的误发。
+function buildFocusToolRunner(roundConversationId: string): (call: LlmToolUseBlock) => Promise<string> {
   return createQqToolRunner({
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
@@ -4742,6 +4745,7 @@ function buildFocusToolRunner(): (call: LlmToolUseBlock) => Promise<string> {
     },
     getFocus: focusConversationId,
     setFocus: setFocusConversationId,
+    roundConversationId,
     canSend: () => (isQqParticipationEnabled()
       ? { allowed: true, reason: "" }
       : { allowed: false, reason: `QQ 发送被抑制：${qqSuppressionDetail().replace(/\n/g, ", ")}` }),
@@ -4939,8 +4943,12 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
   const latestCodeJob = [...adminMessages]
     .reverse()
     .find((item) => item.context.adminCodeJobId || item.context.adminCodeJobNote);
+  // 前台路径下一步就会把焦点切到 groupKey，所以直接记它；后台通知不动焦点，记的是
+  // 焦点此刻实际停在哪。模型据此分清「消息来自哪」和「send_message 会发到哪」。
+  const openConversationId = decision.foreground ? groupKey : focusConversationId();
   const injection: FocusInjectionInput = {
     conversationLabel: formatConversationKey(groupKey),
+    openConversationLabel: openConversationId ? formatConversationKey(openConversationId) : null,
     reason: decision.reason,
     currentTime: formatLocalDateTimeForModel(),
     recent: decision.foreground
@@ -4976,7 +4984,7 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
       expectRebuild: compacted,
       messages: [...conversationLedger.snapshot()],
       tools: [...QQ_TOOL_DEFINITIONS],
-      runTool: buildFocusToolRunner(),
+      runTool: buildFocusToolRunner(groupKey),
       purpose: "focus-loop",
       cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
       // persona + focus 协议,不是 persona + 决策协议:见 focus-prompt.ts 开头。

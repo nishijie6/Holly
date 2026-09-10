@@ -9,6 +9,13 @@ import type { LlmToolDefinition, LlmToolUseBlock } from "./llm-client.js";
 // only thing that does. That is what makes send_message safe to expose with no
 // target argument: the model cannot address a conversation it has not opened,
 // so a hallucinated group id cannot become a misdelivered message.
+//
+// 但这只防住了一半。模型没法对从没打开过的会话说话，却可以对几轮之前打开、焦点一直
+// 停在那儿的会话说话：后台通知按设计不移动焦点，模型读完 A 群的通知、没先打开 A 就
+// 发，话就进了 B 群。2026-09-10 20000003 群的复读「今天真热啊」就是这样发进了
+// 20000001。所以一个 runner 只管一轮，并记住这一轮是被哪个会话唤起的：焦点不在它
+// 身上、本轮又没打开过任何会话时拒发，让模型先把目标打开。本轮里主动打开别的会话再
+// 说话照常放行——那是有意换群接话，不是焦点过期。
 
 export type ConversationSummary = {
   id: string;
@@ -31,6 +38,11 @@ export type QqToolDeps = {
    * about, instead of an exception that ends the turn.
    */
   canSend: () => { allowed: boolean; reason: string };
+  /**
+   * 唤起这一轮的会话 id——前台被找的、或后台通知来自的那个会话。send_message 靠它
+   * 识别过期焦点，见文件头。null 表示这一轮不是被某个会话唤起的，不做这项检查。
+   */
+  roundConversationId: string | null;
 };
 
 export const QQ_TOOL_DEFINITIONS: readonly LlmToolDefinition[] = [
@@ -80,7 +92,10 @@ function refuse(error: string, note: string): string {
   return JSON.stringify({ ok: false, error, note });
 }
 
+// runner 的寿命是一轮：openedThisRound 只在这一轮里有意义，所以调用方每轮都要新建
+// 一个。跨轮复用的话，上一轮的一次打开会一直放行后面每一轮的过期焦点。
 export function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) => Promise<string> {
+  let openedThisRound = false;
   return async (call: LlmToolUseBlock): Promise<string> => {
     switch (call.name) {
       case "list_conversations": {
@@ -98,6 +113,7 @@ export function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) =>
           return refuse("会话不存在", "先用 list_conversations 看列表拿正确的 id。");
         }
         deps.setFocus(id);
+        openedThisRound = true;
         return ok({ id, current: id, recent });
       }
 
@@ -109,6 +125,15 @@ export function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) =>
         const focus = deps.getFocus();
         if (!focus) {
           return refuse("没有打开的会话", "先用 open_conversation 打开目标会话再发送。");
+        }
+        // 排在 canSend 前面：发错群是模型当场就能改的错，先告诉它；只读之类的抑制是
+        // 环境状态，目标改对之后自然还会遇到。
+        const round = deps.roundConversationId;
+        if (round && focus !== round && !openedThisRound) {
+          return refuse(
+            "焦点不在这一轮的会话上",
+            `你当前打开的是 ${focus}，这一轮的消息却来自 ${round}。要回 ${round} 就先 open_conversation 打开它；确实想在 ${focus} 说话，也先 open_conversation 把它重新打开。`,
+          );
         }
         const sending = deps.canSend();
         if (!sending.allowed) {

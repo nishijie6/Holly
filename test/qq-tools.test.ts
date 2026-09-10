@@ -25,12 +25,17 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
     getFocus: () => focus,
     setFocus: (id) => { focus = id; },
     canSend: () => ({ allowed: true, reason: "" }),
+    roundConversationId: null,
     ...overrides,
   };
-  const run = createQqToolRunner(deps);
-  const call = (name: string, input: Record<string, unknown> = {}) =>
-    run({ type: "tool_use", id: "tu_1", name, input } as LlmToolUseBlock).then((raw) => JSON.parse(raw));
-  return { call, sent, focus: () => focus };
+  const bind = (run: ReturnType<typeof createQqToolRunner>) =>
+    (name: string, input: Record<string, unknown> = {}) =>
+      run({ type: "tool_use", id: "tu_1", name, input } as LlmToolUseBlock).then((raw) => JSON.parse(raw));
+  const call = bind(createQqToolRunner(deps));
+  // 下一轮：焦点和发送记录沿用，runner 新建一个——main.ts 每轮就是这么做的。
+  const nextRound = (roundConversationId: string | null) =>
+    bind(createQqToolRunner({ ...deps, roundConversationId }));
+  return { call, nextRound, sent, focus: () => focus };
 }
 
 test("the three tools are declared with closed schemas", () => {
@@ -131,6 +136,59 @@ test("a suppressed send comes back as a result the model can read, not a throw",
   const result = await call("send_message", { message: "在的" });
   assert.equal(result.ok, false);
   assert.match(result.note, /观察模式/);
+  assert.deepEqual(sent, []);
+});
+
+// 2026-09-10 的串群：焦点停在上一轮打开的 20000001，20000003 的通知进来，模型没打开
+// 766 就复读，话进了 253。下面几条钉住这项检查的边界——拦过期焦点，不拦有意换群。
+
+test("焦点停在上一轮打开的会话、本轮消息来自别处时，不重新打开就发会被拒", async () => {
+  const { call, nextRound, sent, focus } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound("qq_group:200");
+  const result = await round("send_message", { message: "今天真热啊" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /open_conversation/);
+  assert.ok(result.note.includes("qq_group:200"), "拒绝理由要点名本轮消息来自的会话");
+  assert.deepEqual(sent, []);
+  // 拒发不等于替模型换焦点：打开哪里仍然只由 open_conversation 决定。
+  assert.equal(focus(), "qq_group:100");
+});
+
+test("本轮打开了消息来自的会话，就照常发到那里", async () => {
+  const { call, nextRound, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound("qq_group:200");
+  await round("open_conversation", { id: "qq_group:200" });
+  const result = await round("send_message", { message: "今天真热啊" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(sent, [{ id: "qq_group:200", message: "今天真热啊" }]);
+});
+
+test("本轮主动打开别的会话再说话是有意换群，放行", async () => {
+  const { nextRound, sent } = harness();
+  const round = nextRound("qq_group:200");
+  await round("open_conversation", { id: "qq_group:100" });
+  const result = await round("send_message", { message: "接一句" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(sent, [{ id: "qq_group:100", message: "接一句" }]);
+});
+
+test("焦点本来就在本轮的会话上（前台切焦点就是这样），不用再打开", async () => {
+  const { call, nextRound, sent } = harness();
+  await call("open_conversation", { id: "qq_group:200" });
+  const result = await nextRound("qq_group:200")("send_message", { message: "在的" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(sent, [{ id: "qq_group:200", message: "在的" }]);
+});
+
+test("打开失败不算本轮打开过", async () => {
+  const { call, nextRound, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound("qq_group:200");
+  await round("open_conversation", { id: "qq_group:999" });
+  const result = await round("send_message", { message: "在的" });
+  assert.equal(result.ok, false);
   assert.deepEqual(sent, []);
 });
 

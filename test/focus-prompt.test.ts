@@ -22,6 +22,7 @@ import { MODEL_DECISION_PROMPT } from "../decision-prompt.js";
 
 const baseInput: FocusInjectionInput = {
   conversationLabel: "群20000001",
+  openConversationLabel: "群20000001",
   reason: "ambient",
   currentTime: "2026-09-07 14:30 星期日",
   recent: [],
@@ -177,4 +178,23 @@ test("不是管理员的批次,元数据里没有管理员那几行", () => {
   });
   assert.equal(text.includes("管理员"), false);
   assert.equal(text.includes("job_id"), false);
+});
+
+// 2026-09-10 串群的另一半原因:元数据里只有一个 conversation: 群20000003,模型把
+// 「通知来自哪」读成了「我现在在哪」。这两件事必须分开写。
+test("通知把消息来自哪、当前打开的是哪分开写", () => {
+  const text = buildFocusNotificationInjection({
+    ...baseInput,
+    conversationLabel: "群20000003",
+    openConversationLabel: "群20000001",
+    batch: [{ senderLabel: "[小王(10000005)]", text: "今天真热啊" }],
+  });
+  assert.ok(text.includes("消息来自: 群20000003"));
+  assert.ok(text.includes("当前打开: 群20000001"));
+  assert.equal(text.includes("conversation:"), false, "含糊的 conversation 字段不能回来");
+});
+
+test("还没打开过任何会话时,当前打开写成「无」而不是留空", () => {
+  const text = buildFocusNotificationInjection({ ...baseInput, openConversationLabel: null });
+  assert.ok(text.includes("当前打开: 无"));
 });
