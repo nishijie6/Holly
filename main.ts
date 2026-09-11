@@ -6538,7 +6538,7 @@ async function notifyWorldObservationFailure(topic: string, reason: string): Pro
 
 // 看到了不等于要说。这个函数是「说出去」前的一排闸门，任何一道不过就把观察
 // 留在记忆里、不发群：
-//   - 只读 / observe 模式
+//   - observe 模式（只读时不跳过，照常走完下面几道，只在最后一步不发——见 dryRun）
 //   - 目标群号没配或不合法
 //   - 抓到的网页里没有最近 24 小时内的内容
 //   - 群里还在聊天（没冷场就别插话——新闻可以等下一轮）
@@ -6553,7 +6553,11 @@ async function maybeBroadcastWorldObservation(
   const targetGroupId = resolveWorldObservationBroadcastGroupId(autonomyConfig, topic);
   if (!targetGroupId) return;
 
-  if (!isQqParticipationEnabled()) {
+  // 只读时照常走完日期闸门和改写，把本来要发的内容记进监控，但不发群、不写对话历史、不记 AI 味。
+  // 只读是紧急停发，不该连「这一轮会发什么」都看不见：2026-09-11 只读开着的一整晚，8 轮观察全在这里
+  // 跳过，24 小时闸门和三条上限一次都没跑到。调播报质量时也能先看试运行的效果，再决定开不开闸。
+  const dryRun = readOnlyMode;
+  if (!isQqParticipationEnabled() && !dryRun) {
     pushMonitorEntry(
       "status",
       "World Observation Broadcast Skipped",
@@ -6614,7 +6618,8 @@ async function maybeBroadcastWorldObservation(
 
   // Success path only interrupts the broadcast group when the conversation
   // there has lulled; an active chat means the news can wait for the next run.
-  const latestActivity = await latestKnownGroupActivity(groupKey);
+  // 试运行不发消息，谈不上打断谁，冷场判断跳过。
+  const latestActivity = dryRun ? null : await latestKnownGroupActivity(groupKey);
   if (latestActivity) {
     const idleMs = Date.now() - latestActivity.timestampMs;
     if (idleMs < autonomyConfig.worldObservationBroadcastLullMs) {
@@ -6677,6 +6682,17 @@ async function maybeBroadcastWorldObservation(
   }
 
   const { message } = translation;
+
+  if (dryRun) {
+    // 不写对话历史：去重读的就是这份历史，写进去等于告诉它「发过了」，而群里其实没人见过。
+    // 代价是试运行之间互相不去重，同一条可能连着几轮都出现在这里。
+    pushMonitorEntry(
+      "status",
+      "World Observation Broadcast Dry Run",
+      `group_id=${groupKey}\nobserved_at=${observedAtIso}\ntopic=${topic}\nduplicates_removed=${translation.duplicateItemsRemoved}\nread_only=true — nothing was sent\n${message}`,
+    );
+    return;
+  }
 
   recordOutgoingAiTone(message, groupKey);
   const sentMessageId = await sendGroupMessage(numericGroupId, message);
