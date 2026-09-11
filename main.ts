@@ -114,8 +114,8 @@ import {
   type RecentBroadcastItem,
 } from "./world-observation-dedup.js";
 import {
-  beijingDateKey,
   classifyBroadcastSources,
+  freshnessWindowLabels,
   isBroadcastItemFresh,
   type BroadcastSource,
 } from "./world-observation-freshness.js";
@@ -757,6 +757,8 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
   worldTopicQuerySuffixOverrides: {},
   worldTopicBroadcastGroupOverrides: {},
+  worldTopicSourceUrls: {},
+  worldTopicBriefs: {},
   memoryReflectionEnabled: false,
   memoryReflectionIntervalMs: 60 * 60 * 1000,
   memoryReflectionRetryMs: 15 * 60 * 1000,
@@ -1055,6 +1057,21 @@ function readGroupIdRecord(value: unknown, defaultValue: Record<string, string>)
   return record;
 }
 
+// 话题 → 固定来源网址列表。只收 http(s) 地址；单独一个字符串也当成一项，免得 YAML 里少写一个
+// 「- 」，整个话题的来源就悄悄没了。
+function readUrlListRecord(value: unknown, defaultValue: Record<string, string[]>): Record<string, string[]> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return defaultValue;
+  const record: Record<string, string[]> = {};
+  for (const [topic, items] of Object.entries(value as Record<string, unknown>)) {
+    const urls = (Array.isArray(items) ? items : [items])
+      .filter((item): item is string => typeof item === "string")
+      .map((item) => item.trim())
+      .filter((item) => /^https?:\/\//i.test(item));
+    if (urls.length > 0) record[topic.trim()] = urls;
+  }
+  return record;
+}
+
 // Read the optional `proactive:` config section; any missing/invalid field falls
 // back to DEFAULT_PROACTIVE_CONFIG. Durations are authored in minutes for
 // readability and converted to ms here. Hot-reloaded by the config watcher (P4).
@@ -1104,6 +1121,8 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
     worldTopics: [...DEFAULT_AUTONOMY_CONFIG.worldTopics],
     worldTopicQuerySuffixOverrides: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicQuerySuffixOverrides },
     worldTopicBroadcastGroupOverrides: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicBroadcastGroupOverrides },
+    worldTopicSourceUrls: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicSourceUrls },
+    worldTopicBriefs: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicBriefs },
   };
   if (!existsSync(configPath)) return base;
 
@@ -1155,6 +1174,8 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       a.world_topic_broadcast_group_overrides,
       base.worldTopicBroadcastGroupOverrides,
     ),
+    worldTopicSourceUrls: readUrlListRecord(a.world_topic_source_urls, base.worldTopicSourceUrls),
+    worldTopicBriefs: readStringRecord(a.world_topic_briefs, base.worldTopicBriefs),
     memoryReflectionEnabled:
       typeof a.memory_reflection_enabled === "boolean"
         ? a.memory_reflection_enabled
@@ -5953,10 +5974,11 @@ async function observeWorldForAutonomy(
   }
   browserObservationAttemptAtMs.set(cacheKey, now);
 
+  const sourceUrls = autonomyConfig.worldTopicSourceUrls[request.topic] ?? [];
   pushMonitorEntry(
     "status",
     "Browser Agent Start",
-    `topic=${request.topic}\nquery=${query}`,
+    `topic=${request.topic}\nquery=${query}\nfixed_sources=${sourceUrls.length}`,
   );
 
   const observed = await browseTopicWithBrowserAgent(
@@ -5970,6 +5992,7 @@ async function observeWorldForAutonomy(
       );
     },
     domainReputationStore ?? undefined,
+    sourceUrls,
   );
   if (!observed) {
     pushMonitorEntry("status", "Browser Agent Empty", `topic=${request.topic}\nquery=${query}`);
@@ -6162,7 +6185,7 @@ function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]):
 type WorldObservationBroadcastTranslation =
   | { kind: "message"; message: string; duplicateItemsRemoved: number }
   | { kind: "duplicate"; duplicateItemsRemoved: number }
-  // 页面上没有一条是今天的。跟 null（内容不可用、要报失败群）分开，因为这是常态。
+  // 页面上没有一条落在最近 24 小时内。跟 null（内容不可用、要报失败群）分开，因为这是常态。
   | { kind: "stale"; itemsDropped: number };
 
 // Safety net for when the structured extraction pass above returns no items
@@ -6228,14 +6251,16 @@ async function translateWorldObservationForBroadcast(
     return { kind: "duplicate", duplicateItemsRemoved: duplicateCandidatesRemoved };
   }
   const candidateUrls = candidates.map((candidate) => candidate.url);
+  const windowLabels = freshnessWindowLabels(nowMs);
   const freshnessPrompt = {
-    todayKey: beijingDateKey(nowMs),
-    pages: sources.map((source) => ({ url: source.page.url, kind: source.kind })),
+    nowLabel: windowLabels.now,
+    sinceLabel: windowLabels.since,
+    pages: sources.map((source) => ({ url: source.page.url, kind: source.kind, pageCitable: source.pageCitable })),
   };
-  const todayArticlePages = sources
-    .filter((source) => source.kind === "article-today")
+  const recentArticlePages = sources
+    .filter((source) => source.kind === "recent-article")
     .map((source) => ({ ...source.page, links: undefined }));
-  const hasTodayArticle = todayArticlePages.length > 0;
+  const hasRecentArticle = recentArticlePages.length > 0;
 
   // 只有某次尝试挑出了至少一条能发的条目，这两个才会被填上。
   let intro = "";
@@ -6257,7 +6282,13 @@ async function translateWorldObservationForBroadcast(
         systemPrompt: WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
         messages: [{
           role: "user",
-          content: buildWorldObservationBroadcastPrompt(topic, attemptObservation, attemptCandidates, freshnessPrompt),
+          content: buildWorldObservationBroadcastPrompt(
+            topic,
+            attemptObservation,
+            attemptCandidates,
+            freshnessPrompt,
+            autonomyConfig.worldTopicBriefs[topic] ?? "",
+          ),
         }],
         jsonSchema: buildWorldObservationBroadcastSchema(attemptUrls),
         cacheRoute: "world-observation-broadcast",
@@ -6303,8 +6334,8 @@ async function translateWorldObservationForBroadcast(
           ].join("\n"),
         );
       }
-      // 列表页的条目逐条核对日期原文，今天的文章页整页可用、不用核对。一条都不过关，说明这些
-      // 页面上没有今天的内容，不是模型写坏了，所以不重试，也不退回原文摘录。
+      // 列表页的条目逐条核对日期原文，窗口内的文章页整页可用、不用核对。一条都不过关，说明这些
+      // 页面上没有最近 24 小时的内容，不是模型写坏了，所以不重试，也不退回原文摘录。
       const freshItems = selection.items.filter((item) => isBroadcastItemFresh(item, sources, nowMs));
       const undatedItems = selection.items.filter((item) => !freshItems.includes(item));
       if (undatedItems.length > 0) {
@@ -6326,9 +6357,9 @@ async function translateWorldObservationForBroadcast(
       validItems = freshItems;
       break;
     }
-    // 只有列表页时，干干净净的空结果多半就是页面上没有今天的条目，缩小上下文重试没有意义。
+    // 只有列表页时，干干净净的空结果多半就是页面上没有窗口内的条目，缩小上下文重试没有意义。
     // 条目全被截断则不同——那是模型写坏了，照旧重试。
-    if (!hasTodayArticle && selection.truncatedTexts.length === 0) break;
+    if (!hasRecentArticle && selection.truncatedTexts.length === 0) break;
     pushMonitorEntry(
       "status",
       selection.truncatedTexts.length > 0 ? "World Observation Translate Truncated" : "World Observation Translate Empty",
@@ -6341,12 +6372,12 @@ async function translateWorldObservationForBroadcast(
     );
   }
   if (validItems.length === 0) {
-    if (!hasTodayArticle) return { kind: "stale", itemsDropped: 0 };
-    // 原文摘录没法逐条核对日期，只能从今天发布的文章页里摘。
+    if (!hasRecentArticle) return { kind: "stale", itemsDropped: 0 };
+    // 原文摘录没法逐条核对日期，只能从最近 24 小时内发布的文章页里摘。
     const articleObservation: ProactiveWorldObservation = {
       ...observation,
-      summary: formatObservationSummary(observation.query, todayArticlePages),
-      urls: todayArticlePages.map((page) => page.url),
+      summary: formatObservationSummary(observation.query, recentArticlePages),
+      urls: recentArticlePages.map((page) => page.url),
     };
     return summaryFallbackBroadcast(articleObservation, recentItems, duplicateCandidatesRemoved);
   }
@@ -6449,7 +6480,7 @@ async function notifyWorldObservationFailure(topic: string, reason: string): Pro
 // 留在记忆里、不发群：
 //   - 只读 / observe 模式
 //   - 目标群号没配或不合法
-//   - 抓到的网页里没有今天的内容
+//   - 抓到的网页里没有最近 24 小时内的内容
 //   - 群里还在聊天（没冷场就别插话——新闻可以等下一轮）
 //   - 内容跟最近播报过的重复
 // 顺序是有讲究的：先判便宜的本地条件，最后才做要花模型的去重与改写。
@@ -6487,17 +6518,17 @@ async function maybeBroadcastWorldObservation(
     );
   }
 
-  // 只播今天的内容。去重只挡得住「同一个地址、差不多的字」，挡不住旧内容换个地址再来——
-  // 91maths 每次换一个列表页，同一道「8 个 8 组成 1000」就在 9 月发了八次。所以先按日期筛
-  // 页面：今天发布的文章整页可用；列表页、首页没有自己的发布时间，正文里写着今天的日期才留下，
-  // 由改写那一步逐条核对。今天的文章页不带相关链接——那些文章没打开过，日期无从核实；列表页的
-  // 链接就是它的条目，得留着。一页不剩是常态而不是抓取失败，所以只记一笔，不往失败群报。
-  // 规则细节见 world-observation-freshness.ts。
+  // 只播最近 24 小时内的内容。去重只挡得住「同一个地址、差不多的字」，挡不住旧内容换个地址
+  // 再来——91maths 每次换一个列表页，同一道「8 个 8 组成 1000」就在 9 月发了八次。所以先按
+  // 日期筛页面：窗口内发布的文章整页可用；列表页、首页和没有可用元数据的页面，正文里写着窗口内
+  // 的日期才留下，由改写那一步逐条核对。窗口内的文章页不带相关链接——那些文章没打开过，日期
+  // 无从核实；列表页的链接就是它的条目，得留着。一页不剩是常态而不是抓取失败，所以只记一笔，
+  // 不往失败群报。规则细节见 world-observation-freshness.ts。
   const nowMs = Date.now();
   const freshness = classifyBroadcastSources(pages, nowMs);
   const broadcastSummary = formatObservationSummary(
     observation.query,
-    freshness.sources.map((source) => source.kind === "article-today" ? { ...source.page, links: undefined } : source.page),
+    freshness.sources.map((source) => source.kind === "recent-article" ? { ...source.page, links: undefined } : source.page),
   );
   if (!broadcastSummary) {
     pushMonitorEntry(
@@ -6506,7 +6537,7 @@ async function maybeBroadcastWorldObservation(
       [
         `group_id=${groupKey}`,
         `topic=${topic}`,
-        `today=${beijingDateKey(nowMs)}`,
+        `window_since=${freshnessWindowLabels(nowMs).since}`,
         `usable_sources=${freshness.sources.length}`,
         ...freshness.rejected.map((page) => `${page.reason} ${page.url}`),
       ].join("\n"),
@@ -6572,7 +6603,7 @@ async function maybeBroadcastWorldObservation(
     pushMonitorEntry(
       "status",
       "World Observation Stale Skipped",
-      `group_id=${groupKey}\ntopic=${topic}\ntoday=${beijingDateKey(nowMs)}\nNo entry on the pages is dated today.\nitems_dropped=${translation.itemsDropped}`,
+      `group_id=${groupKey}\ntopic=${topic}\nwindow_since=${freshnessWindowLabels(nowMs).since}\nNo entry on the pages falls within the last 24 hours.\nitems_dropped=${translation.itemsDropped}`,
     );
     return;
   }

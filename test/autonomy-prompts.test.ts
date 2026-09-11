@@ -178,7 +178,7 @@ test("selectBroadcastItems still rejects malformed items without counting them a
   assert.deepEqual(selectBroadcastItems(undefined, [url]), { items: [], truncatedTexts: [] });
 });
 
-// ---------- 只发今天的内容 ----------
+// ---------- 只发最近 24 小时的内容 ----------
 
 // 列表页条目的日期原文要原样带到核对那一步；没给的条目不凭空补一个空字段。
 test("selectBroadcastItems carries each item's date evidence through", () => {
@@ -197,23 +197,40 @@ test("selectBroadcastItems carries each item's date evidence through", () => {
   ]);
 });
 
-test("the broadcast prompt tells the model today's date and which pages need a per-entry date", () => {
+test("the broadcast prompt tells the model the 24-hour window and which pages need a per-entry date", () => {
   const prompt = buildWorldObservationBroadcastPrompt(
     "人工智能",
     { query: "人工智能 最新 进展", summary: "[Browser observation] query=人工智能 最新 进展", urls: [] },
     [],
     {
-      todayKey: "2026-09-11",
+      nowLabel: "2026-09-11 13:00",
+      sinceLabel: "2026-09-10 13:00",
       pages: [
-        { url: "https://36kr.com/p/1", kind: "article-today" },
-        { url: "https://maomu.com/news", kind: "dated-listing" },
+        { url: "https://36kr.com/p/1", kind: "recent-article", pageCitable: true },
+        { url: "https://maomu.com/news", kind: "dated-listing", pageCitable: true },
+        { url: "https://www.nasa.gov/news/", kind: "dated-listing", pageCitable: false },
       ],
     },
   );
 
-  assert.ok(prompt.includes("Today is 2026-09-11"));
-  assert.ok(prompt.includes("- https://36kr.com/p/1 — an article published today"));
-  assert.ok(prompt.includes("- https://maomu.com/news — a listing/home page with no publish date"));
+  assert.ok(prompt.includes("It is now 2026-09-11 13:00 (Beijing time)"));
+  assert.ok(prompt.includes("since 2026-09-10 13:00"));
+  assert.ok(prompt.includes("- https://36kr.com/p/1 — an article published within the last 24 hours"));
+  assert.ok(prompt.includes("- https://maomu.com/news — a listing/home page"));
+  // 元数据说是旧页面的列表，只能引用它列出的条目链接。
+  assert.match(prompt, /- https:\/\/www\.nasa\.gov\/news\/ — .*Cite the entry's own link, not this page\./);
+  assert.doesNotMatch(prompt, /- https:\/\/maomu\.com\/news — .*Cite the entry's own link/);
+  assert.ok(prompt.includes("Only include entries that are about the topic"));
   assert.ok(prompt.includes('"date_evidence": string'));
-  assert.ok(prompt.includes("If nothing on these pages is dated today, return an empty items array."));
+  assert.ok(prompt.includes("If nothing on these pages falls within the last 24 hours, return an empty items array."));
+});
+
+// 「数学」这个话题名太宽：Quanta 的数学频道里也有趣题专栏。范围说明要跟着话题进提示词。
+test("the broadcast prompt carries a topic's scope only when one is configured", () => {
+  const observation = { query: "数学 最新 进展", summary: "[Browser observation] query=数学 最新 进展", urls: [] };
+  const freshness = { nowLabel: "2026-09-11 13:00", sinceLabel: "2026-09-10 13:00", pages: [] };
+  const scope = "数学研究新闻与理论突破；不要趣味题和脑筋急转弯。";
+
+  assert.ok(buildWorldObservationBroadcastPrompt("数学", observation, [], freshness, scope).includes(`topic: 数学\ntopic scope: ${scope}\n`));
+  assert.ok(!buildWorldObservationBroadcastPrompt("数学", observation, [], freshness).includes("topic scope:"));
 });

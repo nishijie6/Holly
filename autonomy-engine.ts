@@ -62,6 +62,11 @@ export type AutonomyConfig = {
   // 按话题覆盖播报目标群，键是 worldTopics 里的话题原文。没列出的话题发往
   // worldObservationBroadcastGroupId。
   worldTopicBroadcastGroupOverrides: Record<string, string>;
+  // 按话题的固定来源网址，每轮和搜索结果一起读，不看搜索排名。键是 worldTopics 里的话题原文。
+  worldTopicSourceUrls: Record<string, string[]>;
+  // 按话题写给播报改写那一步的内容范围，比如「数学」要研究新闻和理论突破、不要趣味题。话题名
+  // 本身太宽，只凭它模型分不清什么算相关。没写的话题不加说明。
+  worldTopicBriefs: Record<string, string>;
   memoryReflectionEnabled: boolean;
   memoryReflectionIntervalMs: number;
   memoryReflectionRetryMs: number;

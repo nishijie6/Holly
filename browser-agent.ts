@@ -81,8 +81,11 @@ const STEALTH_SCRIPT = [
 // Also collects article links from the content area (anchors with real title
 // text, after page chrome was stripped) so listing pages yield each item's own
 // detail URL instead of only the listing/homepage URL.
-// 发布时间要赶在删 <script> 之前读——JSON-LD 的 datePublished 就在 script 标签里。只认
-// meta 和 JSON-LD 这类元数据，不从正文里扫日期，原因见 world-observation-freshness.ts。
+// 发布时间要赶在删 <script> 之前读——JSON-LD 的 datePublished 就在 script 标签里。
+// <time datetime> 里的机器时间补进正文：列表页常把精确时间只放在这个属性里（Space.com 就是），
+// innerText 读不到。页面日期怎么用，见 world-observation-freshness.ts。
+// 删页面框架时留下文章卡片自己的 <header>/<footer>：Space.com 把每一条的 <time> 放在
+// article > header 里，按标签名一刀切会把列表上的日期连同标题一起删光。
 const CONTENT_EXTRACTION_EXPRESSION = `(() => {
   let publishedAt = "";
   try {
@@ -108,7 +111,14 @@ const CONTENT_EXTRACTION_EXPRESSION = `(() => {
     }
   } catch (_) { /* best effort */ }
   try {
-    document.querySelectorAll('script,style,noscript,template,nav,header,footer,aside,form,[role="navigation"],[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]').forEach((el) => el.remove());
+    document.querySelectorAll('time[datetime]').forEach((el) => {
+      const stamp = (el.getAttribute('datetime') || '').trim();
+      const shown = (el.textContent || '').trim();
+      if (stamp && !shown.includes(stamp)) el.textContent = shown ? shown + ' ' + stamp : stamp;
+    });
+  } catch (_) { /* best effort */ }
+  try {
+    document.querySelectorAll('script,style,noscript,template,nav,header:not(article header),footer:not(article footer),aside,form,[role="navigation"],[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]').forEach((el) => el.remove());
   } catch (_) { /* best effort */ }
   const body = document.body;
   const root = document.querySelector('main, article') || body;
@@ -583,29 +593,49 @@ function isUnsupportedBrowserDocument(url: string): boolean {
 const TRANSIENT_NETWORK_ERROR_PATTERN =
   /ERR_CONNECTION_(CLOSED|RESET|REFUSED)|ERR_EMPTY_RESPONSE|ERR_NETWORK_CHANGED|ERR_TIMED_OUT/i;
 
+// 固定来源排在搜索结果前面，并且额外占页数：搜索结果照旧读够 maxPages 页，固定来源另算。
+// 挤进同一个名额的话，每轮都要读的那几个站会和搜索结果抢位置，「固定」就不成立了。
+export function planBrowseCandidates(
+  sourceUrls: readonly string[],
+  searchUrls: readonly string[],
+  maxPages: number,
+): { urls: string[]; maxPages: number } {
+  const sources = [...new Set(sourceUrls.map((url) => url.trim()).filter(Boolean))];
+  const rest = searchUrls.filter((url) => !sources.includes(url));
+  return { urls: [...sources, ...rest], maxPages: maxPages + sources.length };
+}
+
 export async function browseTopicWithBrowserAgent(
   query: string,
   config: BrowserAgentConfig,
   logger?: BrowserAgentLogger,
   reputation?: DomainReputationTracker,
+  sourceUrls: readonly string[] = [],
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   if (!config.enabled || !cleanQuery) return null;
 
-  const results = await searchWeb(cleanQuery, {
-    topK: config.searchTopK,
-    timeoutMs: config.timeoutMs,
-  });
+  // 有固定来源时，搜索挂了也不该让这一轮白跑：固定来源照样读。
+  let results: SearchResult[] = [];
+  try {
+    results = await searchWeb(cleanQuery, {
+      topK: config.searchTopK,
+      timeoutMs: config.timeoutMs,
+    });
+  } catch (error) {
+    if (sourceUrls.length === 0) throw error;
+    logger?.({ url: `search:${cleanQuery}`, status: "error", detail: error instanceof Error ? error.message : String(error) });
+  }
   const urls = results
     .map((result: SearchResult) => result.url.trim())
     .filter(Boolean)
     .filter((url) => !isExcludedSearchDomain(url))
     .filter((url) => !isUnsupportedBrowserDocument(url));
-  if (urls.length === 0) return null;
   const ranked = reputation ? rankUrlsByDomainReputation(urls, reputation.snapshot()) : urls;
-  if (ranked.length === 0) return null;
+  const plan = planBrowseCandidates(sourceUrls, ranked, config.maxPages);
+  if (plan.urls.length === 0) return null;
 
-  return browseUrlsWithBrowserAgent(cleanQuery, ranked, config, logger, reputation);
+  return browseUrlsWithBrowserAgent(cleanQuery, plan.urls, { ...config, maxPages: plan.maxPages }, logger, reputation);
 }
 
 // Walks candidate URLs (a superset of maxPages, typically all of
