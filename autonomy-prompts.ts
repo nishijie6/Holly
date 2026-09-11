@@ -10,6 +10,10 @@ import { type BroadcastSourceKind } from "./world-observation-freshness.js";
 export const WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT =
   "You turn browser observations into concise Simplified Chinese QQ group updates, returned as structured JSON with an exact source URL per item.";
 
+// 一次播报最多列几条。2026-09-11 起从 5 条收到 3 条，此前 7 天的 78 次播报里有 33 次是满 5 条。
+// 改写提示词和发送前的去重循环共用这个数，免得两处写的上限对不上。
+export const WORLD_OBSERVATION_BROADCAST_MAX_ITEMS = 3;
+
 export type WorldObservationLinkCandidate = { text: string; url: string };
 
 // 播报只发最近 24 小时内的内容。模型要知道现在几点、窗口从几点开始、每一页是「窗口内发布的
@@ -51,7 +55,7 @@ export function buildWorldObservationBroadcastPrompt(
     "Only include entries that are about the topic, and within its topic scope when one is given; a source page can cover more than one subject.",
     `date_evidence: for an entry taken from a listing/home page, copy verbatim the date text that page shows for that entry, for example ${year}-${month}-${day} 14:05, ${month}月${day}日 09:07, 昨天 21:30, 3小时前, 刚刚, Sep ${Number(day)}, ${year} or 5 hours ago. When the page shows a time or a timestamp such as ${year}-${month}-${day}T12:00:00Z next to the date, copy that too. If the page dates a whole section at once — a heading such as 今日 - ${year}-${month}-${day} above a list of bare times — copy that heading's date text for the entries under it. The copied text must contain a date or a relative time; a bare time like 12:37 is not enough. A date printed once at the top of the page next to the weekday is a page clock, not an entry's date. For an entry from an article published within the last 24 hours, use "".`,
     'intro: an optional short lead-in sentence, or "" if not needed.',
-    "items: at most 5 entries. If the observation has MULTIPLE distinct news items, one entry per item (drop the rest beyond 5), each a single short Chinese sentence — do not add numbering yourself, it's added automatically. If there is only ONE item, return exactly one entry with 2-4 short conversational sentences.",
+    `items: at most ${WORLD_OBSERVATION_BROADCAST_MAX_ITEMS} entries. If the observation has MULTIPLE distinct news items, one entry per item (beyond ${WORLD_OBSERVATION_BROADCAST_MAX_ITEMS}, keep the most significant and drop the rest), each a single short Chinese sentence — do not add numbering yourself, it's added automatically. If there is only ONE item, return exactly one entry with 2-4 short conversational sentences.`,
     "Each item's `url` MUST be copied EXACTLY (character for character) from the numbered candidate list below — pick the entry that most specifically matches that item (a specific article/detail link) over a generic page-source entry, unless the page source is the only candidate for that item.",
     "Never invent, shorten, or rewrite a URL — only the candidate list's exact strings are valid.",
     "No markdown, no @ mentions. Keep each item's text under 120 Chinese characters.",

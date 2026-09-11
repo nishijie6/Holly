@@ -225,6 +225,9 @@ test("the broadcast prompt tells the model the 24-hour window and which pages ne
   assert.ok(prompt.includes("Only include entries that are about the topic"));
   assert.ok(prompt.includes('"date_evidence": string'));
   assert.ok(prompt.includes("If nothing on these pages falls within the last 24 hours, return an empty items array."));
+  // 一次播报最多 3 条，提示词里不能还写着 5。
+  assert.ok(prompt.includes("items: at most 3 entries"));
+  assert.ok(!/at most 5|beyond 5/.test(prompt));
 });
 
 // 「数学」这个话题名太宽：Quanta 的数学频道里也有趣题专栏。范围说明要跟着话题进提示词。

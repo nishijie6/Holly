@@ -199,6 +199,7 @@ import {
   selectJudgedSearchResults,
   SEARCH_RESULT_JUDGE_SCHEMA,
   SEARCH_RESULT_JUDGE_SYSTEM_PROMPT,
+  WORLD_OBSERVATION_BROADCAST_MAX_ITEMS,
 } from "./autonomy-prompts.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 import {
@@ -6224,7 +6225,8 @@ function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]):
         type: "array",
         // maxItems is rejected by Claude's structured-output validator
         // ("not supported" for array schemas); the cap is enforced by the
-        // prompt instruction plus the .slice(0, 5) after parsing below.
+        // prompt instruction plus the WORLD_OBSERVATION_BROADCAST_MAX_ITEMS
+        // check in the dedup loop below.
         items: {
           type: "object",
           additionalProperties: false,
@@ -6458,7 +6460,7 @@ async function translateWorldObservationForBroadcast(
     }
     acceptedUrls.add(normalizedUrl);
     items.push(item);
-    if (items.length >= 5) break;
+    if (items.length >= WORLD_OBSERVATION_BROADCAST_MAX_ITEMS) break;
   }
   if (items.length === 0) {
     return { kind: "duplicate", duplicateItemsRemoved };
