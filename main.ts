@@ -193,8 +193,12 @@ import {
   buildArchiveCompositionPrompt,
   buildAutonomyJudgmentPrompt,
   buildMemoryReflectionPrompt,
+  buildSearchResultJudgePrompt,
   buildWorldObservationBroadcastPrompt,
   selectBroadcastItems,
+  selectJudgedSearchResults,
+  SEARCH_RESULT_JUDGE_SCHEMA,
+  SEARCH_RESULT_JUDGE_SYSTEM_PROMPT,
 } from "./autonomy-prompts.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 import {
@@ -5943,6 +5947,57 @@ function observeWorldForProactive(request: ProactiveWorldObservationRequest): Pr
   return Promise.resolve(findRelevantWorldObservation(request));
 }
 
+// 搜索结果先让模型挑一遍再打开，只读它认为可能是新闻或研究进展的页面。本地搜索对「数学」这类
+// 话题几乎只给百科和课程网站，打开了也必然被日期闸门挡掉，白读几页。用决策通道的模型：活很小，
+// 犯不上动主模型。这一步只决定打不打开，所以出了任何错都照旧打开全部搜索结果。
+async function judgeWorldObservationSearchResults(
+  topic: string,
+  results: readonly SearchResult[],
+): Promise<readonly SearchResult[]> {
+  const client = decisionLlmClient ?? activeLlmClient;
+  if (!client) return results;
+  try {
+    const labels = freshnessWindowLabels(Date.now());
+    const reply = await client.generateText({
+      purpose: "world-observation-search-judge",
+      systemPrompt: SEARCH_RESULT_JUDGE_SYSTEM_PROMPT,
+      messages: [{
+        role: "user",
+        content: buildSearchResultJudgePrompt({
+          topic,
+          topicBrief: autonomyConfig.worldTopicBriefs[topic] ?? "",
+          nowLabel: labels.now,
+          sinceLabel: labels.since,
+          results,
+        }),
+      }],
+      jsonSchema: SEARCH_RESULT_JUDGE_SCHEMA,
+      cacheRoute: "world-observation-search-judge",
+    });
+    broadcastLatestLlmUsage(client);
+    const selection = selectJudgedSearchResults(JSON.parse(unwrapJsonBlock(reply)) as unknown, results);
+    if (!selection) throw new Error(`No usable decisions in the reply: ${reply.slice(0, 200)}`);
+    pushMonitorEntry(
+      "status",
+      "World Observation Search Judged",
+      [
+        `topic=${topic}`,
+        `kept=${selection.kept.length} dropped=${selection.dropped.length}`,
+        ...selection.kept.map((result) => `keep ${result.url}`),
+        ...selection.dropped.map(({ result, reason }) => `drop ${result.url} | ${reason}`),
+      ].join("\n"),
+    );
+    return selection.kept;
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "World Observation Search Judge Failed",
+      `topic=${topic}\nOpening every search result instead.\n${error instanceof Error ? error.message : String(error)}`,
+    );
+    return results;
+  }
+}
+
 async function observeWorldForAutonomy(
   request: AutonomyWorldObservationRequest,
 ): Promise<ProactiveWorldObservation | null> {
@@ -5992,7 +6047,10 @@ async function observeWorldForAutonomy(
       );
     },
     domainReputationStore ?? undefined,
-    sourceUrls,
+    {
+      sourceUrls,
+      judgeSearchResults: (results) => judgeWorldObservationSearchResults(request.topic, results),
+    },
   );
   if (!observed) {
     pushMonitorEntry("status", "Browser Agent Empty", `topic=${request.topic}\nquery=${query}`);

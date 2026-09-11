@@ -133,6 +133,102 @@ export function selectBroadcastItems(
   return selection;
 }
 
+// ---------- 打开网页前先筛搜索结果 ----------
+//
+// 本地搜索对有些话题几乎只给百科和课程网站：查询里只要有「数学」，前几条永远是数学天地、可汗
+// 学院、kmath 学习网，换什么说法都一样。这些页面没有日期，打开了必然被 24 小时闸门挡掉，每轮
+// 白读三页。搜索结果本身带着标题、网址和摘要，摘要里常写着「8 小时之前」「2026年8月4日」，
+// 够模型在打开之前先判断一遍。
+//
+// 这一步只决定打不打开，不决定发不发：拿不准就留下，后面还有日期闸门和改写那一步把关。所以
+// 解析也往宽处走——编号不对的判断直接忽略，模型没提到的结果照旧留下，一条可用的判断都没有就
+// 当没筛过。
+
+export const SEARCH_RESULT_JUDGE_SYSTEM_PROMPT =
+  "You screen web search results before any page is opened for Holly's hourly world observation, and return structured JSON only.";
+
+export type SearchResultForJudge = { title: string; url: string; snippet: string };
+
+export function buildSearchResultJudgePrompt(input: {
+  topic: string;
+  topicBrief: string;
+  nowLabel: string;
+  sinceLabel: string;
+  results: readonly SearchResultForJudge[];
+}): string {
+  const resultsBlock = input.results
+    .map((result, index) => [
+      `${index + 1}. ${result.title || "(untitled)"}`,
+      `   url: ${result.url}`,
+      `   snippet: ${result.snippet || "(none)"}`,
+    ].join("\n"))
+    .join("\n");
+  return [
+    "Decide which of these search results are worth opening for a news update on the topic below.",
+    "Keep a result when it is likely a news article, a news or research-update listing, or an announcement page that keeps getting new items.",
+    "Drop encyclopedia and dictionary entries, courses and learning material, beginner explainers, Q&A and forum threads, tool or product home pages, and anything outside the topic scope.",
+    "Drop a result whose snippet clearly dates it before the window below, unless it is a listing that keeps updating.",
+    "When unsure, keep it: a later step checks every page's dates before anything is sent.",
+    'Return JSON only: {"decisions": [{"index": number, "keep": boolean, "reason": string}]}, one decision per result. reason: a few words in Simplified Chinese.',
+    "",
+    `It is now ${input.nowLabel} (Beijing time); the window starts at ${input.sinceLabel}.`,
+    `topic: ${input.topic}`,
+    ...(input.topicBrief ? [`topic scope: ${input.topicBrief}`] : []),
+    "",
+    "Search results:",
+    resultsBlock || "(none)",
+  ].join("\n");
+}
+
+export const SEARCH_RESULT_JUDGE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["decisions"],
+  properties: {
+    decisions: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["index", "keep", "reason"],
+        properties: {
+          index: { type: "integer" },
+          keep: { type: "boolean" },
+          reason: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+export type JudgedSearchResults<T> = {
+  kept: T[];
+  dropped: Array<{ result: T; reason: string }>;
+};
+
+// 编号从 1 开始，和提示词里的列表一致。同一编号判了两次，以第一次为准。
+export function selectJudgedSearchResults<T>(raw: unknown, results: readonly T[]): JudgedSearchResults<T> | null {
+  const decisions = raw && typeof raw === "object" ? (raw as { decisions?: unknown }).decisions : undefined;
+  if (!Array.isArray(decisions)) return null;
+  const verdicts = new Map<number, { keep: boolean; reason: string }>();
+  for (const decision of decisions) {
+    if (!decision || typeof decision !== "object") continue;
+    const record = decision as Record<string, unknown>;
+    const index = record.index;
+    if (typeof index !== "number" || !Number.isInteger(index) || index < 1 || index > results.length) continue;
+    if (typeof record.keep !== "boolean" || verdicts.has(index)) continue;
+    verdicts.set(index, { keep: record.keep, reason: typeof record.reason === "string" ? record.reason.trim() : "" });
+  }
+  if (verdicts.size === 0) return null;
+  const selection: JudgedSearchResults<T> = { kept: [], dropped: [] };
+  results.forEach((result, position) => {
+    const verdict = verdicts.get(position + 1);
+    if (verdict && !verdict.keep) selection.dropped.push({ result, reason: verdict.reason });
+    else selection.kept.push(result);
+  });
+  return selection;
+}
+
 export const MEMORY_REFLECTION_SYSTEM_PROMPT =
   "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.";
 

@@ -4,9 +4,11 @@ import test from "node:test";
 import {
   buildArchiveCompositionPrompt,
   buildMemoryReflectionPrompt,
+  buildSearchResultJudgePrompt,
   buildWorldObservationBroadcastPrompt,
   isTruncatedBroadcastText,
   selectBroadcastItems,
+  selectJudgedSearchResults,
 } from "../autonomy-prompts.js";
 
 const worldBlocks = [
@@ -233,4 +235,56 @@ test("the broadcast prompt carries a topic's scope only when one is configured",
 
   assert.ok(buildWorldObservationBroadcastPrompt("数学", observation, [], freshness, scope).includes(`topic: 数学\ntopic scope: ${scope}\n`));
   assert.ok(!buildWorldObservationBroadcastPrompt("数学", observation, [], freshness).includes("topic scope:"));
+});
+
+// ---------- 打开网页前先筛搜索结果 ----------
+
+// 2026-09-11「数学 最新 进展」的真实搜索结果。百度百科排在更前面，但已被域名黑名单挡掉，不会交给模型。
+const MATH_SEARCH_RESULTS = [
+  { title: "：网络上最全面的数学资源 - 数学天地", url: "https://mathworld.net.cn/", snippet: "2025年1月24日 · 由 Eric Weisstein 创建、开发和维护" },
+  { title: "数学在线学习-高等数学/线性代数/概率论与数理统计在线学习", url: "https://kb.kmath.cn/kbase/", snippet: "初中数学还涉及统计与概率" },
+  { title: "数学 | 可汗学院 - Khan Academy", url: "https://zh.khanacademy.org/math", snippet: "1 天前 · 欢迎来到可汗学院观看视频,做练习,提高你的数学技能." },
+];
+
+test("the search judge prompt numbers each result with its url and snippet, under the topic scope", () => {
+  const prompt = buildSearchResultJudgePrompt({
+    topic: "数学",
+    topicBrief: "数学研究新闻与理论突破；不要趣味题。",
+    nowLabel: "2026-09-11 17:00",
+    sinceLabel: "2026-09-10 17:00",
+    results: MATH_SEARCH_RESULTS,
+  });
+
+  assert.ok(prompt.includes("topic: 数学\ntopic scope: 数学研究新闻与理论突破；不要趣味题。"));
+  assert.ok(prompt.includes("the window starts at 2026-09-10 17:00"));
+  assert.ok(prompt.includes("3. 数学 | 可汗学院 - Khan Academy\n   url: https://zh.khanacademy.org/math\n   snippet: 1 天前"));
+});
+
+test("selectJudgedSearchResults drops what the model rejected and keeps everything else", () => {
+  const results = [...MATH_SEARCH_RESULTS, { title: "Mathematics | Quanta Magazine", url: "https://www.quantamagazine.org/mathematics/", snippet: "" }];
+  const selection = selectJudgedSearchResults({
+    decisions: [
+      { index: 1, keep: false, reason: " 数学资源站，不是新闻 " },
+      { index: 2, keep: false, reason: "学习网站" },
+      { index: 2, keep: true, reason: "同一编号判第二次，不算" },
+      { index: 9, keep: false, reason: "编号越界" },
+      { index: 4, keep: true, reason: "数学新闻列表" },
+    ],
+  }, results);
+
+  // 模型没提到第 3 条：拿不准就留下，后面还有日期闸门。
+  assert.deepEqual(selection?.kept.map((result) => result.url), [
+    "https://zh.khanacademy.org/math",
+    "https://www.quantamagazine.org/mathematics/",
+  ]);
+  assert.deepEqual(selection?.dropped.map(({ result, reason }) => [result.url, reason]), [
+    ["https://mathworld.net.cn/", "数学资源站，不是新闻"],
+    ["https://kb.kmath.cn/kbase/", "学习网站"],
+  ]);
+});
+
+test("selectJudgedSearchResults returns null when nothing in the reply is usable, so the caller does not screen", () => {
+  for (const raw of [undefined, null, "keep all", {}, { decisions: [] }, { decisions: [{ index: "1", keep: false }, { index: 1 }] }]) {
+    assert.equal(selectJudgedSearchResults(raw, MATH_SEARCH_RESULTS), null, JSON.stringify(raw));
+  }
 });

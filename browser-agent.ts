@@ -605,15 +605,48 @@ export function planBrowseCandidates(
   return { urls: [...sources, ...rest], maxPages: maxPages + sources.length };
 }
 
+// 打开网页之前筛搜索结果的钩子，交回想打开的那几条（必须是传入结果的子集）。浏览器模块不碰
+// 模型，判断由调用方提供，见 main.ts 的 judgeWorldObservationSearchResults。
+export type SearchResultJudge = (results: readonly SearchResult[]) => Promise<readonly SearchResult[]>;
+
+// 先去掉永远不该打开的（黑名单域名、PDF），剩下的才交给判断——没必要让模型看百度百科。判断
+// 抛错时不筛：这一步只是省几次页面加载，不能让它的故障拖垮整轮观察。
+export async function screenSearchResults(
+  results: readonly SearchResult[],
+  judge?: SearchResultJudge,
+  onJudgeError?: (error: unknown) => void,
+): Promise<string[]> {
+  const openable = results.filter((result) => {
+    const url = result.url.trim();
+    return url.length > 0 && !isExcludedSearchDomain(url) && !isUnsupportedBrowserDocument(url);
+  });
+  let screened: readonly SearchResult[] = openable;
+  if (judge && openable.length > 0) {
+    try {
+      screened = await judge(openable);
+    } catch (error) {
+      onJudgeError?.(error);
+    }
+  }
+  return screened.map((result) => result.url.trim());
+}
+
+export type BrowseTopicOptions = {
+  // 这个话题每轮固定要读的页面，见 planBrowseCandidates。
+  sourceUrls?: readonly string[];
+  judgeSearchResults?: SearchResultJudge;
+};
+
 export async function browseTopicWithBrowserAgent(
   query: string,
   config: BrowserAgentConfig,
   logger?: BrowserAgentLogger,
   reputation?: DomainReputationTracker,
-  sourceUrls: readonly string[] = [],
+  options: BrowseTopicOptions = {},
 ): Promise<BrowserTopicObservation | null> {
   const cleanQuery = query.trim();
   if (!config.enabled || !cleanQuery) return null;
+  const sourceUrls = options.sourceUrls ?? [];
 
   // 有固定来源时，搜索挂了也不该让这一轮白跑：固定来源照样读。
   let results: SearchResult[] = [];
@@ -626,11 +659,9 @@ export async function browseTopicWithBrowserAgent(
     if (sourceUrls.length === 0) throw error;
     logger?.({ url: `search:${cleanQuery}`, status: "error", detail: error instanceof Error ? error.message : String(error) });
   }
-  const urls = results
-    .map((result: SearchResult) => result.url.trim())
-    .filter(Boolean)
-    .filter((url) => !isExcludedSearchDomain(url))
-    .filter((url) => !isUnsupportedBrowserDocument(url));
+  const urls = await screenSearchResults(results, options.judgeSearchResults, (error) => {
+    logger?.({ url: `judge:${cleanQuery}`, status: "error", detail: error instanceof Error ? error.message : String(error) });
+  });
   const ranked = reputation ? rankUrlsByDomainReputation(urls, reputation.snapshot()) : urls;
   const plan = planBrowseCandidates(sourceUrls, ranked, config.maxPages);
   if (plan.urls.length === 0) return null;

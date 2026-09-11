@@ -8,6 +8,7 @@ export type LlmCallPurpose =
   | "reply-search-reask"
   | "context-warm"
   | "world-observation-broadcast"
+  | "world-observation-search-judge"
   | "memory-reflection"
   | "archive-composition"
   | "proactive-decision"
