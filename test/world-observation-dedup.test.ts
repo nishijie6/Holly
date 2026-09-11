@@ -18,6 +18,19 @@ test("normalizeBroadcastUrl removes fragments, tracking parameters, and trailing
   );
 });
 
+// 2026-09-07 18:35 和 09-08 00:35 真实重复发出的同一篇文章，两次的链接只差一个 www.。
+test("normalizeBroadcastUrl treats a www. host and its bare host as the same page", () => {
+  assert.equal(
+    normalizeBroadcastUrl("https://www.nao.cas.cn/news/ky/202609/t20260907_8279168.html"),
+    normalizeBroadcastUrl("https://nao.cas.cn/news/ky/202609/t20260907_8279168.html"),
+  );
+  // 只去掉开头的 www.，其他子域名是别的站点。
+  assert.notEqual(
+    normalizeBroadcastUrl("https://news.example.com/a"),
+    normalizeBroadcastUrl("https://example.com/a"),
+  );
+});
+
 test("extractRecentBroadcastItems restores sent items from persisted conversation turns", () => {
   const now = Date.parse("2026-08-12T12:00:00.000Z");
   const items = extractRecentBroadcastItems([

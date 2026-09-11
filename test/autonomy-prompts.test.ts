@@ -4,6 +4,8 @@ import test from "node:test";
 import {
   buildArchiveCompositionPrompt,
   buildMemoryReflectionPrompt,
+  isTruncatedBroadcastText,
+  selectBroadcastItems,
 } from "../autonomy-prompts.js";
 
 const worldBlocks = [
@@ -77,4 +79,100 @@ test("an empty stable half degrades to instructions only", () => {
   assert.ok(stable.includes("Holly's private memory and reflection loop"));
   assert.ok(!stable.endsWith("\n"), "no trailing blank line when there is no material");
   for (const block of churn) assert.ok(volatile.includes(block));
+});
+
+// ---------- 播报条目的完整性检查 ----------
+
+// 2026-09-05 到 09-10 真实发进群里的截断条目，从监控日志原样摘出。每一条都停在句子中间。
+const TRUNCATED_BROADCAST_TEXTS = [
+  "北京经开区推出",
+  "OpenAI就旗下智能体向德国维基站点写入内容的",
+  "世界模型不再只做未来预测，机器人本体与",
+  "李飞飞团队用三张照片替代两小时扫街采集，主打",
+  "400亿AI短剧市场爆冷：市场规模翻了一倍多，公司却跑了九成，号称",
+  "火山引擎内测AI版权平台，Seedance从",
+  "千问办公推出业内首个",
+  "AI仅用11天、30万美元攻破困扰数学界358年的费马大定理最后一环，被评",
+  "黄仁勋半年内第三次喊出",
+  "国内首例：六人利用",
+  "号称",
+  "联想IDG总裁称AI PC的",
+  "AI社交收入暴涨12倍，微信也已下场，模式从",
+  "美国国防部被曝曾要求OpenAI提供",
+  "Arm将战线推向x86腹地，",
+  "另一篇关于代码风格的分享《",
+  "博客园作者",
+];
+
+test("isTruncatedBroadcastText flags every truncated item that actually reached a group", () => {
+  for (const text of TRUNCATED_BROADCAST_TEXTS) {
+    assert.equal(isTruncatedBroadcastText(text), true, text);
+  }
+});
+
+test("isTruncatedBroadcastText accepts text that ends like a finished sentence", () => {
+  for (const text of [
+    // 前两条是历史上真实发出的完整条目，历史上所有完整条目都以「。」或「？」结尾。
+    "想看更多趣题可以点这里换一批。",
+    "挂钟敲6下用30秒，敲12下要多少秒？",
+    "黄仁勋半年内第三次喊出「AGI已经到来」",
+    "推荐阅读《数学之美》",
+    "这篇值得一看！",
+    "Anthropic released Claude Opus 5.",
+    "来看看吧～",
+    "这个理由绝了😂",
+    "  前后带空白也照样算完整。  ",
+  ]) {
+    assert.equal(isTruncatedBroadcastText(text), false, text);
+  }
+});
+
+test("isTruncatedBroadcastText does not call an empty string truncated", () => {
+  assert.equal(isTruncatedBroadcastText(""), false);
+  assert.equal(isTruncatedBroadcastText("   "), false);
+});
+
+test("selectBroadcastItems drops only the truncated items and keeps the rest of the same reply", () => {
+  const urls = ["https://a.example/1", "https://a.example/2", "https://a.example/3"];
+  const selection = selectBroadcastItems(
+    [
+      { text: "京东启动物理AI加速计划。", url: urls[0] },
+      { text: "黄仁勋半年内第三次喊出", url: urls[1] },
+      { text: "FAST 发布第二十六批科学数据。", url: urls[2] },
+    ],
+    urls,
+  );
+
+  assert.deepEqual(selection.items, [
+    { text: "京东启动物理AI加速计划。", url: urls[0] },
+    { text: "FAST 发布第二十六批科学数据。", url: urls[2] },
+  ]);
+  assert.deepEqual(selection.truncatedTexts, ["黄仁勋半年内第三次喊出"]);
+});
+
+// 2026-09-10 发到 20000001 的第一条播报就是这个形状：唯一的条目被截断。返回空列表，
+// 调用方才会重试，而不是把「博客园作者」加一个链接发出去。
+test("selectBroadcastItems returns no items when every item is truncated, so the caller retries", () => {
+  const url = "https://www.cnblogs.com/janas/p/14897873.html";
+  const selection = selectBroadcastItems([{ text: "博客园作者", url }], [url]);
+
+  assert.deepEqual(selection.items, []);
+  assert.deepEqual(selection.truncatedTexts, ["博客园作者"]);
+});
+
+test("selectBroadcastItems still rejects malformed items without counting them as truncated", () => {
+  const url = "https://a.example/ok";
+  const selection = selectBroadcastItems(
+    [
+      null,
+      "not an object",
+      { text: "链接不在候选列表里。", url: "https://invented.example/" },
+      { text: "", url },
+      { text: 42, url },
+    ],
+    [url],
+  );
+
+  assert.deepEqual(selection, { items: [], truncatedTexts: [] });
+  assert.deepEqual(selectBroadcastItems(undefined, [url]), { items: [], truncatedTexts: [] });
 });

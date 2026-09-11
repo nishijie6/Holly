@@ -20,6 +20,10 @@ export function normalizeBroadcastUrl(rawUrl: string): string {
   try {
     const parsed = new URL(clean);
     parsed.hash = "";
+    // 带不带 www. 是同一个站点的同一篇文章。不去掉的话，nao.cas.cn 和 www.nao.cas.cn 上的
+    // 同一条新闻会被当成两条——2026-09-02 到 09-09 之间就这样重复发过两次。
+    // 规范化的结果只用来比较，发出去的链接保持原样。
+    parsed.hostname = parsed.hostname.replace(/^www\./, "");
     for (const key of [...parsed.searchParams.keys()]) {
       if (TRACKING_QUERY_PARAM.test(key)) parsed.searchParams.delete(key);
     }
@@ -27,7 +31,7 @@ export function normalizeBroadcastUrl(rawUrl: string): string {
     if (parsed.pathname !== "/") parsed.pathname = parsed.pathname.replace(/\/+$/, "");
     return parsed.toString();
   } catch {
-    return clean;
+    return clean.replace(/^(https?:\/\/)www\./i, "$1");
   }
 }
 

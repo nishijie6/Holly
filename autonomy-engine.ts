@@ -48,7 +48,8 @@ export type AutonomyConfig = {
   // quiet for at least this long (don't interrupt an active conversation).
   worldObservationBroadcastLullMs: number;
   // Suppress recently broadcast URLs and semantically equivalent headlines.
-  // The history comes from the persisted per-group conversation timeline.
+  // 历史取自所有播报目标群的持久化时间线之和，而不只是这次要发的那个群——见
+  // worldObservationBroadcastGroupIds。
   worldObservationDedupWindowMs: number;
   worldTopics: string[];
   // Per-topic override for browser_agent.query_suffix, keyed by exact topic
@@ -58,6 +59,9 @@ export type AutonomyConfig = {
   // false-positive covered by the world-observation broadcast fallback).
   // Missing entry = use browser_agent.query_suffix as before; "" = no suffix.
   worldTopicQuerySuffixOverrides: Record<string, string>;
+  // 按话题覆盖播报目标群，键是 worldTopics 里的话题原文。没列出的话题发往
+  // worldObservationBroadcastGroupId。
+  worldTopicBroadcastGroupOverrides: Record<string, string>;
   memoryReflectionEnabled: boolean;
   memoryReflectionIntervalMs: number;
   memoryReflectionRetryMs: number;
@@ -67,6 +71,35 @@ export type AutonomyConfig = {
   archiveWritingIntervalMs: number;
   archiveWritingRetryMs: number;
 };
+
+// ---------- 世界观察播报的目标群 ----------
+
+type BroadcastRoutingConfig = Pick<
+  AutonomyConfig,
+  "worldObservationBroadcastGroupId" | "worldTopicBroadcastGroupOverrides"
+>;
+
+// 话题单独指定了群就发那里，否则发默认群。键按话题原文逐字匹配，写法必须和 worldTopics 一致。
+export function resolveWorldObservationBroadcastGroupId(
+  config: BroadcastRoutingConfig,
+  topic: string,
+): string | null {
+  return config.worldTopicBroadcastGroupOverrides[topic] ?? config.worldObservationBroadcastGroupId;
+}
+
+// 所有可能收到世界观察播报的群。去重时要把它们的历史合在一起看。
+//
+// 去重原本只翻目标群自己的历史，于是一换目标群、或者按话题分群，新群对别的群七天内发过的
+// 内容就一无所知，同一篇文章会再发一遍——2026-09-10 改群当天就发生了。这里把播报当成
+// 一条统一的内容流：发过就是发过，不管当时发在哪个群。只算当前配置里的群；从配置里移除的群，
+// 它的历史也就不再参与去重。
+export function worldObservationBroadcastGroupIds(config: BroadcastRoutingConfig): string[] {
+  const ids = [
+    config.worldObservationBroadcastGroupId,
+    ...Object.values(config.worldTopicBroadcastGroupOverrides),
+  ];
+  return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))];
+}
 
 export type AutonomyLoopState = {
   lastWorldObservationAt: number;

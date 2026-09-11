@@ -2,7 +2,6 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  allocateVariableContextBudgets,
   compactTextToTokenBudget,
   compressMemoryPrompt,
   estimateMessageTokens,
@@ -115,6 +114,30 @@ test("compressMemoryPrompt leaves a prompt that already fits", () => {
   assert.equal(compressMemoryPrompt("short", 1000), "short");
 });
 
+// 记忆块现在拿的是一份固定配额（main.ts 的 MEMORY_PROMPT_BUDGET_TOKENS），不再
+// 和历史共享一个总预算按占比切分。这条不变量是那个改动的支点：只要记忆压缩后
+// 一定落在自己的配额里，检索命中多少条就不会挤到历史，历史窗口的起点也就不会
+// 跟着每次请求平移——而窗口起点决定了被缓存的前缀长什么样。
+test("compressMemoryPrompt stays inside its budget no matter how much it is given", () => {
+  const lines = Array.from(
+    { length: 40 },
+    (_, index) => `[2026-09-09T06:00:00Z] sender=某人(${index}) 一段足够长的记忆内容，用来把预算撑破。`,
+  ).join("\n");
+
+  for (const budget of [24, 48, 120, 400, 1000]) {
+    const out = compressMemoryPrompt(lines, budget);
+    assert.ok(
+      estimateTextTokens(out) <= budget,
+      `budget=${budget} 却压出了 ${estimateTextTokens(out)} tokens`,
+    );
+  }
+});
+
+test("compressMemoryPrompt yields nothing when it has no budget at all", () => {
+  assert.equal(compressMemoryPrompt("[x] anything", 0), "");
+  assert.equal(compressMemoryPrompt("[x] anything", -5), "");
+});
+
 // --- formatTopicTimestamp ---
 
 test("formatTopicTimestamp renders a missing timestamp as ??", () => {
@@ -125,64 +148,6 @@ test("formatTopicTimestamp renders a timestamp as MM-DD HH:mm", () => {
   // Deliberately a shape assertion, not an exact string: the output is
   // rendered in local time, and CI runs in UTC while development does not.
   assert.match(formatTopicTimestamp(0), /^\d{2}-\d{2} \d{2}:\d{2}$/);
-});
-
-// --- allocateVariableContextBudgets ---
-
-test("allocateVariableContextBudgets gives nothing away when there is no budget", () => {
-  assert.deepEqual(allocateVariableContextBudgets(0, 0, 0), {
-    memoryBudget: 0,
-    conversationBudget: 0,
-  });
-});
-
-test("allocateVariableContextBudgets gives the whole budget to the only claimant", () => {
-  assert.deepEqual(allocateVariableContextBudgets(0, 100, 1000), {
-    memoryBudget: 0,
-    conversationBudget: 1000,
-  });
-  assert.deepEqual(allocateVariableContextBudgets(100, 0, 1000), {
-    memoryBudget: 1000,
-    conversationBudget: 0,
-  });
-});
-
-test("allocateVariableContextBudgets splits proportionally", () => {
-  assert.deepEqual(allocateVariableContextBudgets(500, 500, 1000), {
-    memoryBudget: 500,
-    conversationBudget: 500,
-  });
-});
-
-test("allocateVariableContextBudgets floors a starved section at 48 tokens", () => {
-  assert.deepEqual(allocateVariableContextBudgets(1, 999, 1000), {
-    memoryBudget: 48,
-    conversationBudget: 952,
-  });
-});
-
-test("allocateVariableContextBudgets caps the floor at a quarter of a small budget", () => {
-  // With totalBudget=100 the floor is min(48, 25) = 25, not 48.
-  assert.deepEqual(allocateVariableContextBudgets(1, 999, 100), {
-    memoryBudget: 25,
-    conversationBudget: 75,
-  });
-});
-
-test("allocateVariableContextBudgets never exceeds the total budget", () => {
-  for (const [m, c, total] of [
-    [1, 999, 1000],
-    [500, 500, 1000],
-    [1, 999, 100],
-    [999, 1, 640],
-    [7, 3, 64],
-  ] as const) {
-    const out = allocateVariableContextBudgets(m, c, total);
-    assert.ok(
-      out.memoryBudget + out.conversationBudget <= total,
-      `${m}/${c}/${total} allocated ${out.memoryBudget}+${out.conversationBudget}`,
-    );
-  }
 });
 
 // --- modelContextWindowTokens ---

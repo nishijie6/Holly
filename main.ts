@@ -91,7 +91,9 @@ import {
   type ProactiveWorldObservationRequest,
 } from "./proactive-engine.js";
 import {
+  resolveWorldObservationBroadcastGroupId,
   runAutonomyLoop,
+  worldObservationBroadcastGroupIds,
   type ArchiveWorkKind,
   type AutonomyArchiveComposeRequest,
   type AutonomyArchiveWriteRequest,
@@ -143,7 +145,6 @@ import {
   sanitizeConversationMessages,
   formatTopicTimestamp,
   compressMemoryPrompt,
-  allocateVariableContextBudgets,
   modelContextWindowTokens,
 } from "./context-budget.js";
 import {
@@ -185,6 +186,7 @@ import {
   buildAutonomyJudgmentPrompt,
   buildMemoryReflectionPrompt,
   buildWorldObservationBroadcastPrompt,
+  selectBroadcastItems,
 } from "./autonomy-prompts.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 import {
@@ -246,6 +248,11 @@ import {
 
 type MonitorEntryKind = "incoming" | "outgoing" | "status" | "error" | "assistant";
 
+// 判断类条目（焦点循环收尾、老管线的 Model Reply）的结局。只有这两种条目带它：
+// 流水里别的 kind 已经各自说明了自己是什么，唯独「判断」这一种，看的人真正要找的
+// 是「这一轮开没开口」，而那从 kind 上看不出来——焦点循环的收尾条目全是 status。
+type MonitorEntryOutcome = "reply" | "silent";
+
 type MonitorConnectionState = "connecting" | "open" | "closed" | "error";
 
 // 监控页左侧那条流水里的一行。body 是给人读的多行文本，不是结构化数据——
@@ -257,6 +264,7 @@ type MonitorEntry = {
   body: string;
   timestamp: string;
   label?: string;
+  outcome?: MonitorEntryOutcome;
 };
 
 type MonitorStatus = {
@@ -639,6 +647,25 @@ const DEFAULT_CONTEXT_COMPRESS_THRESHOLD_TOKENS = 120000;
 const MIN_CONTEXT_LIMIT_TOKENS = 128;
 // Headroom left below the model's input window for estimation drift + output.
 const CONTEXT_MODEL_WINDOW_MARGIN_TOKENS = 16_000;
+// 易变尾部（检索到的记忆 + 其它群动态横幅 + 当前这批消息）在预算里占的固定配额。
+//
+// 这里用常量而不是实测长度，是这条路由的缓存能不能复用的关键。尾部本身永远在
+// 缓存断点之后，怎么变都不碰前缀——但它的「长度」曾经会顺着预算传导下去：尾部
+// 占得多，留给历史的预算就少，compressConversationTurns 保留原文的起点就往后
+// 挪，于是被缓存的那段时间线整体平移，摘要块也换了跨度。前缀一移，整条路由的
+// 缓存条目就作废，每次请求都按全价重读。预热路径传空记忆、空当前消息，实测预算
+// 天然比真实回复宽，两者因此永远算不出同一个窗口，互相砸缓存。
+//
+// 换成常量之后，历史窗口只取决于系统提示词和这两个数，与本次检索命中几条、这批
+// 消息有多长都无关——同一个群的相邻请求于是能落在同一个前缀上。代价是固定让出
+// 这么多 token 的历史，即使这次尾部只用了几百；这个交换是划算的，因为省下的是
+// 整个前缀的重复计费。
+//
+// 超出配额不会报错：记忆由 compressMemoryPrompt 压进上限，当前消息若真的撑破了
+// 整体预算，prepareModelRequest 的第 3、4 级降级仍会按硬上限截断它。
+const MEMORY_PROMPT_BUDGET_TOKENS = 2_000;
+const CURRENT_MESSAGE_BUDGET_TOKENS = 4_000;
+const VOLATILE_TAIL_BUDGET_TOKENS = MEMORY_PROMPT_BUDGET_TOKENS + CURRENT_MESSAGE_BUDGET_TOKENS;
 // MODEL_DECISION_PROMPT / MODEL_DECISION_JSON_SCHEMA / buildModelSystemPrompt now
 // live in decision-prompt.ts (imported above) so smokes/tests can exercise the
 // exact production prompt without importing this self-starting entrypoint.
@@ -721,6 +748,7 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldObservationDedupWindowMs: 7 * 24 * 60 * 60 * 1000,
   worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
   worldTopicQuerySuffixOverrides: {},
+  worldTopicBroadcastGroupOverrides: {},
   memoryReflectionEnabled: false,
   memoryReflectionIntervalMs: 60 * 60 * 1000,
   memoryReflectionRetryMs: 15 * 60 * 1000,
@@ -1006,6 +1034,19 @@ function readOptionalGroupId(value: unknown, defaultValue: string | null): strin
   return Number.isSafeInteger(numeric) && numeric > 0 ? normalized : defaultValue;
 }
 
+// 话题 → 群号。不能复用 readStringRecord：YAML 里没加引号的群号会被解析成数字，而
+// readStringRecord 只收字符串，这一项会被悄悄丢掉，话题落回默认群——发错了群却没有任何提示。
+// 这里数字和字符串都接受，逐项按群号校验；不是合法群号的项才丢弃。
+function readGroupIdRecord(value: unknown, defaultValue: Record<string, string>): Record<string, string> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return defaultValue;
+  const record: Record<string, string> = {};
+  for (const [topic, item] of Object.entries(value as Record<string, unknown>)) {
+    const groupId = readOptionalGroupId(item, null);
+    if (groupId) record[topic.trim()] = groupId;
+  }
+  return record;
+}
+
 // Read the optional `proactive:` config section; any missing/invalid field falls
 // back to DEFAULT_PROACTIVE_CONFIG. Durations are authored in minutes for
 // readability and converted to ms here. Hot-reloaded by the config watcher (P4).
@@ -1054,6 +1095,7 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
     ...DEFAULT_AUTONOMY_CONFIG,
     worldTopics: [...DEFAULT_AUTONOMY_CONFIG.worldTopics],
     worldTopicQuerySuffixOverrides: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicQuerySuffixOverrides },
+    worldTopicBroadcastGroupOverrides: { ...DEFAULT_AUTONOMY_CONFIG.worldTopicBroadcastGroupOverrides },
   };
   if (!existsSync(configPath)) return base;
 
@@ -1100,6 +1142,10 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
     worldTopicQuerySuffixOverrides: readStringRecord(
       a.world_topic_query_suffix_overrides,
       base.worldTopicQuerySuffixOverrides,
+    ),
+    worldTopicBroadcastGroupOverrides: readGroupIdRecord(
+      a.world_topic_broadcast_group_overrides,
+      base.worldTopicBroadcastGroupOverrides,
     ),
     memoryReflectionEnabled:
       typeof a.memory_reflection_enabled === "boolean"
@@ -1542,64 +1588,25 @@ function compressConversationTurns(turns: readonly ConversationTurn[], budgetTok
   }];
 }
 
-// 在「记忆」和「对话」之间分配同一份可变预算。
+// 把记忆块和历史各自压进各自的配额，两者不再共享一个总预算。
 //
-// 为什么要试三轮：两边都按分配额压过之后，实际结果仍可能超——压缩本身是有
-// 下限的（一条消息压不到 0），所以先按分配额各压一次，超了就把没用完的额度
-// 让给对方再压一次。三轮之后不再纠结，交给调用方的下一级兜底。
+// 曾经这里是按 token 占比切分的：记忆多检索出几条，历史分到的预算就少几百，
+// compressConversationTurns 保留原文的起点就往后挪几条——而那个起点决定了被缓存
+// 的前缀长什么样。于是「这次想起了什么」这种每请求都不同的东西，隔着预算把缓存
+// 前缀推着走。现在两条预算互不相干：历史窗口只随历史本身增长而动。
+//
+// 两个压缩器各自都保证不超过自己的配额（compressMemoryPrompt 走
+// compactTextToTokenBudget，compressConversationTurns 末尾有截断兜底），所以这里
+// 不再需要原先那几级「压完再互相让一让」的对账。
 function fitVariableContextToBudget(
   memoryPrompt: string,
   conversationTurns: readonly ConversationTurn[],
-  totalBudget: number,
+  conversationBudget: number,
+  memoryBudget: number,
 ): { memoryPrompt: string; conversationMessages: LlmMessage[] } {
-  const cleanedMemoryPrompt = memoryPrompt.trim();
-  const formattedConversation = formatConversationTurnsForModel(conversationTurns);
-  if (totalBudget <= 0) {
-    return { memoryPrompt: "", conversationMessages: [] };
-  }
-
-  const memoryTokens = estimateTextTokens(cleanedMemoryPrompt);
-  const conversationTokens = estimateMessagesTokens(formattedConversation);
-  if (memoryTokens + conversationTokens <= totalBudget) {
-    return {
-      memoryPrompt: cleanedMemoryPrompt,
-      conversationMessages: formattedConversation,
-    };
-  }
-
-  const { memoryBudget, conversationBudget } = allocateVariableContextBudgets(
-    memoryTokens,
-    conversationTokens,
-    totalBudget,
-  );
-
-  let compactMemoryPrompt = compressMemoryPrompt(cleanedMemoryPrompt, memoryBudget);
-  let compactConversationMessages = compressConversationTurns(conversationTurns, conversationBudget);
-
-  let total = estimateTextTokens(compactMemoryPrompt) + estimateMessagesTokens(compactConversationMessages);
-  if (total <= totalBudget) {
-    return {
-      memoryPrompt: compactMemoryPrompt,
-      conversationMessages: compactConversationMessages,
-    };
-  }
-
-  const memoryOnlyBudget = Math.max(0, totalBudget - estimateMessagesTokens(compactConversationMessages));
-  compactMemoryPrompt = compressMemoryPrompt(cleanedMemoryPrompt, memoryOnlyBudget);
-  total = estimateTextTokens(compactMemoryPrompt) + estimateMessagesTokens(compactConversationMessages);
-  if (total <= totalBudget) {
-    return {
-      memoryPrompt: compactMemoryPrompt,
-      conversationMessages: compactConversationMessages,
-    };
-  }
-
-  const conversationOnlyBudget = Math.max(0, totalBudget - estimateTextTokens(compactMemoryPrompt));
-  compactConversationMessages = compressConversationTurns(conversationTurns, conversationOnlyBudget);
-
   return {
-    memoryPrompt: compactMemoryPrompt,
-    conversationMessages: compactConversationMessages,
+    memoryPrompt: compressMemoryPrompt(memoryPrompt.trim(), Math.max(0, memoryBudget)),
+    conversationMessages: compressConversationTurns(conversationTurns, Math.max(0, conversationBudget)),
   };
 }
 
@@ -1657,11 +1664,17 @@ function prepareModelRequest(
   let messages = tailMessage ? [...conversationMessages, tailMessage] : [...conversationMessages];
   let estimatedTokens = estimateRequestTokens(systemPrompt, messages);
 
-  const bareTail = buildTailMessage("", currentMessage);
-  const fixedBudget = estimateSystemPromptTokens(systemPrompt) + (bareTail ? estimateMessageTokens(bareTail) : 0);
+  // 固定配额，不是实测尾部长度——见 VOLATILE_TAIL_BUDGET_TOKENS：这一步是历史
+  // 窗口稳不稳的分水岭。用实测值会让「这批消息有多长」传导到历史的起点上。
+  const fixedBudget = estimateSystemPromptTokens(systemPrompt) + VOLATILE_TAIL_BUDGET_TOKENS;
 
   const rebuildWithBudget = (variableBudget: number): void => {
-    const fitted = fitVariableContextToBudget(memoryPrompt, conversationTurns, variableBudget);
+    const fitted = fitVariableContextToBudget(
+      memoryPrompt,
+      conversationTurns,
+      variableBudget,
+      MEMORY_PROMPT_BUDGET_TOKENS,
+    );
     fittedMemoryPrompt = fitted.memoryPrompt;
     conversationMessages = fitted.conversationMessages;
     tailMessage = buildTailMessage(fittedMemoryPrompt, currentMessage);
@@ -3193,7 +3206,13 @@ function broadcastMonitorEvent(payload: MonitorEvent): void {
   }
 }
 
-function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, label?: string): MonitorEntry {
+function pushMonitorEntry(
+  kind: MonitorEntryKind,
+  title: string,
+  body: string,
+  label?: string,
+  outcome?: MonitorEntryOutcome,
+): MonitorEntry {
   const entry: MonitorEntry = {
     id: ++monitorEntryId,
     kind,
@@ -3201,6 +3220,7 @@ function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, l
     body,
     timestamp: new Date().toISOString(),
     ...(label ? { label } : {}),
+    ...(outcome ? { outcome } : {}),
   };
 
   // Holly's richest signal — prefix drift, watchdog restarts, compaction, every
@@ -3212,7 +3232,7 @@ function pushMonitorEntry(kind: MonitorEntryKind, title: string, body: string, l
   //
   // `id` is per-process and restarts at 1, so it is deliberately not written:
   // across restarts it is not a key, and looking like one would mislead.
-  monitorLog.append({ ts: entry.timestamp, kind, title, body, ...(label ? { label } : {}) });
+  monitorLog.append({ ts: entry.timestamp, kind, title, body, ...(label ? { label } : {}), ...(outcome ? { outcome } : {}) });
 
   monitorHistory = [...monitorHistory.slice(-(WS_HISTORY_LIMIT - 1)), entry];
   broadcastMonitorEvent({
@@ -4730,10 +4750,18 @@ async function sendToConversationKey(groupKey: string, message: string): Promise
   return sendGroupMessage(parsePositiveOneBotId(groupKey, "reply group_id"), message);
 }
 
+// onSent 只在消息真的发出去之后才触发——它挂在 sendToConversation 上，而那一步
+// 位于 canSend 闸门和上游调用之后。判断本轮「开没开口」必须用它，不能去数模型
+// 发起了几次 send_message：被只读模式挡下的、参数为空被拒的，都会留下 tool_use
+// 却没有一个字进群。
+//
 // roundConversationId 是唤起这一轮的会话，qq-tools 拿它识别过期焦点。这也是 runner
 // 必须每轮现建、不能缓存复用的原因：「本轮打开过会话」的记录活在 runner 里，复用
 // 就会让上一轮的一次打开放行这一轮的误发。
-function buildFocusToolRunner(roundConversationId: string): (call: LlmToolUseBlock) => Promise<string> {
+function buildFocusToolRunner(
+  roundConversationId: string,
+  onSent?: (conversationId: string, message: string) => void,
+): (call: LlmToolUseBlock) => Promise<string> {
   return createQqToolRunner({
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
@@ -4741,6 +4769,7 @@ function buildFocusToolRunner(roundConversationId: string): (call: LlmToolUseBlo
     sendToConversation: async (id, message) => {
       const messageId = await sendToConversationKey(id, message);
       await appendChatLog("assistant", message);
+      onSent?.(id, message);
       return messageId;
     },
     getFocus: focusConversationId,
@@ -4979,12 +5008,14 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
   const compacted = await compactLedgerIfNeeded(client);
 
   const startedAt = Date.now();
+  // 本轮真正进了群的话。空数组就是「看过、没开口」——思考面板据此上色。
+  const sentMessages: string[] = [];
   try {
     const result = await client.runToolLoop({
       expectRebuild: compacted,
       messages: [...conversationLedger.snapshot()],
       tools: [...QQ_TOOL_DEFINITIONS],
-      runTool: buildFocusToolRunner(groupKey),
+      runTool: buildFocusToolRunner(groupKey, (_conversationId, message) => sentMessages.push(message)),
       purpose: "focus-loop",
       cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
       // persona + focus 协议,不是 persona + 决策协议:见 focus-prompt.ts 开头。
@@ -5005,7 +5036,23 @@ async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]
         result.text.slice(0, 400),
       ].filter(Boolean).join("\n"),
       client.model,
+      sentMessages.length > 0 ? "reply" : "silent",
     );
+
+    // 焦点管线也要往思考时间线上记一笔。老的反应式路径一直在记，焦点管线接管
+    // 之后却没有跟上，于是「群消息判断」这一栏对当前流量是空的——面板看着像
+    // Holly 什么都没想过。outcome 取自 sentMessages 而不是模型说了什么：
+    // 判断这轮算不算「开口」的唯一凭据是有没有字真的进群。
+    await recordMonitorThought({
+      kind: "reactive",
+      title: `${latest.context.replyTargetType === "private" ? "私聊" : "群消息"}判断 · ${messages.length} 条未读`,
+      summary: result.text || "模型未提供思考摘要。",
+      groupId: groupKey,
+      outcome: sentMessages.length > 0 ? "reply" : "silent",
+      finalAnswer: sentMessages.join("\n\n"),
+      model: client.model,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     pushMonitorEntry("error", "Focus Loop Error", `conversation=${groupKey}\n${detail}`, client.model);
@@ -5299,6 +5346,7 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
     `Model Reply - ${formatElapsedDuration(startedAt, Date.now())}`,
     content,
     routedModelLabel,
+    decision.shouldReply && decision.finalAnswer ? "reply" : "silent",
   );
 
   if (!decision.shouldReply) {
@@ -6168,7 +6216,9 @@ async function translateWorldObservationForBroadcast(
   }
   const candidateUrls = candidates.map((candidate) => candidate.url);
 
-  let parsed: { intro?: unknown; items?: unknown } | null = null;
+  // 只有某次尝试挑出了至少一条能发的条目，这两个才会被填上。
+  let intro = "";
+  let validItems: Array<{ text: string; url: string }> = [];
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     // A retry deliberately carries less page chrome and fewer detail links.
     // This addresses the observed failure mode where 3 listing pages plus up
@@ -6202,41 +6252,51 @@ async function translateWorldObservationForBroadcast(
     }
 
     broadcastLatestLlmUsage(client);
+    let parsed: { intro?: unknown; items?: unknown };
     try {
-      const candidate = JSON.parse(unwrapJsonBlock(reply)) as { intro?: unknown; items?: unknown };
-      if (Array.isArray(candidate.items) && candidate.items.length > 0) {
-        parsed = candidate;
-        break;
-      }
-      pushMonitorEntry(
-        "status",
-        "World Observation Translate Empty",
-        `attempt=${attempt}\ntopic=${topic}\nRetrying with reduced context.`,
-      );
+      parsed = JSON.parse(unwrapJsonBlock(reply)) as { intro?: unknown; items?: unknown };
     } catch {
       pushMonitorEntry(
         "error",
         "World Observation Translate Failed",
         `attempt=${attempt}\nInvalid JSON: ${reply.slice(0, 200)}`,
       );
+      continue;
     }
-  }
-  if (!parsed) return summaryFallbackBroadcast(observation, recentItems, duplicateCandidatesRemoved);
 
-  const intro = typeof parsed.intro === "string" ? parsed.intro.trim() : "";
-  const rawItems = Array.isArray(parsed.items) ? parsed.items : [];
-  const validItems = rawItems
-    .map((item): { text: string; url: string } | null => {
-      if (!item || typeof item !== "object") return null;
-      const record = item as Record<string, unknown>;
-      const text = typeof record.text === "string" ? record.text.trim() : "";
-      const url = typeof record.url === "string" ? record.url : "";
-      // Belt-and-suspenders: even though the schema enum should guarantee this,
-      // never let an unrecognized URL (a provider that ignores enum, say) through.
-      if (!text || !url || !candidateUrls.includes(url)) return null;
-      return { text, url };
-    })
-    .filter((item): item is { text: string; url: string } => item !== null);
+    // 被截断的条目在这里就剔掉，原因见 autonomy-prompts.ts 的 isTruncatedBroadcastText。
+    // 只要还剩一条完整的，就用这次的结果，只丢坏的；一条不剩才和「items 为空」一样重试，
+    // 两次都不行再退回下面的原文摘录。挑条目放在循环里而不是循环后，正是为了让「全被截断」
+    // 能走到重试——放在后面，它只会直接掉进摘录兜底。
+    const selection = selectBroadcastItems(parsed?.items, candidateUrls);
+    if (selection.items.length > 0) {
+      if (selection.truncatedTexts.length > 0) {
+        pushMonitorEntry(
+          "status",
+          "World Observation Truncated Items Dropped",
+          [
+            `attempt=${attempt}`,
+            `topic=${topic}`,
+            `kept=${selection.items.length} dropped=${selection.truncatedTexts.length}`,
+            ...selection.truncatedTexts,
+          ].join("\n"),
+        );
+      }
+      intro = typeof parsed?.intro === "string" ? parsed.intro.trim() : "";
+      validItems = selection.items;
+      break;
+    }
+    pushMonitorEntry(
+      "status",
+      selection.truncatedTexts.length > 0 ? "World Observation Translate Truncated" : "World Observation Translate Empty",
+      [
+        `attempt=${attempt}`,
+        `topic=${topic}`,
+        attempt < 2 ? "Retrying with reduced context." : "Falling back to the raw summary excerpt.",
+        ...selection.truncatedTexts,
+      ].join("\n"),
+    );
+  }
   if (validItems.length === 0) {
     return summaryFallbackBroadcast(observation, recentItems, duplicateCandidatesRemoved);
   }
@@ -6347,7 +6407,7 @@ async function maybeBroadcastWorldObservation(
   observation: ProactiveWorldObservation,
   observedAtIso: string,
 ): Promise<void> {
-  const targetGroupId = autonomyConfig.worldObservationBroadcastGroupId;
+  const targetGroupId = resolveWorldObservationBroadcastGroupId(autonomyConfig, topic);
   if (!targetGroupId) return;
 
   if (!isQqParticipationEnabled()) {
@@ -6390,8 +6450,15 @@ async function maybeBroadcastWorldObservation(
     }
   }
 
+  // 跨群去重：把所有播报目标群的历史合在一起判，原因见 autonomy-engine.ts 的
+  // worldObservationBroadcastGroupIds。本次的目标群本来就在其中，这里先放进去只是保险。
+  const dedupGroupKeys = new Set<string>([groupKey]);
+  for (const id of worldObservationBroadcastGroupIds(autonomyConfig)) {
+    const key = normalizeConversationGroupKey(id);
+    if (key) dedupGroupKeys.add(key);
+  }
   const recentItems = extractRecentBroadcastItems(
-    conversationHistoryByGroup.get(groupKey) ?? [],
+    [...dedupGroupKeys].flatMap((key) => conversationHistoryByGroup.get(key) ?? []),
     Date.now(),
     autonomyConfig.worldObservationDedupWindowMs,
   );
@@ -8399,6 +8466,22 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       --th-qq: #0284c7;
       --th-proactive: #d97706;
       --th-autonomy: #16a34a;
+      /* 判断卡专用的第六、七支：开口用玫红压住整栏，沉默退成灰。
+         灰是有意的——一屏里大部分判断都是沉默，让它们安静地退到背景，
+         剩下的玫红就是「这一轮她说话了」，扫一眼就能挑出来。 */
+      --th-reply: #db2777;
+      --th-silent: #94a3b8;
+
+      /* Live Messages 里判断条目的颜色，和思考卡那两支分开定义，因为环境不同：
+         流水在日间只靠 -50 级淡底色区分各类条目，左条退化成 1px 边框。拿同一支灰去标
+         「沉默」会直接混进满屏的 status 里。所以这里用深一档的 -100 级底色，外加一条
+         4px 左条，让判断从例行噪声里浮出来。沉默选琥珀：流水里没有任何 kind 用暖色，
+         它不会和收发消息、错误撞色。 */
+      --oc-bar-w: 4px;
+      --oc-reply-bar: #db2777;    --oc-reply-tint: #fce7f3;   --oc-reply-fg: #be185d;
+      --oc-reply-badge-bg: #fff;  --oc-reply-badge-fg: #be185d;
+      --oc-silent-bar: #d97706;   --oc-silent-tint: #fef3c7;  --oc-silent-fg: #92400e;
+      --oc-silent-badge-bg: #fff; --oc-silent-badge-fg: #b45309;
 
       /* 群聊消息行 */
       --msg-user-bg: #f0f9ff;      --msg-user-bar: #38bdf8;  --msg-user-fg: #0369a1;
@@ -8583,6 +8666,18 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       --th-qq: hsl(var(--foreground));
       --th-proactive: hsl(var(--signal));
       --th-autonomy: hsl(var(--scheduler));
+      /* --cost 是这套色板里唯一没被任何 kind 认领的一支，拿来当「开口」不会撞色；
+         沉默退到 muted-foreground，和日间那支灰同一个用意。 */
+      --th-reply: hsl(var(--cost));
+      --th-silent: hsl(var(--muted-foreground));
+      /* 夜间流水是一摞共用黑线的实心块，左条本来就有 10px，底色是无色相的 card/raised。
+         判断条目沿用这条左条，底色叠一层自身色相的透明度，徽标按夜间惯例整块填实。
+         --cost 与 --scheduler 在流水里都没有 kind 认领。 */
+      --oc-bar-w: var(--bar-w);
+      --oc-reply-bar: hsl(var(--cost));       --oc-reply-tint: hsl(var(--cost) / 0.16);       --oc-reply-fg: hsl(var(--cost));
+      --oc-reply-badge-bg: hsl(var(--cost));  --oc-reply-badge-fg: hsl(var(--cost-foreground));
+      --oc-silent-bar: hsl(var(--scheduler)); --oc-silent-tint: hsl(var(--scheduler) / 0.14); --oc-silent-fg: hsl(var(--scheduler));
+      --oc-silent-badge-bg: hsl(var(--scheduler)); --oc-silent-badge-fg: hsl(var(--scheduler-foreground));
 
       --msg-user-bg: hsl(var(--card));   --msg-user-bar: hsl(var(--foreground)); --msg-user-fg: hsl(var(--foreground));
       --msg-asst-bg: transparent;        --msg-asst-bar: hsl(var(--llm));        --msg-asst-fg: hsl(var(--llm));
@@ -8862,6 +8957,23 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     /* 日间是淡红底，夜间直接上墙：整块填实正红 */
     .entry.error { background: var(--tint-error); color: var(--tint-error-fg); }
     .entry.error .entry-h { color: var(--tint-error-fg); }
+    /* 判断条目按结局上色，压过 kind 给的颜色，所以放在 kind 规则之后。错误条目除外：
+       撞到轮次上限的循环哪怕发过话，它首先是个故障，红色不能被盖掉，徽标照样标出结局。 */
+    .entry.oc-reply:not(.error) {
+      border-left-width: var(--oc-bar-w); border-left-color: var(--oc-reply-bar); background: var(--oc-reply-tint);
+    }
+    .entry.oc-silent:not(.error) {
+      border-left-width: var(--oc-bar-w); border-left-color: var(--oc-silent-bar); background: var(--oc-silent-tint);
+    }
+    .entry.oc-reply:not(.error) .entry-h { color: var(--oc-reply-fg); }
+    .entry.oc-silent:not(.error) .entry-h { color: var(--oc-silent-fg); }
+    .oc-badge {
+      display: inline-block; margin-left: 8px; padding: 1px 7px; vertical-align: 1px;
+      border: 1px solid currentColor; border-radius: var(--radius-pill);
+      font-size: 10px; letter-spacing: 0.04em;
+    }
+    .oc-badge.oc-reply { background: var(--oc-reply-badge-bg); color: var(--oc-reply-badge-fg); border-color: var(--oc-reply-bar); }
+    .oc-badge.oc-silent { background: var(--oc-silent-badge-bg); color: var(--oc-silent-badge-fg); border-color: var(--oc-silent-bar); }
     .entry-h {
       display: flex; justify-content: space-between; gap: 8px; margin-bottom: 5px;
       font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase;
@@ -9005,6 +9117,16 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     .thought-card.qq_mode { border-left-color: var(--th-qq); }
     .thought-card.proactive { border-left-color: var(--th-proactive); }
     .thought-card.autonomy { border-left-color: var(--th-autonomy); }
+    /* 判断卡（reactive）的左条改由「开没开口」决定，而不是 kind。
+       别的 kind 各自只有一种结局，颜色回答「这是哪一类思考」就够了；判断卡不是——
+       同样是判断，说了和没说是两件事，而那正是翻这一栏时要找的东西。
+       reactive 原本没有自己的笔（落在 --th-default 上），所以这里改的是一支没人用的颜色。 */
+    .thought-card.reactive.oc-reply { border-left-color: var(--th-reply); }
+    .thought-card.reactive.oc-silent { border-left-color: var(--th-silent); }
+    /* 胶囊跟着上色，兼顾只看得见颜色差异不够的情况：文字本身也说了结论。
+       不限定 reactive——主动开口判断也有同一组结局，标签语言应当一致。 */
+    .thought-meta span.oc-reply { border-color: var(--th-reply); color: var(--th-reply); }
+    .thought-meta span.oc-silent { border-color: var(--th-silent); color: var(--th-silent); }
     .thought-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
     .thought-title { font-size: var(--title-size); font-weight: var(--title-weight); line-height: 1.3; }
     .thought-time { flex-shrink: 0; font-size: 11px; color: hsl(var(--muted-foreground)); }
@@ -9298,7 +9420,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
           </div>
           <div v-if="!filteredThoughts.length" class="empty">还没有可展示的思考记录。</div>
           <div v-else class="thought-list">
-            <article v-for="thought in filteredThoughts" :key="thought.id" class="thought-card" :class="thought.kind">
+            <article v-for="thought in filteredThoughts" :key="thought.id" class="thought-card" :class="[thought.kind, outcomeClass(thought.outcome)]">
               <div class="thought-head">
                 <span class="thought-title">{{ thought.title }}</span>
                 <span class="thought-time">{{ fmtDateTime(thought.timestamp) }}</span>
@@ -9306,7 +9428,7 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
               <div class="thought-meta">
                 <span>{{ thoughtKindLabel(thought.kind) }}</span>
                 <span v-if="thought.groupId">群 {{ thought.groupId }}</span>
-                <span v-if="thought.outcome">{{ thoughtOutcomeLabel(thought.outcome) }}</span>
+                <span v-if="thought.outcome" :class="outcomeClass(thought.outcome)">{{ thoughtOutcomeLabel(thought.outcome) }}</span>
                 <span v-if="thought.model">{{ thought.model }}</span>
                 <span v-if="typeof thought.durationMs === 'number' && thought.durationMs > 0">{{ fmtDuration(thought.durationMs) }}</span>
               </div>
@@ -9422,9 +9544,9 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         <div class="chat-scroll" style="padding:12px;">
           <div v-if="!entries.length" class="empty" style="margin:8px;">Waiting for messages&hellip;</div>
           <template v-else>
-            <article v-for="e in entries" :key="e.id" class="entry" :class="e.kind">
+            <article v-for="e in entries" :key="e.id" class="entry" :class="[e.kind, outcomeClass(e.outcome)]">
               <div class="entry-h">
-                <span>{{ e.label || e.kind }} &mdash; {{ e.title }}</span>
+                <span>{{ e.label || e.kind }} &mdash; {{ e.title }}<span v-if="e.outcome" class="oc-badge" :class="outcomeClass(e.outcome)">{{ thoughtOutcomeLabel(e.outcome) }}</span></span>
                 <span>{{ fmtTime(e.timestamp) }}</span>
               </div>
               <pre>{{ fmtBody(e.body) }}</pre>
@@ -9882,6 +10004,15 @@ createApp({
       return '群消息判断';
     }
 
+    // 只有「开口 / 沉默」这一组结局值得上色。其余 outcome（写入记忆、完成观察……）
+    // 各自属于只有一种结局的 kind，给它们上色只会把这一栏变成调色板。
+    // 思考卡和 Live Messages 的判断条目共用它：类名两处一致，颜色各自定义。
+    function outcomeClass(outcome) {
+      if (outcome === 'reply' || outcome === 'proactive_live') return 'oc-reply';
+      if (outcome === 'silent' || outcome === 'proactive_shadow') return 'oc-silent';
+      return '';
+    }
+
     function thoughtOutcomeLabel(outcome) {
       var labels = {
         reply: '选择回复', silent: '保持沉默', active: '主动接入', observe: '仅观察', offline: '离线',
@@ -10262,7 +10393,7 @@ createApp({
       theme, toggleTheme,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
+      fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, outcomeClass, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
       loadThoughts, loadUsageHistory, loadArchive
     };
@@ -10416,7 +10547,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} reflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_interval=${Math.round(autonomyConfig.worldObservationIntervalMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupId(autonomyConfig, topic) ?? "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",

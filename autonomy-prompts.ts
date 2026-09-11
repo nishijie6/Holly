@@ -28,6 +28,8 @@ export function buildWorldObservationBroadcastPrompt(
     "Each item's `url` MUST be copied EXACTLY (character for character) from the numbered candidate list below — pick the entry that most specifically matches that item (a specific article/detail link) over a generic page-source entry, unless the page source is the only candidate for that item.",
     "Never invent, shorten, or rewrite a URL — only the candidate list's exact strings are valid.",
     "No markdown, no @ mentions. Keep each item's text under 120 Chinese characters.",
+    'Inside intro and text, mark quoted names or phrases with 「」. Never use ASCII double quotes (") there: an unescaped one ends the JSON string and the rest of the sentence is silently lost.',
+    "End every item's text with sentence-ending punctuation (。！？). An item that stops without it is treated as cut off and dropped.",
     "If the source text is noisy, keep only the most useful concrete points.",
     "When at least one concrete factual item is present, items MUST contain at least one entry; do not return an empty items array merely because some sources are listing pages or noisy.",
     "",
@@ -40,6 +42,62 @@ export function buildWorldObservationBroadcastPrompt(
     "world observation:",
     observation.summary,
   ].join("\n");
+}
+
+// ---------- 播报条目的完整性检查 ----------
+//
+// 播报走强约束的 JSON 结构化输出。模型在 text 里写出一个没转义的英文双引号时，
+// 语法会把它当成字符串的结尾：后半句被丢掉，JSON 却依然合法，所以既不报错也不重试，
+// 半句话就这样发进了群。2026-09-05 到 09-10 已发出的 228 个条目里有 17 个是这样断的，
+// 断点几乎都落在马上要开引号的地方（号称、被评、喊出、分享《）。
+//
+// 上面的提示词已经要求用「」、并以句末标点收尾，这里是兜底：照做的条目必然以句末标点
+// 或收尾的括号、引号结束；被截断的条目停在一个字、逗号或开括号上。这条规则在那 228 个
+// 条目上拦下了全部 17 个截断，其余 211 个一个没误伤。回复链路的
+// detectIncompleteFinalAnswer 查的是「因为、但是」这类口语悬空词，拿同一批数据跑只抓到
+// 1 个，所以播报不复用它。
+//
+// 不检查 intro：引导语照例以「：」收尾，套用这条规则会把几乎每一条都拦下，而历史上
+// 也没有一条引导语被截断过。
+const BROADCAST_TEXT_COMPLETE_ENDING = /(?:[。！？!?.…~～」』》】）)”’"']|\p{Extended_Pictographic})\uFE0F?$/u;
+
+// 空字符串不算截断——它根本不是一条内容，由 selectBroadcastItems 当作无效条目丢掉。
+export function isTruncatedBroadcastText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.length > 0 && !BROADCAST_TEXT_COMPLETE_ENDING.test(trimmed);
+}
+
+export type WorldObservationBroadcastItem = { text: string; url: string };
+
+export type WorldObservationBroadcastItemSelection = {
+  items: WorldObservationBroadcastItem[];
+  // 因截断被丢掉的正文，原样交给监控页：这是事后唯一能看出「模型写坏了」的地方。
+  truncatedTexts: string[];
+};
+
+// 从模型返回的 items 里挑出能发的条目。只丢坏的那几条，同一次返回里完整的条目照常保留；
+// 调用方只在一条都不剩时才需要重试，或退回原文摘录。
+export function selectBroadcastItems(
+  rawItems: unknown,
+  candidateUrls: readonly string[],
+): WorldObservationBroadcastItemSelection {
+  const selection: WorldObservationBroadcastItemSelection = { items: [], truncatedTexts: [] };
+  if (!Array.isArray(rawItems)) return selection;
+  for (const item of rawItems) {
+    if (!item || typeof item !== "object") continue;
+    const record = item as Record<string, unknown>;
+    const text = typeof record.text === "string" ? record.text.trim() : "";
+    const url = typeof record.url === "string" ? record.url : "";
+    // 链接必须逐字来自候选列表。schema 的 enum 本该保证这一点，但换成不认 enum 的服务端
+    // 时就不再成立，这道检查不能省。
+    if (!text || !url || !candidateUrls.includes(url)) continue;
+    if (isTruncatedBroadcastText(text)) {
+      selection.truncatedTexts.push(text);
+      continue;
+    }
+    selection.items.push({ text, url });
+  }
+  return selection;
 }
 
 export const MEMORY_REFLECTION_SYSTEM_PROMPT =

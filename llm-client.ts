@@ -366,7 +366,24 @@ async function saveConfig(configPath: string, config: AppConfig): Promise<void> 
   await writeFile(configPath, body, "utf-8");
 }
 
-function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: string): {
+// Hoist system-role turns into the system prompt and normalise the rest.
+//
+// The emptiness test has to match buildClaudeMessages': a turn is empty only
+// when it has neither prose NOR structural blocks. Testing `content` alone
+// predates tool calling and quietly destroyed every tool transcript that came
+// through here — a tool_result turn is `{content: "", blocks: [...]}`, so it was
+// dropped outright, and a turn that survived was rebuilt as `{role, content}`,
+// which threw its blocks away. runToolLoop feeds the ConversationLedger through
+// this function, so every focus loop began by flattening its own history:
+// the model lost which tools it had called and what came back, and the prompt
+// cache lost the prefix (the flattened shape can never match the structural one
+// the previous loop ended on, so every route rebuilt on the next call).
+//
+// It failed silently rather than as a 400 because the damage was symmetric:
+// tool_result turns are always empty and were dropped, and an assistant turn
+// that kept its prose lost its tool_use with it — so no orphaned id ever
+// reached the API to complain about.
+export function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: string): {
   systemPrompt: string;
   contents: LlmMessage[];
 } {
@@ -375,18 +392,22 @@ function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: string): {
 
   for (const message of messages) {
     const content = message.content.trim();
-    if (!content) {
+    const blocks = messageHasStructuralBlocks(message) ? message.blocks : undefined;
+    if (!content && !blocks) {
       continue;
     }
 
     if (message.role === "system") {
-      systemBlocks.push(content);
+      // A system turn carries prose by definition; structural blocks have no
+      // meaning there, so hoisting the text and dropping the rest is correct.
+      if (content) systemBlocks.push(content);
       continue;
     }
 
     contents.push({
       role: message.role,
       content,
+      ...(blocks ? { blocks } : {}),
     });
   }
 

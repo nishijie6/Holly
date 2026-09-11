@@ -6,6 +6,7 @@ import {
   digestClaudeCachedPrefix,
   parseClaudeToolUses,
   runClaudeToolLoop,
+  splitSystemPrompt,
 } from "../llm-client.js";
 import type { LlmToolDefinition, LlmToolUseBlock } from "../llm-client.js";
 import type { TokenUsageBreakdown } from "../token-usage.js";
@@ -357,4 +358,67 @@ test("describeTransportError names the cause, not undici's wrapper", async () =>
   );
   // Non-Errors must not crash the logger they were thrown into.
   assert.equal(describeTransportError("plain string"), "plain string");
+});
+
+// --- splitSystemPrompt preserves tool transcripts ---------------------------
+
+// 这一组钉的是一个静默了很久的缺陷：splitSystemPrompt 曾经只看 content 判空，
+// 于是 runToolLoop 每次开跑前都会把 ConversationLedger 里的工具轨迹压平——
+// tool_result 回合（content 恒为 ""）被整条丢掉，侥幸活下来的回合也被重建成
+// {role, content} 而丢掉 blocks。它不报 400，因为破坏是对称的：tool_use 和它的
+// tool_result 一起消失，没有孤儿 id 能让 API 抱怨。代价是模型看不见自己调过什么
+// 工具、拿回了什么，以及每次调用都必然重建缓存前缀。
+
+test("splitSystemPrompt keeps a tool_result turn whose only content is blocks", () => {
+  const results = [{ type: "tool_result", toolUseId: "t1", content: "晴" }] as const;
+  const { contents } = splitSystemPrompt(
+    [{ role: "user", content: "", blocks: [...results] as never }],
+    "persona",
+  );
+  assert.equal(contents.length, 1, "tool_result 回合不能因为 content 为空就被丢弃");
+  assert.deepEqual(contents[0].blocks, [...results]);
+});
+
+test("splitSystemPrompt keeps the tool_use blocks of an assistant turn that also has prose", () => {
+  const uses = [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "北京" } }] as const;
+  const { contents } = splitSystemPrompt(
+    [{ role: "assistant", content: "我查一下", blocks: [...uses] as never }],
+    "persona",
+  );
+  assert.equal(contents[0].content, "我查一下");
+  assert.deepEqual(contents[0].blocks, [...uses], "blocks 必须原样带过去，否则工具轨迹就断了");
+});
+
+test("splitSystemPrompt still drops a turn with neither prose nor blocks", () => {
+  const { contents } = splitSystemPrompt([{ role: "user", content: "   " }], "persona");
+  assert.deepEqual(contents, []);
+});
+
+test("splitSystemPrompt still hoists system turns into the prompt", () => {
+  const { systemPrompt, contents } = splitSystemPrompt(
+    [{ role: "system", content: "额外规则" }, { role: "user", content: "你好" }],
+    "persona",
+  );
+  assert.equal(systemPrompt, "persona\n\n额外规则");
+  assert.deepEqual(contents, [{ role: "user", content: "你好" }]);
+});
+
+// 真正会回归的那条：一轮工具循环结束后的记录，再喂回 splitSystemPrompt，
+// 必须还原成同一份结构——否则下一次调用的缓存前缀和上一次对不上。
+test("a tool transcript survives a round-trip through splitSystemPrompt unchanged", () => {
+  const transcript = [
+    { role: "user" as const, content: "北京天气?" },
+    {
+      role: "assistant" as const,
+      content: "",
+      blocks: [{ type: "tool_use", id: "t1", name: "get_weather", input: { city: "北京" } }] as never,
+    },
+    {
+      role: "user" as const,
+      content: "",
+      blocks: [{ type: "tool_result", toolUseId: "t1", content: "晴" }] as never,
+    },
+  ];
+  const { contents } = splitSystemPrompt(transcript, "persona");
+  assert.deepEqual(contents, transcript);
 });

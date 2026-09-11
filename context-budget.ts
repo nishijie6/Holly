@@ -1,9 +1,11 @@
-// Token estimation, text compaction, and context-budget allocation.
-// Extracted verbatim from main.ts; behaviour is deliberately unchanged.
+// Token estimation and text compaction. Extracted verbatim from main.ts.
+//
+// 这里只负责「量一段文本有多大」和「把它压进给定的配额」，不再决定谁该拿多少
+// 配额：曾经的 allocateVariableContextBudgets 按占比在记忆和历史之间切分总预算，
+// 而那正是让缓存前缀跟着每请求的记忆长短平移的那一步。现在配额由 main.ts 的常量
+// 直接给定，见 MEMORY_PROMPT_BUDGET_TOKENS。
 
 import type { LlmMessage } from "./llm-client.js";
-
-const CONTEXT_MIN_SECTION_BUDGET = 48;
 
 export function estimateTextTokens(text: string): number {
   const normalized = text.trim();
@@ -173,43 +175,6 @@ export function compressMemoryPrompt(memoryPrompt: string, budgetTokens: number)
   }
 
   return result === header ? compactTextToTokenBudget(header, budgetTokens) : result;
-}
-
-export function allocateVariableContextBudgets(
-  memoryTokens: number,
-  conversationTokens: number,
-  totalBudget: number,
-): { memoryBudget: number; conversationBudget: number } {
-  if (totalBudget <= 0) {
-    return { memoryBudget: 0, conversationBudget: 0 };
-  }
-
-  if (memoryTokens <= 0) {
-    return { memoryBudget: 0, conversationBudget: totalBudget };
-  }
-
-  if (conversationTokens <= 0) {
-    return { memoryBudget: totalBudget, conversationBudget: 0 };
-  }
-
-  const totalTokens = memoryTokens + conversationTokens;
-  let memoryBudget = Math.round(totalBudget * (memoryTokens / totalTokens));
-  let conversationBudget = totalBudget - memoryBudget;
-  const minimumSectionBudget = Math.min(CONTEXT_MIN_SECTION_BUDGET, Math.floor(totalBudget / 4));
-
-  if (memoryBudget < minimumSectionBudget) {
-    const delta = minimumSectionBudget - memoryBudget;
-    memoryBudget += delta;
-    conversationBudget = Math.max(0, conversationBudget - delta);
-  }
-
-  if (conversationBudget < minimumSectionBudget) {
-    const delta = minimumSectionBudget - conversationBudget;
-    conversationBudget += delta;
-    memoryBudget = Math.max(0, memoryBudget - delta);
-  }
-
-  return { memoryBudget, conversationBudget };
 }
 
 export function modelContextWindowTokens(model: string): number {

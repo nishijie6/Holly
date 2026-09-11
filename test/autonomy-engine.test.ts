@@ -2,7 +2,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  resolveWorldObservationBroadcastGroupId,
   runAutonomyLoop,
+  worldObservationBroadcastGroupIds,
   type AutonomyConfig,
   type AutonomyDeps,
   type AutonomyJudgmentDecision,
@@ -505,4 +507,39 @@ test("短路不写状态：跳过的那一轮不该看起来像做过什么", as
   const before = JSON.stringify(state);
   await runAutonomyLoop(baseDeps({ state, hasProactiveWork: () => false }));
   assert.equal(JSON.stringify(state), before);
+});
+
+// ---------- 世界观察播报的目标群 ----------
+
+test("a topic with its own broadcast group goes there, and every other topic goes to the default group", () => {
+  const config = {
+    worldObservationBroadcastGroupId: "20000001",
+    worldTopicBroadcastGroupOverrides: { 数学趣题: "20000002" },
+  };
+
+  assert.equal(resolveWorldObservationBroadcastGroupId(config, "数学趣题"), "20000002");
+  assert.equal(resolveWorldObservationBroadcastGroupId(config, "天文学"), "20000001");
+  assert.equal(
+    resolveWorldObservationBroadcastGroupId({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} }, "天文学"),
+    null,
+  );
+});
+
+// 去重把这些群的历史合在一起看；漏掉一个，那个群发过的内容就会在别的群再发一遍。
+test("worldObservationBroadcastGroupIds lists every group a broadcast can land in, once each", () => {
+  assert.deepEqual(
+    worldObservationBroadcastGroupIds({
+      worldObservationBroadcastGroupId: "20000001",
+      worldTopicBroadcastGroupOverrides: { 人工智能: "20000001", 天文学: "20000001", 数学趣题: "20000002" },
+    }),
+    ["20000001", "20000002"],
+  );
+  assert.deepEqual(
+    worldObservationBroadcastGroupIds({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: { 数学趣题: "20000002" } }),
+    ["20000002"],
+  );
+  assert.deepEqual(
+    worldObservationBroadcastGroupIds({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} }),
+    [],
+  );
 });
