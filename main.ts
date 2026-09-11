@@ -173,8 +173,12 @@ import {
 } from "./log-retention.js";
 import {
   DEFAULT_LEDGER_COMPACTION_OPTIONS,
-  buildLedgerSummaryPrompt,
+  LEDGER_COMPACTION_MAX_ROUNDS,
+  LEDGER_COMPACTION_TOOL_REFUSAL,
+  buildLedgerCompactionMessages,
+  extractLedgerSummary,
   planLedgerCompaction,
+  renderLedgerSummaryTurn,
 } from "./ledger-compaction.js";
 import { decideFocus } from "./focus-policy.js";
 import {
@@ -4920,7 +4924,8 @@ async function restoreConversationLedger(): Promise<void> {
  * that detector exists to catch.
  */
 async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
-  const plan = planLedgerCompaction(conversationLedger.snapshot(), DEFAULT_LEDGER_COMPACTION_OPTIONS);
+  const ledger = conversationLedger.snapshot();
+  const plan = planLedgerCompaction(ledger, DEFAULT_LEDGER_COMPACTION_OPTIONS);
   if (!plan) {
     return false;
   }
@@ -4928,12 +4933,24 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
   const startedAt = Date.now();
   let summary: string;
   try {
-    summary = await client.generateText({
+    // 和焦点循环共用前缀：同一份 system、同一套工具、整本账本原样照发，只在尾部多一条整理指令，
+    // 所以账本几乎全是缓存读取（见 ledger-compaction.ts）。工具必须带着，模型真去调就退回一句
+    // 「现在不能用」，只取它写出来的正文。cacheRoute 也用焦点那条：漂移检测会顺便验证这次请求
+    // 确实是在焦点前缀上往后接，哪天有人改坏了，监控里会出现 focus-loop 以外的 Prefix Drift。
+    const result = await client.runToolLoop({
+      messages: buildLedgerCompactionMessages(ledger, plan),
+      tools: [...QQ_TOOL_DEFINITIONS],
+      runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
       purpose: "ledger-compaction",
-      systemPrompt: "你在压缩自己的对话记录。只输出摘要正文，不要任何前后缀。",
-      messages: [{ role: "user", content: buildLedgerSummaryPrompt(plan.summarize) }],
-      cacheRoute: "ledger-compaction",
+      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+      maxRounds: LEDGER_COMPACTION_MAX_ROUNDS,
     });
+    broadcastLatestLlmUsage(client);
+    if (result.exhausted) {
+      throw new Error(`The model kept calling tools for ${result.rounds} rounds instead of writing the summary.`);
+    }
+    summary = extractLedgerSummary(result.text);
   } catch (error) {
     // A failed summary is not a reason to drop the transcript. Leaving it
     // oversized costs tokens; discarding it unsummarized loses the conversation.
@@ -4952,7 +4969,8 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
   }
 
   const before = conversationLedger.size;
-  conversationLedger.replaceFrontWithSummary(summary, plan.keep);
+  // 包进 <conversation_summary>：下一次压缩的指令靠这层标签认出上一份累计摘要，拿它当基线合并。
+  conversationLedger.replaceFrontWithSummary(renderLedgerSummaryTurn(summary), plan.keep);
   // The log must match memory, and this is a rewrite, not an append.
   await ledgerStore?.rewrite(conversationLedger.snapshot());
 
@@ -4961,6 +4979,7 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
     `Ledger Compacted - ${formatElapsedDuration(startedAt, Date.now())}`,
     [
       `turns ${before} -> ${conversationLedger.size} (summarized ${plan.summarize.length})`,
+      "The summary call reused the focus prefix; its cache read shows under purpose=ledger-compaction.",
       "The prompt-cache prefix is rebuilt from here; the next request pays full price once.",
       summary.slice(0, 300),
     ].join("\n"),
@@ -4969,7 +4988,18 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
   return true;
 }
 
+// 所有群共用一本账本，焦点循环一次只能跑一个。回复任务按群排队（reply:<群号>），不同群的批次会同时
+// 进来：两轮同时往账本里追加，一边的工具调用还没收到结果、另一边就追加注入，账本当场抛错；压缩更糟，
+// 生成摘要要花几十秒，这期间别的群追加进来的消息会被 replaceFrontWithSummary 一并覆盖。
+// 单独开一个队列，而不是在 modelRouteQueue 上多开一条路由：焦点循环本身就跑在 modelRouteQueue 的
+// 任务里，主动发言的 submitExclusive 要等所有路由排空，在同一个实例上嵌套提交会互相等死。
+const focusLoopQueue = new RouteQueue();
+
 async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
+  await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, () => runFocusLoopForBatch(messages));
+}
+
+async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): Promise<void> {
   const client = getDecisionLlmClient();
   if (!client) {
     pushMonitorEntry("error", "Focus Loop Skipped", "No decision LLM client is available.");
@@ -6861,9 +6891,10 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
 }
 
 // The autonomy routes cache a rolling world-observation window, so their prefix
-// legitimately rebuilds whenever a new observation arrives — roughly hourly.
-// Unannounced, each of those would reach the monitor as an error telling
-// someone to hunt for a volatile value that broke the prefix.
+// legitimately rebuilds whenever the window's start moves. Unannounced, each of
+// those would reach the monitor as an error telling someone to hunt for a
+// volatile value that broke the prefix.
+// 新观察到达不再算重建：稳定段按块发，新观察只是在后面多一块（见 StablePrefixLedger.changed）。
 const autonomyStablePrefixes = new StablePrefixLedger();
 
 // 窗口起点。进程内活着就行——重启后从 0 起算，第一次反思重建一次前缀，之后照常滞后。
@@ -6983,6 +7014,8 @@ async function reflectMemoryForAutonomy(
   // the breakpoint lands between the world-observation window and everything
   // that changes per tick. As one message there was nothing stable for it to
   // sit on and the whole 11k request was reread at full price.
+  // 稳定段再往下拆：指令一条、每条世界观察各一条（见 autonomy-prompts.ts 的 SplitPrompt）。
+  // 新观察只在后面追加一块，前面的块照样命中缓存。
   const prompt = buildMemoryReflectionPrompt(
     request.nowIso,
     request.reason,
@@ -6996,7 +7029,7 @@ async function reflectMemoryForAutonomy(
       purpose: "memory-reflection",
       systemPrompt: MEMORY_REFLECTION_SYSTEM_PROMPT,
       messages: [
-        { role: "user", content: prompt.stable },
+        ...prompt.stable.map((content) => ({ role: "user" as const, content })),
         { role: "user", content: prompt.volatile },
       ],
       jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
@@ -7640,7 +7673,7 @@ async function composeArchiveForAutonomy(
       purpose: "archive-composition",
       systemPrompt: ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
       messages: [
-        { role: "user", content: prompt.stable },
+        ...prompt.stable.map((content) => ({ role: "user" as const, content })),
         { role: "user", content: prompt.volatile },
       ],
       jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,

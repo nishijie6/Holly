@@ -243,7 +243,11 @@ export const MEMORY_REFLECTION_SYSTEM_PROMPT =
 // conversation windows change on nearly every call, and used to sit *ahead* of
 // the material — a timestamp at the front of the prefix invalidates everything
 // after it, so the order matters as much as the split.
-export type SplitPrompt = { stable: string; volatile: string };
+// stable 按块给：指令一块，每条世界观察各一块。调用方把每块作为一条消息发出去，在线上它们是同一条
+// user 消息里相邻的文本块。缓存按块比对前缀——整段拼成一块时，窗口里每多一条观察这一块的字节就变，
+// 前缀跟着作废：2026-09-08 到 09-11，归档写作 29 次调用缓存读取为 0，记忆反思 88 次只读回 16.7%。
+// 分块之后新观察只是在后面多一块，前面的块原样命中；只有窗口起点移动才真的重建。
+export type SplitPrompt = { stable: string[]; volatile: string };
 
 const MEMORY_REFLECTION_INSTRUCTIONS = [
   "You are Holly's private memory and reflection loop.",
@@ -262,9 +266,7 @@ export function buildMemoryReflectionPrompt(
   volatileMaterial: readonly string[],
 ): SplitPrompt {
   return {
-    stable: [...MEMORY_REFLECTION_INSTRUCTIONS, "", stableMaterial.join("\n\n")]
-      .join("\n")
-      .trimEnd(),
+    stable: [MEMORY_REFLECTION_INSTRUCTIONS.join("\n"), ...stableMaterial],
     volatile: [
       `now=${nowIso}`,
       `reason=${reason}`,
@@ -299,9 +301,7 @@ export function buildArchiveCompositionPrompt(
   volatileMaterial: readonly string[],
 ): SplitPrompt {
   return {
-    stable: [...ARCHIVE_COMPOSITION_INSTRUCTIONS, "", stableMaterial.join("\n\n")]
-      .join("\n")
-      .trimEnd(),
+    stable: [ARCHIVE_COMPOSITION_INSTRUCTIONS.join("\n"), ...stableMaterial],
     volatile: [
       `now=${nowIso}`,
       `reason=${reason}`,

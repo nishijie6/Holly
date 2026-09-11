@@ -29,8 +29,22 @@ test("memory reflection's stable half is byte-identical across ticks", () => {
     [...churn, "Internal memory 2:\n- content: 又一条"],
   );
 
-  assert.equal(first.stable, second.stable);
+  assert.deepEqual(first.stable, second.stable);
   assert.notEqual(first.volatile, second.volatile);
+});
+
+// 窗口里多了一条观察，稳定段只是在后面多一块、前面的块原样不动：缓存按块比对前缀，这样才读得回来。
+test("a new world observation only appends a block to the stable half", () => {
+  const newer = [...worldBlocks, "World observation 3:\n- topic: 人工智能\n- summary: 新的一条"];
+  for (const build of [
+    (blocks: string[]) => buildMemoryReflectionPrompt("2026-09-06T13:00:00.000Z", "tick", blocks, churn),
+    (blocks: string[]) => buildArchiveCompositionPrompt("2026-09-06T13:00:00.000Z", "tick", [], blocks, churn),
+  ]) {
+    const before = build(worldBlocks);
+    const after = build(newer);
+    assert.equal(after.stable.length, before.stable.length + 1);
+    assert.deepEqual(after.stable.slice(0, before.stable.length), before.stable);
+  }
 });
 
 // now/reason used to sit ahead of the material. A timestamp anywhere in the
@@ -39,12 +53,12 @@ test("memory reflection's stable half is byte-identical across ticks", () => {
 test("timestamps stay out of the cached half", () => {
   const nowIso = "2026-09-06T13:00:00.000Z";
   const memory = buildMemoryReflectionPrompt(nowIso, "tick", worldBlocks, churn);
-  assert.ok(!memory.stable.includes(nowIso), "now must not appear in the stable half");
-  assert.ok(!memory.stable.includes("reason="), "reason must not appear in the stable half");
+  assert.ok(!memory.stable.some((block) => block.includes(nowIso)), "now must not appear in the stable half");
+  assert.ok(!memory.stable.some((block) => block.includes("reason=")), "reason must not appear in the stable half");
   assert.ok(memory.volatile.includes(nowIso));
 
   const archive = buildArchiveCompositionPrompt(nowIso, "tick", ["- [poem] 旧作"], worldBlocks, churn);
-  assert.ok(!archive.stable.includes(nowIso), "now must not appear in the stable half");
+  assert.ok(!archive.stable.some((block) => block.includes(nowIso)), "now must not appear in the stable half");
   assert.ok(archive.volatile.includes(nowIso));
 });
 
@@ -57,7 +71,7 @@ test("archive composition keeps recent titles in the volatile half", () => {
     "2026-09-06T13:00:00.000Z", "tick", [], worldBlocks, churn,
   );
 
-  assert.equal(withTitles.stable, withoutTitles.stable, "a new work must not disturb the prefix");
+  assert.deepEqual(withTitles.stable, withoutTitles.stable, "a new work must not disturb the prefix");
   assert.ok(withTitles.volatile.includes("雨夜"));
   assert.ok(!withoutTitles.volatile.includes("Recent works"));
 });
@@ -68,9 +82,10 @@ test("the split preserves instructions and material", () => {
   const { stable, volatile } = buildMemoryReflectionPrompt(
     "2026-09-06T13:00:00.000Z", "tick", worldBlocks, churn,
   );
-  assert.ok(stable.includes("Holly's private memory and reflection loop"));
-  assert.ok(stable.includes("should_write"));
-  for (const block of worldBlocks) assert.ok(stable.includes(block));
+  assert.ok(stable[0].includes("Holly's private memory and reflection loop"));
+  assert.ok(stable[0].includes("should_write"));
+  // 每条观察各占一块，顺序不变。
+  assert.deepEqual(stable.slice(1), worldBlocks);
   for (const block of churn) assert.ok(volatile.includes(block));
 });
 
@@ -79,8 +94,9 @@ test("an empty stable half degrades to instructions only", () => {
   const { stable, volatile } = buildMemoryReflectionPrompt(
     "2026-09-06T13:00:00.000Z", "tick", [], churn,
   );
-  assert.ok(stable.includes("Holly's private memory and reflection loop"));
-  assert.ok(!stable.endsWith("\n"), "no trailing blank line when there is no material");
+  assert.equal(stable.length, 1);
+  assert.ok(stable[0].includes("Holly's private memory and reflection loop"));
+  assert.ok(!stable[0].endsWith("\n"), "no trailing blank line when there is no material");
   for (const block of churn) assert.ok(volatile.includes(block));
 });
 

@@ -145,32 +145,76 @@ test("StablePrefixLedger tells a deliberate prefix change from a surprise", asyn
 
   // First call on a route has no history — the inspection reports "fresh", not
   // "rebuilt", so there is nothing to excuse.
-  assert.equal(ledger.changed("memory-reflection", "window A"), false);
+  assert.equal(ledger.changed("memory-reflection", ["指令", "观察 A"]), false);
   // Same rolling window on the next tick: a rebuild here would be real drift.
-  assert.equal(ledger.changed("memory-reflection", "window A"), false);
-  // A new observation arrived and the window moved — we caused this one.
-  assert.equal(ledger.changed("memory-reflection", "window B"), true);
-  assert.equal(ledger.changed("memory-reflection", "window B"), false);
+  assert.equal(ledger.changed("memory-reflection", ["指令", "观察 A"]), false);
+  // 窗口起点移动，前面的块变了——这次重建是我们自己造成的。
+  assert.equal(ledger.changed("memory-reflection", ["指令", "观察 B"]), true);
+  assert.equal(ledger.changed("memory-reflection", ["指令", "观察 B"]), false);
+});
+
+// 窗口里多了一条观察，只是在后面多一块：缓存照样读得回来，不该记成重建。
+test("StablePrefixLedger does not call an appended block a change, but a shorter list is one", async () => {
+  const { StablePrefixLedger } = await import("../cache-prefix.js");
+  const ledger = new StablePrefixLedger();
+
+  ledger.changed("archive-composition", ["指令", "观察 A"]);
+  assert.equal(ledger.changed("archive-composition", ["指令", "观察 A", "观察 B"]), false);
+  // 变短同样是重建：缓存条目伸到了新断点后面，读不回来。
+  assert.equal(ledger.changed("archive-composition", ["指令", "观察 A"]), true);
 });
 
 test("StablePrefixLedger keeps routes apart", async () => {
   const { StablePrefixLedger } = await import("../cache-prefix.js");
   const ledger = new StablePrefixLedger();
 
-  assert.equal(ledger.changed("memory-reflection", "window A"), false);
-  assert.equal(ledger.changed("archive-composition", "window A"), false);
-  assert.equal(ledger.changed("memory-reflection", "window B"), true);
+  assert.equal(ledger.changed("memory-reflection", ["window A"]), false);
+  assert.equal(ledger.changed("archive-composition", ["window A"]), false);
+  assert.equal(ledger.changed("memory-reflection", ["window B"]), true);
   // The other route never saw window B, so its own history is untouched.
-  assert.equal(ledger.changed("archive-composition", "window A"), false);
+  assert.equal(ledger.changed("archive-composition", ["window A"]), false);
 });
 
 test("StablePrefixLedger is bounded and forgets the oldest route first", async () => {
   const { StablePrefixLedger } = await import("../cache-prefix.js");
   const ledger = new StablePrefixLedger(2);
 
-  ledger.changed("a", "x");
-  ledger.changed("b", "x");
-  ledger.changed("c", "x");   // evicts "a"
+  ledger.changed("a", ["x"]);
+  ledger.changed("b", ["x"]);
+  ledger.changed("c", ["x"]);   // evicts "a"
   // "a" was dropped, so it reads as a first call again rather than a change.
-  assert.equal(ledger.changed("a", "y"), false);
+  assert.equal(ledger.changed("a", ["y"]), false);
+});
+
+// 记忆反思和归档写作的稳定段按块发。窗口里多了一条世界观察，线上的缓存前缀应当是「延长」而不是
+// 「重建」——这条钉住的是 autonomy-prompts.ts 拆块的真正目的。旧写法把稳定段拼成一条消息，同样的
+// 变化就是重建，一并测出来作对照。
+test("a new world observation extends the reflection prefix once the stable half is sent as blocks", async () => {
+  const { buildMemoryReflectionPrompt } = await import("../autonomy-prompts.js");
+  const observations = [
+    "World observation:\n- topic: 天文学\n- summary: 一",
+    "World observation:\n- topic: 数学\n- summary: 二",
+  ];
+  const newer = [...observations, "World observation:\n- topic: 人工智能\n- summary: 三"];
+  const request = (blocks: string[], asOneMessage: boolean) => {
+    const prompt = buildMemoryReflectionPrompt("2026-09-11T05:00:00.000Z", "tick", blocks, ["Recent conversation:\n- 有人说了句话"]);
+    const stable = asOneMessage ? [prompt.stable.join("\n\n")] : prompt.stable;
+    return buildClaudeRequestBody(
+      "claude-opus-4-7",
+      "You write Holly's private internal memory.",
+      [
+        ...stable.map((content) => ({ role: "user" as const, content })),
+        { role: "user" as const, content: prompt.volatile },
+      ],
+      { cacheStablePrefix: true, volatileTailMessages: 1 },
+    );
+  };
+
+  const split = new CachePrefixTracker();
+  split.inspect("memory-reflection", digestClaudeCachedPrefix(request(observations, false)));
+  assert.equal(split.inspect("memory-reflection", digestClaudeCachedPrefix(request(newer, false))).status, "extended");
+
+  const joined = new CachePrefixTracker();
+  joined.inspect("memory-reflection", digestClaudeCachedPrefix(request(observations, true)));
+  assert.equal(joined.inspect("memory-reflection", digestClaudeCachedPrefix(request(newer, true))).status, "rebuilt");
 });
