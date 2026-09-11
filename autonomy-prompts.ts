@@ -5,24 +5,42 @@
 // actually reaches the model, without hunting through main.ts's business logic.
 import { type ProactiveWorldObservation } from "./proactive-engine.js";
 import { type AutonomyJudgmentRequest } from "./autonomy-engine.js";
+import { type BroadcastSourceKind } from "./world-observation-freshness.js";
 
 export const WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT =
   "You turn browser observations into concise Simplified Chinese QQ group updates, returned as structured JSON with an exact source URL per item.";
 
 export type WorldObservationLinkCandidate = { text: string; url: string };
 
+// 播报只发今天的内容。模型要知道今天是哪天、每一页是「今天发布的文章」还是「没有发布时间的
+// 列表页」，并为列表页上的每一条抄出页面标给它的日期原文——核对在 world-observation-freshness.ts，
+// 这里只负责把要求说清楚。
+export type WorldObservationBroadcastFreshness = {
+  todayKey: string;
+  pages: ReadonlyArray<{ url: string; kind: BroadcastSourceKind }>;
+};
+
 export function buildWorldObservationBroadcastPrompt(
   topic: string,
   observation: ProactiveWorldObservation,
   candidates: readonly WorldObservationLinkCandidate[],
+  freshness: WorldObservationBroadcastFreshness,
 ): string {
   const linksBlock = candidates
     .map((candidate, index) => `${index + 1}. ${candidate.text ? `${candidate.text} — ` : ""}${candidate.url}`)
     .join("\n");
+  const [, month, day] = freshness.todayKey.split("-");
+  const pageDatesBlock = freshness.pages
+    .map((page) => page.kind === "article-today"
+      ? `- ${page.url} — an article published today; its own content qualifies.`
+      : `- ${page.url} — a listing/home page with no publish date of its own; use an entry from it only if the page text shows that entry is dated today.`)
+    .join("\n");
   return [
     "Condense this browser world observation into Simplified Chinese for a QQ group.",
     "Keep the factual content. Do not mention that it was translated or that this is automated.",
-    'Return JSON only: {"intro": string, "items": [{"text": string, "url": string}]}.',
+    'Return JSON only: {"intro": string, "items": [{"text": string, "url": string, "date_evidence": string}]}.',
+    `Today is ${freshness.todayKey} (Beijing time). Only include entries published today. Skip anything dated earlier, and skip entries whose date you cannot see on the page.`,
+    `date_evidence: for an entry taken from a listing/home page, copy verbatim the date text that page shows for that entry, for example ${freshness.todayKey} 14:05, ${month}月${day}日 19:07, 3小时前 or 刚刚. If the page dates a whole section at once — a heading such as 今日 - ${freshness.todayKey} above a list of bare times — copy that heading's date text for the entries under it. The copied text must contain the date or a relative time; a bare time like 12:37 is not enough. A date printed once at the top of the page next to the weekday is a page clock, not an entry's date. For an entry from an article published today, use "".`,
     'intro: an optional short lead-in sentence, or "" if not needed.',
     "items: at most 5 entries. If the observation has MULTIPLE distinct news items, one entry per item (drop the rest beyond 5), each a single short Chinese sentence — do not add numbering yourself, it's added automatically. If there is only ONE item, return exactly one entry with 2-4 short conversational sentences.",
     "Each item's `url` MUST be copied EXACTLY (character for character) from the numbered candidate list below — pick the entry that most specifically matches that item (a specific article/detail link) over a generic page-source entry, unless the page source is the only candidate for that item.",
@@ -31,10 +49,13 @@ export function buildWorldObservationBroadcastPrompt(
     'Inside intro and text, mark quoted names or phrases with 「」. Never use ASCII double quotes (") there: an unescaped one ends the JSON string and the rest of the sentence is silently lost.',
     "End every item's text with sentence-ending punctuation (。！？). An item that stops without it is treated as cut off and dropped.",
     "If the source text is noisy, keep only the most useful concrete points.",
-    "When at least one concrete factual item is present, items MUST contain at least one entry; do not return an empty items array merely because some sources are listing pages or noisy.",
+    "When at least one concrete factual item dated today is present, items MUST contain at least one entry; do not return an empty items array merely because some sources are listing pages or noisy. If nothing on these pages is dated today, return an empty items array.",
     "",
     `topic: ${topic}`,
     `query: ${observation.query}`,
+    "",
+    "Page dates:",
+    pageDatesBlock || "(none)",
     "",
     "Candidate links (url must be copied exactly from here):",
     linksBlock || "(none)",
@@ -67,7 +88,8 @@ export function isTruncatedBroadcastText(text: string): boolean {
   return trimmed.length > 0 && !BROADCAST_TEXT_COMPLETE_ENDING.test(trimmed);
 }
 
-export type WorldObservationBroadcastItem = { text: string; url: string };
+// dateEvidence：模型从列表页抄来的这一条的日期原文，今天的文章页上的条目没有这一项。
+export type WorldObservationBroadcastItem = { text: string; url: string; dateEvidence?: string };
 
 export type WorldObservationBroadcastItemSelection = {
   items: WorldObservationBroadcastItem[];
@@ -88,6 +110,7 @@ export function selectBroadcastItems(
     const record = item as Record<string, unknown>;
     const text = typeof record.text === "string" ? record.text.trim() : "";
     const url = typeof record.url === "string" ? record.url : "";
+    const dateEvidence = typeof record.date_evidence === "string" ? record.date_evidence.trim() : "";
     // 链接必须逐字来自候选列表。schema 的 enum 本该保证这一点，但换成不认 enum 的服务端
     // 时就不再成立，这道检查不能省。
     if (!text || !url || !candidateUrls.includes(url)) continue;
@@ -95,7 +118,7 @@ export function selectBroadcastItems(
       selection.truncatedTexts.push(text);
       continue;
     }
-    selection.items.push({ text, url });
+    selection.items.push({ text, url, ...(dateEvidence ? { dateEvidence } : {}) });
   }
   return selection;
 }

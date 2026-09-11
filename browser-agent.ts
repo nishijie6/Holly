@@ -33,6 +33,9 @@ export type BrowserPageObservation = {
   // Article links found inside the content area, so downstream consumers can
   // cite an item's own detail page instead of a listing/homepage URL.
   links?: BrowserPageLink[];
+  // 页面元数据里声明的发布时间，原样保留（各站格式五花八门）。解析和「是不是今天」的判断在
+  // world-observation-freshness.ts；页面没声明就没有这个字段。
+  publishedAt?: string;
   error?: string;
 };
 
@@ -78,7 +81,32 @@ const STEALTH_SCRIPT = [
 // Also collects article links from the content area (anchors with real title
 // text, after page chrome was stripped) so listing pages yield each item's own
 // detail URL instead of only the listing/homepage URL.
+// 发布时间要赶在删 <script> 之前读——JSON-LD 的 datePublished 就在 script 标签里。只认
+// meta 和 JSON-LD 这类元数据，不从正文里扫日期，原因见 world-observation-freshness.ts。
 const CONTENT_EXTRACTION_EXPRESSION = `(() => {
+  let publishedAt = "";
+  try {
+    const selectors = [
+      'meta[property="article:published_time" i]',
+      'meta[property$=":published_time" i]',
+      'meta[name$="published_time" i]',
+      'meta[itemprop="datePublished" i]',
+      'meta[name="pubdate" i]',
+      'meta[name="publishdate" i]',
+      'meta[name="publish_date" i]',
+      'meta[name="publish-date" i]',
+    ];
+    for (const selector of selectors) {
+      const value = ((document.querySelector(selector) || {}).content || '').trim();
+      if (value) { publishedAt = value; break; }
+    }
+    if (!publishedAt) {
+      for (const node of document.querySelectorAll('script[type="application/ld+json"]')) {
+        const match = (node.textContent || '').match(/"datePublished"\\s*:\\s*"([^"]+)"/);
+        if (match) { publishedAt = match[1].trim(); break; }
+      }
+    }
+  } catch (_) { /* best effort */ }
   try {
     document.querySelectorAll('script,style,noscript,template,nav,header,footer,aside,form,[role="navigation"],[class*="cookie" i],[id*="cookie" i],[class*="consent" i],[id*="consent" i]').forEach((el) => el.remove());
   } catch (_) { /* best effort */ }
@@ -103,7 +131,7 @@ const CONTENT_EXTRACTION_EXPRESSION = `(() => {
       links.push({ text: label.slice(0, 80), url: href });
     }
   } catch (_) { /* best effort */ }
-  return JSON.stringify({ title: document.title || "", url: location.href, text: text, links: links });
+  return JSON.stringify({ title: document.title || "", url: location.href, text: text, links: links, publishedAt: publishedAt });
 })()`;
 
 // Diagnostic emitted per page so callers can surface why a read produced no
@@ -441,6 +469,7 @@ async function readPageWithBrowser(
         return label && linkUrl ? { text: label, url: linkUrl } : null;
       })
       .filter((item): item is BrowserPageLink => item !== null);
+    const publishedAt = typeof parsed.publishedAt === "string" ? parsed.publishedAt.trim() : "";
     if (finalUrl.startsWith("chrome-error://")) {
       return {
         title,
@@ -454,6 +483,7 @@ async function readPageWithBrowser(
       url: finalUrl,
       excerpt: trimText(text, config.contentMaxChars),
       ...(links.length > 0 ? { links } : {}),
+      ...(publishedAt ? { publishedAt } : {}),
     };
   } catch (error) {
     return {
@@ -482,7 +512,8 @@ function isUsableArticleExcerpt(excerpt: string): boolean {
   return !BOT_WALL_PHRASE_PATTERN.test(trimmed);
 }
 
-function formatObservationSummary(query: string, pages: BrowserPageObservation[]): string {
+// 导出给播报用：按日期筛过页面之后，要用剩下的页面重新拼一份摘要。
+export function formatObservationSummary(query: string, pages: readonly BrowserPageObservation[]): string {
   const readable = pages.filter((page) => isUsableArticleExcerpt(page.excerpt));
   if (readable.length === 0) {
     return "";

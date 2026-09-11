@@ -113,11 +113,19 @@ import {
   normalizeBroadcastUrl,
   type RecentBroadcastItem,
 } from "./world-observation-dedup.js";
+import {
+  beijingDateKey,
+  classifyBroadcastSources,
+  isBroadcastItemFresh,
+  type BroadcastSource,
+} from "./world-observation-freshness.js";
 import { searchWeb, type SearchResult } from "./web-search.js";
 import { normalizeSearchQuery, resolveExplicitSearchRequest } from "./search-intent.js";
 import {
   browseTopicWithBrowserAgent,
+  formatObservationSummary,
   type BrowserAgentConfig,
+  type BrowserPageObservation,
   type BrowserTopicObservation,
 } from "./browser-agent.js";
 import { DomainReputationStore } from "./domain-reputation.js";
@@ -5994,7 +6002,7 @@ async function observeWorldForAutonomy(
     console.error("Failed to store world observation:", error);
   }
   try {
-    await maybeBroadcastWorldObservation(request.topic, worldObservation, observedAtIso);
+    await maybeBroadcastWorldObservation(request.topic, worldObservation, observedAtIso, observed.pages);
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     pushMonitorEntry("error", "World Observation Broadcast Failed", detail);
@@ -6139,10 +6147,11 @@ function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]):
         items: {
           type: "object",
           additionalProperties: false,
-          required: ["text", "url"],
+          required: ["text", "url", "date_evidence"],
           properties: {
             text: { type: "string" },
             url: candidateUrls.length > 0 ? { type: "string", enum: candidateUrls } : { type: "string" },
+            date_evidence: { type: "string" },
           },
         },
       },
@@ -6152,7 +6161,9 @@ function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]):
 
 type WorldObservationBroadcastTranslation =
   | { kind: "message"; message: string; duplicateItemsRemoved: number }
-  | { kind: "duplicate"; duplicateItemsRemoved: number };
+  | { kind: "duplicate"; duplicateItemsRemoved: number }
+  // 页面上没有一条是今天的。跟 null（内容不可用、要报失败群）分开，因为这是常态。
+  | { kind: "stale"; itemsDropped: number };
 
 // Safety net for when the structured extraction pass above returns no items
 // twice in a row. browser-agent already filtered the source for a minimum
@@ -6193,6 +6204,8 @@ async function translateWorldObservationForBroadcast(
   topic: string,
   observation: ProactiveWorldObservation,
   recentItems: readonly RecentBroadcastItem[],
+  sources: readonly BroadcastSource<BrowserPageObservation>[],
+  nowMs: number,
 ): Promise<WorldObservationBroadcastTranslation | null> {
   const client = activeLlmClient;
   if (!client) {
@@ -6215,6 +6228,14 @@ async function translateWorldObservationForBroadcast(
     return { kind: "duplicate", duplicateItemsRemoved: duplicateCandidatesRemoved };
   }
   const candidateUrls = candidates.map((candidate) => candidate.url);
+  const freshnessPrompt = {
+    todayKey: beijingDateKey(nowMs),
+    pages: sources.map((source) => ({ url: source.page.url, kind: source.kind })),
+  };
+  const todayArticlePages = sources
+    .filter((source) => source.kind === "article-today")
+    .map((source) => ({ ...source.page, links: undefined }));
+  const hasTodayArticle = todayArticlePages.length > 0;
 
   // 只有某次尝试挑出了至少一条能发的条目，这两个才会被填上。
   let intro = "";
@@ -6236,7 +6257,7 @@ async function translateWorldObservationForBroadcast(
         systemPrompt: WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
         messages: [{
           role: "user",
-          content: buildWorldObservationBroadcastPrompt(topic, attemptObservation, attemptCandidates),
+          content: buildWorldObservationBroadcastPrompt(topic, attemptObservation, attemptCandidates, freshnessPrompt),
         }],
         jsonSchema: buildWorldObservationBroadcastSchema(attemptUrls),
         cacheRoute: "world-observation-broadcast",
@@ -6282,10 +6303,32 @@ async function translateWorldObservationForBroadcast(
           ].join("\n"),
         );
       }
+      // 列表页的条目逐条核对日期原文，今天的文章页整页可用、不用核对。一条都不过关，说明这些
+      // 页面上没有今天的内容，不是模型写坏了，所以不重试，也不退回原文摘录。
+      const freshItems = selection.items.filter((item) => isBroadcastItemFresh(item, sources, nowMs));
+      const undatedItems = selection.items.filter((item) => !freshItems.includes(item));
+      if (undatedItems.length > 0) {
+        pushMonitorEntry(
+          "status",
+          "World Observation Undated Items Dropped",
+          [
+            `attempt=${attempt}`,
+            `topic=${topic}`,
+            `kept=${freshItems.length} dropped=${undatedItems.length}`,
+            ...undatedItems.map((item) => `${item.text} | date_evidence=${item.dateEvidence ?? ""} | ${item.url}`),
+          ].join("\n"),
+        );
+      }
+      if (freshItems.length === 0) {
+        return { kind: "stale", itemsDropped: undatedItems.length };
+      }
       intro = typeof parsed?.intro === "string" ? parsed.intro.trim() : "";
-      validItems = selection.items;
+      validItems = freshItems;
       break;
     }
+    // 只有列表页时，干干净净的空结果多半就是页面上没有今天的条目，缩小上下文重试没有意义。
+    // 条目全被截断则不同——那是模型写坏了，照旧重试。
+    if (!hasTodayArticle && selection.truncatedTexts.length === 0) break;
     pushMonitorEntry(
       "status",
       selection.truncatedTexts.length > 0 ? "World Observation Translate Truncated" : "World Observation Translate Empty",
@@ -6298,7 +6341,14 @@ async function translateWorldObservationForBroadcast(
     );
   }
   if (validItems.length === 0) {
-    return summaryFallbackBroadcast(observation, recentItems, duplicateCandidatesRemoved);
+    if (!hasTodayArticle) return { kind: "stale", itemsDropped: 0 };
+    // 原文摘录没法逐条核对日期，只能从今天发布的文章页里摘。
+    const articleObservation: ProactiveWorldObservation = {
+      ...observation,
+      summary: formatObservationSummary(observation.query, todayArticlePages),
+      urls: todayArticlePages.map((page) => page.url),
+    };
+    return summaryFallbackBroadcast(articleObservation, recentItems, duplicateCandidatesRemoved);
   }
 
   // Catch both exact URL repeats and the same event rewritten by another
@@ -6399,6 +6449,7 @@ async function notifyWorldObservationFailure(topic: string, reason: string): Pro
 // 留在记忆里、不发群：
 //   - 只读 / observe 模式
 //   - 目标群号没配或不合法
+//   - 抓到的网页里没有今天的内容
 //   - 群里还在聊天（没冷场就别插话——新闻可以等下一轮）
 //   - 内容跟最近播报过的重复
 // 顺序是有讲究的：先判便宜的本地条件，最后才做要花模型的去重与改写。
@@ -6406,6 +6457,7 @@ async function maybeBroadcastWorldObservation(
   topic: string,
   observation: ProactiveWorldObservation,
   observedAtIso: string,
+  pages: readonly BrowserPageObservation[],
 ): Promise<void> {
   const targetGroupId = resolveWorldObservationBroadcastGroupId(autonomyConfig, topic);
   if (!targetGroupId) return;
@@ -6435,6 +6487,40 @@ async function maybeBroadcastWorldObservation(
     );
   }
 
+  // 只播今天的内容。去重只挡得住「同一个地址、差不多的字」，挡不住旧内容换个地址再来——
+  // 91maths 每次换一个列表页，同一道「8 个 8 组成 1000」就在 9 月发了八次。所以先按日期筛
+  // 页面：今天发布的文章整页可用；列表页、首页没有自己的发布时间，正文里写着今天的日期才留下，
+  // 由改写那一步逐条核对。今天的文章页不带相关链接——那些文章没打开过，日期无从核实；列表页的
+  // 链接就是它的条目，得留着。一页不剩是常态而不是抓取失败，所以只记一笔，不往失败群报。
+  // 规则细节见 world-observation-freshness.ts。
+  const nowMs = Date.now();
+  const freshness = classifyBroadcastSources(pages, nowMs);
+  const broadcastSummary = formatObservationSummary(
+    observation.query,
+    freshness.sources.map((source) => source.kind === "article-today" ? { ...source.page, links: undefined } : source.page),
+  );
+  if (!broadcastSummary) {
+    pushMonitorEntry(
+      "status",
+      "World Observation Stale Skipped",
+      [
+        `group_id=${groupKey}`,
+        `topic=${topic}`,
+        `today=${beijingDateKey(nowMs)}`,
+        `usable_sources=${freshness.sources.length}`,
+        ...freshness.rejected.map((page) => `${page.reason} ${page.url}`),
+      ].join("\n"),
+    );
+    return;
+  }
+  const broadcastObservation: ProactiveWorldObservation = {
+    ...observation,
+    summary: broadcastSummary,
+    urls: freshness.sources
+      .map((source) => source.page.url)
+      .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index),
+  };
+
   // Success path only interrupts the broadcast group when the conversation
   // there has lulled; an active chat means the news can wait for the next run.
   const latestActivity = await latestKnownGroupActivity(groupKey);
@@ -6462,18 +6548,32 @@ async function maybeBroadcastWorldObservation(
     Date.now(),
     autonomyConfig.worldObservationDedupWindowMs,
   );
-  const translation = await translateWorldObservationForBroadcast(topic, observation, recentItems);
+  const translation = await translateWorldObservationForBroadcast(
+    topic,
+    broadcastObservation,
+    recentItems,
+    freshness.sources,
+    nowMs,
+  );
   if (!translation) {
     // Show the head of the source summary so the monitor makes it obvious when
     // the skip is because the observation was boilerplate (cookie/nav) noise
     // rather than a transient LLM issue.
-    const summaryHead = observation.summary.replace(/\s+/g, " ").trim().slice(0, 80);
+    const summaryHead = broadcastObservation.summary.replace(/\s+/g, " ").trim().slice(0, 80);
     pushMonitorEntry(
       "status",
       "World Observation Broadcast Skipped",
       `group_id=${groupKey}\ntopic=${topic}\nNo usable translated message (source may be noise); notifying failure group.\nsummary_head=${summaryHead || "(empty)"}`,
     );
     await notifyWorldObservationFailure(topic, `抓到的内容不可用(可能是噪声或翻译失败) ${summaryHead ? `开头=「${summaryHead}」` : ""}`.trim());
+    return;
+  }
+  if (translation.kind === "stale") {
+    pushMonitorEntry(
+      "status",
+      "World Observation Stale Skipped",
+      `group_id=${groupKey}\ntopic=${topic}\ntoday=${beijingDateKey(nowMs)}\nNo entry on the pages is dated today.\nitems_dropped=${translation.itemsDropped}`,
+    );
     return;
   }
   if (translation.kind === "duplicate") {

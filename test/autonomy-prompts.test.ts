@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildArchiveCompositionPrompt,
   buildMemoryReflectionPrompt,
+  buildWorldObservationBroadcastPrompt,
   isTruncatedBroadcastText,
   selectBroadcastItems,
 } from "../autonomy-prompts.js";
@@ -175,4 +176,44 @@ test("selectBroadcastItems still rejects malformed items without counting them a
 
   assert.deepEqual(selection, { items: [], truncatedTexts: [] });
   assert.deepEqual(selectBroadcastItems(undefined, [url]), { items: [], truncatedTexts: [] });
+});
+
+// ---------- 只发今天的内容 ----------
+
+// 列表页条目的日期原文要原样带到核对那一步；没给的条目不凭空补一个空字段。
+test("selectBroadcastItems carries each item's date evidence through", () => {
+  const urls = ["https://leiphone.com/a/1", "https://36kr.com/p/2"];
+  const selection = selectBroadcastItems(
+    [
+      { text: "雷锋网报道了新模型。", url: urls[0], date_evidence: " 09月11日 19:07 " },
+      { text: "36氪报道了一笔融资。", url: urls[1], date_evidence: "" },
+    ],
+    urls,
+  );
+
+  assert.deepEqual(selection.items, [
+    { text: "雷锋网报道了新模型。", url: urls[0], dateEvidence: "09月11日 19:07" },
+    { text: "36氪报道了一笔融资。", url: urls[1] },
+  ]);
+});
+
+test("the broadcast prompt tells the model today's date and which pages need a per-entry date", () => {
+  const prompt = buildWorldObservationBroadcastPrompt(
+    "人工智能",
+    { query: "人工智能 最新 进展", summary: "[Browser observation] query=人工智能 最新 进展", urls: [] },
+    [],
+    {
+      todayKey: "2026-09-11",
+      pages: [
+        { url: "https://36kr.com/p/1", kind: "article-today" },
+        { url: "https://maomu.com/news", kind: "dated-listing" },
+      ],
+    },
+  );
+
+  assert.ok(prompt.includes("Today is 2026-09-11"));
+  assert.ok(prompt.includes("- https://36kr.com/p/1 — an article published today"));
+  assert.ok(prompt.includes("- https://maomu.com/news — a listing/home page with no publish date"));
+  assert.ok(prompt.includes('"date_evidence": string'));
+  assert.ok(prompt.includes("If nothing on these pages is dated today, return an empty items array."));
 });
