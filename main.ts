@@ -770,7 +770,9 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldTopicSourceUrls: {},
   worldTopicBriefs: {},
   memoryReflectionEnabled: false,
-  memoryReflectionIntervalMs: 60 * 60 * 1000,
+  // 50 分钟而不是 60：缓存 1 小时过期，60 分钟一次正好卡在过期边缘。09-09 到 09-12 的记录里，
+  // 和上一次间隔不到 55 分钟的反思 42 次里有 31 次读到缓存，间隔 55–65 分钟的 50 次里只有 3 次。
+  memoryReflectionIntervalMs: 50 * 60 * 1000,
   memoryReflectionRetryMs: 15 * 60 * 1000,
   memoryReflectionBroadcastGroupId: null,
   memoryReflectionBroadcastLullMs: 3 * 60 * 60 * 1000,
