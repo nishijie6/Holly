@@ -176,6 +176,7 @@ import {
   LEDGER_COMPACTION_MAX_ROUNDS,
   LEDGER_COMPACTION_TOOL_REFUSAL,
   buildLedgerCompactionMessages,
+  buildStaleLedgerSummaryMessages,
   extractLedgerSummary,
   planLedgerCompaction,
   renderLedgerSummaryTurn,
@@ -4885,6 +4886,21 @@ async function restoreConversationLedger(): Promise<void> {
   );
   ledgerStore = store;
 
+  if (outcome.rejected === "stale" && outcome.staleTranscript) {
+    // 过期不再整本丢掉：旧账本已经改名存档，这里排进焦点循环的队列去整理成累计摘要，新账本从摘要
+    // 开始。排队而不是在启动流程里等它：整本读一遍、写几千字要一两分钟，不该拖着 QQ 连不上。启动
+    // 之后到来的焦点轮次都排在它后面，摘要写进账本之前不会有新的一轮先跑，也就不会出现「摘要插到
+    // 已有轮次前面」这种打乱前缀的情况。
+    const { messages, archivedTo } = outcome.staleTranscript;
+    pushMonitorEntry(
+      "status",
+      "Conversation Ledger Stale",
+      `${outcome.recordCount} persisted turn(s) are past the stale limit. Archived to ${archivedTo}; summarizing them before the first focus round.`,
+    );
+    void focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, () => summarizeStaleLedger(messages, archivedTo));
+    return;
+  }
+
   if (outcome.rejected) {
     pushMonitorEntry(
       "status",
@@ -4913,6 +4929,58 @@ async function restoreConversationLedger(): Promise<void> {
         : ""
     }`,
   );
+}
+
+// 过期账本的整本摘要。和压缩用同一套指令和工具拒绝，但没有缓存可读——过期意味着早就过了 1 小时的
+// 缓存有效期——所以走单独的 cacheRoute，不去占焦点路由在漂移检测里的基线。失败时存档留在磁盘上，
+// 账本照旧从空白开始：和以前一样能用，只是记忆没接上，路径写进监控，方便手动找回。
+async function summarizeStaleLedger(transcript: readonly LlmMessage[], archivedTo: string): Promise<void> {
+  const startedAt = Date.now();
+  let client: LlmClient | undefined;
+  try {
+    // 取客户端也放进 try：这个任务是 void 提交进队列的，任何一处抛出来都没人接，会变成进程级的
+    // unhandled rejection。
+    client = getDecisionLlmClient();
+    const result = await client.runToolLoop({
+      messages: buildStaleLedgerSummaryMessages(transcript),
+      tools: [...QQ_TOOL_DEFINITIONS],
+      runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
+      purpose: "ledger-compaction",
+      cacheRoute: "ledger-stale-summary",
+      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+      maxRounds: LEDGER_COMPACTION_MAX_ROUNDS,
+    });
+    broadcastLatestLlmUsage(client);
+    if (result.exhausted) {
+      throw new Error(`The model kept calling tools for ${result.rounds} rounds instead of writing the summary.`);
+    }
+    const summary = extractLedgerSummary(result.text);
+    if (!summary) {
+      throw new Error("The summary came back empty.");
+    }
+
+    // 这个任务排在焦点队列最前面，账本此刻应当还是空的；万一已经有了新的轮次，也原样接在摘要后面。
+    // 必须先拷一份：snapshot() 返回的就是账本内部的数组，replaceFrontWithSummary 会先把它清空。
+    conversationLedger.replaceFrontWithSummary(renderLedgerSummaryTurn(summary), [...conversationLedger.snapshot()]);
+    await ledgerStore?.rewrite(conversationLedger.snapshot());
+    await rm(archivedTo, { force: true });
+    pushMonitorEntry(
+      "status",
+      `Conversation Ledger Summarized - ${formatElapsedDuration(startedAt, Date.now())}`,
+      [
+        `${transcript.length} stale turn(s) -> 1 summary turn; the archive was removed.`,
+        summary.slice(0, 300),
+      ].join("\n"),
+      client.model,
+    );
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Conversation Ledger Summary Failed",
+      `Starting from an empty transcript; the stale turns are still on disk at ${archivedTo}.\n${error instanceof Error ? error.message : String(error)}`,
+      client?.model,
+    );
+  }
 }
 
 /**

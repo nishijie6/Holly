@@ -1,5 +1,6 @@
 import { estimateMessagesTokens } from "./context-budget.js";
 import type { LlmMessage } from "./llm-client.js";
+import { ConversationLedger } from "./conversation-ledger.js";
 
 // Deciding where to cut a ledger, and how to ask for the summary that replaces
 // the front.
@@ -116,13 +117,23 @@ function quoteRoundStart(message: LlmMessage): string[] {
   return [first, "……", `「${clipLine(lines[lines.length - 1])}」`];
 }
 
-export function buildLedgerCompactionInstruction(firstKept: LlmMessage): string {
+// firstKept 为 null 表示整本都要摘要：账本过期（隔了很久没有新的一轮），没有要原样保留的尾巴。
+export function buildLedgerCompactionInstruction(firstKept: LlmMessage | null): string {
+  const range = firstKept
+    ? [
+      "现在不是新的一轮消息，也不用决定回不回谁。上下文前面这一段马上会被压缩掉，只留下一份摘要，之后你要靠它把事情自然接下去。请为自己整理这份累计摘要。",
+      "",
+      "摘要的范围：从上下文开头，到下面这条消息之前为止。这条消息和它之后的内容会原样留在上下文里，不要写进摘要。",
+      ...quoteRoundStart(firstKept),
+    ]
+    : [
+      "现在不是新的一轮消息，也不用决定回不回谁。上面这整段对话已经隔了很久没有继续，马上会被压缩成一份摘要，之后的新消息接在摘要后面。请为自己整理这份累计摘要。",
+      "",
+      "摘要的范围：上面的全部内容。里面说的「刚刚」「现在」「等会儿」都是很久以前的事，按已经过去的事来写，不要写成还在进行的对话；当时答应过、还没兑现的事照样记下，注明是当时说的。",
+    ];
   return [
     "<system_reminder>",
-    "现在不是新的一轮消息，也不用决定回不回谁。上下文前面这一段马上会被压缩掉，只留下一份摘要，之后你要靠它把事情自然接下去。请为自己整理这份累计摘要。",
-    "",
-    "摘要的范围：从上下文开头，到下面这条消息之前为止。这条消息和它之后的内容会原样留在上下文里，不要写进摘要。",
-    ...quoteRoundStart(firstKept),
+    ...range,
     "",
     "如果范围开头有 <conversation_summary>，那是上一次压缩留下的累计记忆。把它当作基线，和之后的新内容保守合并：旧摘要里仍然成立的内容必须保留；只有明确失效、被新事实覆盖、或者已经结束且不再影响后面的，才可以删掉或改写，删改时留下仍然有意义的结果和影响。",
     "",
@@ -162,6 +173,18 @@ export function buildLedgerCompactionMessages(
     throw new Error("buildLedgerCompactionMessages: the plan keeps nothing to anchor the summary on.");
   }
   return [...ledger, { role: "user", content: buildLedgerCompactionInstruction(firstKept) }];
+}
+
+// 过期账本的整本摘要请求。旧账本原样发出去，只按 restore 的规矩先理顺：结尾没收到结果的工具调用
+// 丢掉，否则末尾那个 tool_use 配不上结果，请求直接 400。
+export function buildStaleLedgerSummaryMessages(transcript: readonly LlmMessage[]): LlmMessage[] {
+  const settled = new ConversationLedger();
+  settled.restore(transcript);
+  const messages = settled.snapshot();
+  if (messages.length === 0) {
+    throw new Error("buildStaleLedgerSummaryMessages: nothing left to summarize after settling the transcript.");
+  }
+  return [...messages, { role: "user", content: buildLedgerCompactionInstruction(null) }];
 }
 
 export function renderLedgerSummaryTurn(summary: string): string {

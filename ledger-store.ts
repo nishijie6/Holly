@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 import type { LlmMessage, LlmStructuralBlock } from "./llm-client.js";
@@ -14,6 +14,11 @@ import type { LlmMessage, LlmStructuralBlock } from "./llm-client.js";
 // prompt-cache prefix, and doing it silently inside a restore is exactly the kind
 // of invisible rewrite the ledger exists to prevent. A clean start is honest and
 // its cost is one cold prefix; a silent truncation is neither.
+//
+// 过期是例外，不再整本丢掉：旧文件改名存档，原样交还给调用方去整理成累计摘要，新账本从摘要开始
+// （见 main.ts 的 summarizeStaleLedger）。以前过期就清空文件，2026-09-12 早上一次重启因此丢了
+// 155 条、约 10 万 token 的上下文——只读开了一整夜，焦点循环没跑，账本自然就过了 12 小时。
+// 存档留到摘要写成才删，摘要失败时记忆还在磁盘上。
 
 export type LedgerRestoreOutcome = {
   messages: LlmMessage[];
@@ -21,6 +26,11 @@ export type LedgerRestoreOutcome = {
   rejected: null | "stale" | "too-large" | "unreadable";
   /** Lines that were on disk, whether or not they were restored. */
   recordCount: number;
+  /**
+   * 过期时交还的旧账本，和它被改名存档到的路径。只在 rejected 为 "stale" 时出现；messages 仍然是
+   * 空的，免得调用方不小心把过期的上下文原样恢复回去。
+   */
+  staleTranscript?: { messages: LlmMessage[]; archivedTo: string };
 };
 
 export type LedgerStoreOptions = {
@@ -152,7 +162,16 @@ export class LedgerStore {
 
     const newestAt = Date.parse(records[records.length - 1].at);
     if (Number.isFinite(newestAt) && now - newestAt > options.maxAgeMs) {
-      return reject("stale");
+      const archivedTo = await store.archive(now);
+      return {
+        store,
+        outcome: {
+          messages: [],
+          rejected: "stale",
+          recordCount: records.length,
+          staleTranscript: { messages: records.map((record) => record.message), archivedTo },
+        },
+      };
     }
 
     return {
@@ -197,6 +216,23 @@ export class LedgerStore {
       });
     this.writeQueue = write;
     await write;
+  }
+
+  /**
+   * 把当前文件改名存档，返回存档路径；之后的追加从一个新文件开始。改名而不是复制再清空：改名是
+   * 原子的，崩在中途也不会留下两份半截的账本。
+   */
+  async archive(now = Date.now()): Promise<string> {
+    const stamp = new Date(now).toISOString().replace(/[:.]/g, "-");
+    const archivedTo = `${this.filePath.replace(/\.jsonl$/u, "")}.stale-${stamp}.jsonl`;
+    const write = this.writeQueue
+      .catch(() => undefined)
+      .then(async () => {
+        await rename(this.filePath, archivedTo);
+      });
+    this.writeQueue = write;
+    await write;
+    return archivedTo;
   }
 
   /** Start a new transcript. The old one is gone, not archived. */

@@ -5,6 +5,7 @@ import {
   DEFAULT_LEDGER_COMPACTION_OPTIONS,
   buildLedgerCompactionInstruction,
   buildLedgerCompactionMessages,
+  buildStaleLedgerSummaryMessages,
   extractLedgerSummary,
   planLedgerCompaction,
   renderLedgerSummaryTurn,
@@ -214,6 +215,25 @@ test("a summary turn round-trips, and wrappers the model adds are stripped", () 
   assert.equal(extractLedgerSummary(`以下是摘要：\n\n${body}`), body);
   assert.equal(extractLedgerSummary(`<conversation_summary>\n${body}\n</conversation_summary>`), body);
   assert.equal(renderLedgerSummaryTurn(`  ${body}  `), `<conversation_summary>\n${body}\n</conversation_summary>`);
+});
+
+// --- a stale ledger is summarized whole ------------------------------------
+
+test("a stale transcript is summarized whole, after dropping a trailing unanswered tool call", () => {
+  const messages = buildStaleLedgerSummaryMessages([...LEDGER, calls("tu_9", "再看看")]);
+  // 结尾没收到结果的工具调用丢掉，其余原样照发，最后多一条整理指令。
+  assert.equal(messages.length, LEDGER.length + 1);
+  LEDGER.forEach((message, index) => assert.deepEqual(messages[index], message, `message ${index}`));
+
+  const instruction = messages.at(-1)?.content ?? "";
+  assert.match(instruction, /上面的全部内容/u);
+  assert.match(instruction, /按已经过去的事来写/u);
+  assert.match(instruction, /基线/u);
+  assert.doesNotMatch(instruction, /到下面这条消息之前/u);
+});
+
+test("a stale transcript with nothing settled left has nothing to summarize", () => {
+  assert.throws(() => buildStaleLedgerSummaryMessages([calls("tu_1")]), /nothing left to summarize/u);
 });
 
 // helpers -------------------------------------------------------------------

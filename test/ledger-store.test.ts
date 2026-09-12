@@ -98,18 +98,30 @@ test("a tool turn that lost blocks is dropped rather than replayed as prose", as
 
 // --- the two bounds --------------------------------------------------------
 
-test("a stale transcript is rejected whole and the file is truncated", async () => {
+test("a stale transcript is archived and handed back for summarizing, not restored", async () => {
   const path = tmpPath();
   const old = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   await writeFile(path, `${JSON.stringify({ at: old, message: { role: "user", content: "昨天的话" } })}\n`, "utf-8");
 
-  const { outcome } = await LedgerStore.load(path, OPTS);
+  const { store, outcome } = await LedgerStore.load(path, OPTS);
   assert.equal(outcome.rejected, "stale");
+  // 过期的上下文不能原样恢复，只交还给调用方去整理成摘要。
   assert.deepEqual(outcome.messages, []);
   assert.equal(outcome.recordCount, 1);
-  // Truncated, so the next boot does not re-read and re-reject the same thing.
-  assert.equal((await readFile(path, "utf-8")).trim(), "");
+  assert.deepEqual(outcome.staleTranscript?.messages.map((m) => m.content), ["昨天的话"]);
+
+  // 旧文件改名存档，原路径空出来：下次启动不会再读到它、再判一次过期。
+  const archivedTo = outcome.staleTranscript?.archivedTo ?? "";
+  assert.notEqual(archivedTo, path);
+  assert.match(await readFile(archivedTo, "utf-8"), /昨天的话/u);
+  await assert.rejects(readFile(path, "utf-8"));
+  assert.deepEqual((await LedgerStore.load(path, OPTS)).outcome, { messages: [], rejected: null, recordCount: 0 });
+
+  // 新账本就从原路径接着追加。
+  await store.append({ role: "user", content: "今天的话" });
+  assert.deepEqual((await LedgerStore.load(path, OPTS)).outcome.messages.map((m) => m.content), ["今天的话"]);
   await rm(path, { force: true });
+  await rm(archivedTo, { force: true });
 });
 
 test("an oversized transcript is rejected whole, never truncated at the front", async () => {
