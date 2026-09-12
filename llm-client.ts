@@ -144,6 +144,10 @@ export type LlmClient = {
     cacheRoute: string;
     systemPrompt?: string;
     maxRounds?: number;
+    // 只豁免这次循环的第一轮。第一轮的请求内容来自调用方传进来的 messages，调用方可能有意改写过它
+    // （压缩换掉了账本前段、或者刚在焦点路由上发过一次压缩请求）；之后每一轮都只是在后面追加这次
+    // 循环自己的 assistant / tool 轮次，必须是延长。整次循环都豁免的话，第二轮以后真出现的漂移会被
+    // 当成预期内的重建放过去。
     expectRebuild?: boolean;
     onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[]) => void;
     onToolResults?: (results: LlmToolResultBlock[]) => void;
@@ -1447,7 +1451,8 @@ export async function runClaudeToolLoop(input: {
   runTool: (call: LlmToolUseBlock) => Promise<string>;
   options?: ClaudeRequestOptions;
   recordUsage: (usage: TokenUsageBreakdown) => void;
-  inspectBody?: (body: Record<string, unknown>) => void;
+  // round 从 1 开始。调用方靠它区分「内容来自调用方的第一轮」和「循环自己追加出来的后续轮次」。
+  inspectBody?: (body: Record<string, unknown>, round: number) => void;
   maxRounds?: number;
   // Called as each turn is decided, before the next request goes out. This is
   // the seam for an owner of the transcript (ConversationLedger): the loop stays
@@ -1458,6 +1463,7 @@ export async function runClaudeToolLoop(input: {
 }): Promise<ClaudeToolLoopResult> {
   const maxRounds = Math.max(1, input.maxRounds ?? CLAUDE_TOOL_LOOP_MAX_ROUNDS);
   const messages: LlmMessage[] = [...input.messages];
+  const inspectBody = input.inspectBody;
   let lastText = "";
 
   for (let round = 1; round <= maxRounds; round += 1) {
@@ -1467,7 +1473,7 @@ export async function runClaudeToolLoop(input: {
       messages,
       { ...input.options, tools: input.tools },
       input.recordUsage,
-      input.inspectBody,
+      inspectBody ? (body) => inspectBody(body, round) : undefined,
     );
 
     const text = extractClaudeText(data);
@@ -1700,7 +1706,9 @@ export async function createLlmClient(
         // Inspected per round, not per turn: each round is its own request, and
         // a prefix that stops extending mid-loop is exactly the regression the
         // ledger is meant to make impossible.
-        inspectBody: inspectPrefixFor(input.purpose, input.cacheRoute, input.expectRebuild ?? false),
+        // expectRebuild 只交给第一轮，原因见 LlmClient.runToolLoop 的类型说明。
+        inspectBody: (body, round) =>
+          inspectPrefixFor(input.purpose, input.cacheRoute, round === 1 && (input.expectRebuild ?? false))(body),
         maxRounds: input.maxRounds,
         onAssistantTurn: input.onAssistantTurn,
         onToolResults: input.onToolResults,

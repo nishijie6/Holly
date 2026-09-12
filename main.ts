@@ -4991,11 +4991,16 @@ async function summarizeStaleLedger(transcript: readonly LlmMessage[], archivedT
  * pipeline that breaks the prefix, and it must never be mistaken for the bug
  * that detector exists to catch.
  */
-async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
+// 这一轮有没有在焦点路由上发过压缩请求，结果如何。调用方真正关心的是「发过没有」：只要压缩请求
+// 发出去了，漂移检测记下的上一次请求就是它，而紧接着的焦点请求会把本轮注入当作易变尾部排除掉，
+// 前缀比压缩请求少一块，必然判成重建——压缩失败、账本原封未动时也一样。
+type LedgerCompactionOutcome = "not-needed" | "compacted" | "failed";
+
+async function compactLedgerIfNeeded(client: LlmClient): Promise<LedgerCompactionOutcome> {
   const ledger = conversationLedger.snapshot();
   const plan = planLedgerCompaction(ledger, DEFAULT_LEDGER_COMPACTION_OPTIONS);
   if (!plan) {
-    return false;
+    return "not-needed";
   }
 
   const startedAt = Date.now();
@@ -5028,12 +5033,12 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
       `Kept the full transcript.\n${error instanceof Error ? error.message : String(error)}`,
       client.model,
     );
-    return false;
+    return "failed";
   }
 
   if (!summary.trim()) {
     pushMonitorEntry("error", "Ledger Compaction Failed", "The summary came back empty; kept the full transcript.");
-    return false;
+    return "failed";
   }
 
   const before = conversationLedger.size;
@@ -5053,7 +5058,7 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<boolean> {
     ].join("\n"),
     client.model,
   );
-  return true;
+  return "compacted";
 }
 
 // 所有群共用一本账本，焦点循环一次只能跑一个。回复任务按群排队（reply:<群号>），不同群的批次会同时
@@ -5137,14 +5142,17 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     conversationLedger.appendUserText(buildFocusNotificationInjection(injection));
   }
 
-  const compacted = await compactLedgerIfNeeded(client);
+  const compaction = await compactLedgerIfNeeded(client);
 
   const startedAt = Date.now();
   // 本轮真正进了群的话。空数组就是「看过、没开口」——思考面板据此上色。
   const sentMessages: string[] = [];
   try {
     const result = await client.runToolLoop({
-      expectRebuild: compacted,
+      // 只要这一轮在焦点路由上发过压缩请求（成败都算），紧接着的第一次请求就一定判成重建：成功时
+      // 账本前段换成了摘要，失败时前缀比压缩请求少了本轮注入那一块。以前只在成功时豁免，压缩失败会
+      // 在监控里留下一条假的 Prefix Drift。豁免只作用于这次循环的第一轮，见 llm-client 的 runToolLoop。
+      expectRebuild: compaction !== "not-needed",
       messages: [...conversationLedger.snapshot()],
       tools: [...QQ_TOOL_DEFINITIONS],
       runTool: buildFocusToolRunner(groupKey, (_conversationId, message) => sentMessages.push(message)),

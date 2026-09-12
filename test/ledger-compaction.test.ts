@@ -11,7 +11,8 @@ import {
   renderLedgerSummaryTurn,
 } from "../ledger-compaction.js";
 import { ConversationLedger } from "../conversation-ledger.js";
-import { buildClaudeRequestBody, type LlmMessage } from "../llm-client.js";
+import { buildClaudeRequestBody, digestClaudeCachedPrefix, type LlmMessage } from "../llm-client.js";
+import { CachePrefixTracker } from "../cache-prefix.js";
 import { QQ_TOOL_DEFINITIONS } from "../qq-tools.js";
 import { buildFocusSystemPrompt } from "../focus-prompt.js";
 
@@ -188,6 +189,26 @@ test("the compaction request extends the focus loop's request byte for byte", ()
   assert.deepEqual(compactionBlocks.slice(0, focusBlocks.length), focusBlocks);
   // 焦点请求缓存到的位置，整个落在摘要请求的缓存范围之内。
   assert.ok(breakpointIndex(compaction) >= breakpointIndex(focus));
+});
+
+// 反过来看这对请求的先后。压缩请求在焦点路由上发出之后，下一次焦点请求哪怕面对一模一样的账本（压缩
+// 失败、什么都没替换），检测器也会判成重建：压缩请求把整本账本算进了缓存前缀，焦点请求却把最后一条
+// 当作易变尾部排除在外，前缀少了一块。所以 main.ts 在「发过压缩请求」时就给紧接着的第一轮标上
+// expectRebuild，而不是只在压缩成功时——否则每次压缩失败都会留下一条假的 Prefix Drift。
+test("after a compaction request, the next focus request inspects as rebuilt even if the ledger is unchanged", () => {
+  const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
+  assert.ok(plan);
+  const system = buildFocusSystemPrompt("你是 Holly。").trim();
+  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...QQ_TOOL_DEFINITIONS] };
+  const tracker = new CachePrefixTracker();
+  const inspect = (messages: LlmMessage[]) => tracker.inspect(
+    "claude-sonnet-4-6|focus-ledger",
+    digestClaudeCachedPrefix(buildClaudeRequestBody("claude-sonnet-4-6", system, messages, options)),
+  ).status;
+
+  assert.equal(inspect(LEDGER), "fresh");
+  assert.equal(inspect(buildLedgerCompactionMessages(LEDGER, plan)), "extended");
+  assert.equal(inspect(LEDGER), "rebuilt");
 });
 
 // --- the instruction and the summary turn -----------------------------------

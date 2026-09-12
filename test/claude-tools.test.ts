@@ -1,8 +1,12 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import {
   buildClaudeRequestBody,
+  createLlmClient,
   digestClaudeCachedPrefix,
   parseClaudeToolUses,
   runClaudeToolLoop,
@@ -218,6 +222,86 @@ test("the loop runs a tool, feeds the result back, and stops at end_turn", async
     assert.equal(result.messages[2].blocks?.[0].type, "tool_result");
   } finally {
     restore();
+  }
+});
+
+// 调用方按轮次解读前缀检查：只有第一轮的请求内容来自调用方，之后每一轮都只是在后面追加这次循环
+// 自己的轮次，必须是延长（见 llm-client 里 runToolLoop 的 expectRebuild）。所以轮次编号要如实传出。
+test("inspectBody is told which round each request belongs to", async () => {
+  const restore = stubFetch([
+    {
+      stop_reason: "tool_use",
+      content: [{ type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Paris" } }],
+    },
+    { stop_reason: "end_turn", content: [{ type: "text", text: "18C in Paris" }] },
+  ]);
+  try {
+    const rounds: number[] = [];
+    await runClaudeToolLoop({
+      model: "claude-sonnet-4-6",
+      systemPrompt: "sys",
+      messages: [{ role: "user", content: "weather?" }],
+      tools: [WEATHER],
+      runTool: async () => "18C",
+      recordUsage: noUsage,
+      inspectBody: (_body, round) => { rounds.push(round); },
+    });
+
+    assert.deepEqual(rounds, [1, 2]);
+  } finally {
+    restore();
+  }
+});
+
+// 真正改变行为的是客户端这一层：runToolLoop 只把 expectRebuild 交给第一轮。发过压缩请求的那一轮要
+// 豁免第一次请求，但第二轮以后只是在后面追加，真出了漂移必须照常报 error，不能跟着被豁免。
+test("runToolLoop excuses only its first round when the caller expects a rebuild", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "holly-tool-loop-"));
+  const configPath = join(dir, "config.yaml");
+  let restore = (): void => {};
+  try {
+    await writeFile(configPath, [
+      "llm:",
+      "  active: claude_sonnet",
+      "  decision_profile: claude_sonnet",
+      "  system_prompt: sys",
+      "  profiles:",
+      "    claude_sonnet:",
+      "      provider: claude",
+      "      model: claude-sonnet-4-6",
+      "",
+    ].join("\n"), "utf8");
+    const excused: boolean[] = [];
+    const client = await createLlmClient(configPath, undefined, {
+      cachePrefixObserver: (event) => { excused.push(event.expectRebuild); },
+    });
+    // 客户端建好之后再换掉 fetch：模拟的响应只该被这次循环的两轮消耗。
+    restore = stubFetch([
+      {
+        stop_reason: "tool_use",
+        usage: { input_tokens: 10, output_tokens: 5 },
+        content: [{ type: "tool_use", id: "tu_1", name: "get_weather", input: { city: "Paris" } }],
+      },
+      {
+        stop_reason: "end_turn",
+        usage: { input_tokens: 12, output_tokens: 5 },
+        content: [{ type: "text", text: "18C in Paris" }],
+      },
+    ]);
+
+    await client.runToolLoop({
+      messages: [{ role: "user", content: "weather?" }],
+      tools: [WEATHER],
+      runTool: async () => "18C",
+      purpose: "focus-loop",
+      cacheRoute: "focus-ledger",
+      expectRebuild: true,
+    });
+
+    assert.deepEqual(excused, [true, false]);
+  } finally {
+    restore();
+    await rm(dir, { recursive: true, force: true });
   }
 });
 
