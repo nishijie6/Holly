@@ -80,3 +80,40 @@ test("autonomy tick thought exposes shadow proactive output", () => {
   assert.equal(thought.finalAnswer, "这个新模型的推理速度挺有意思");
   assert.match(thought.summary, /影子模式 1/);
 });
+
+test("autonomy tick thought shows why the model chose to observe the world", () => {
+  const result: AutonomyLoopResult = {
+    action: { type: "observe_world", topic: "天文学", reason: "天文三个小时没看了", observed: true },
+    checks: [{
+      name: "world_observation",
+      status: "acted",
+      reason: "已完成“天文学”世界观察，获得 3 个来源",
+      nextEligibleAt: null,
+    }],
+  };
+
+  const thought = buildAutonomyTickThought(result, NOW);
+  assert.equal(thought.outcome, "world_observed");
+  assert.match(thought.summary, /主题为“天文学”/);
+  assert.match(thought.summary, /观察原因：天文三个小时没看了/);
+});
+
+test("世界观察没被选中的那一行不进 Thoughts，其余明细照常列出", () => {
+  const result: AutonomyLoopResult = {
+    action: { type: "do_nothing", reason: "三个话题最近都刚看过，这一轮静观即可" },
+    checks: [
+      { name: "world_observation", status: "deferred", reason: "模型本轮选择优先做别的", nextEligibleAt: null },
+      { name: "memory_reflection", status: "waiting", reason: "距离上次完成尚未达到配置间隔", nextEligibleAt: NOW + 42 * 60_000 },
+      { name: "archive_writing", status: "disabled", reason: "归档写作已关闭", nextEligibleAt: null },
+      // 只去掉世界观察那一行：群聊主动开口的顺延只在有事可做时才出现，不是每分钟的固定噪声。
+      { name: "group_proactive", status: "deferred", reason: "模型本轮选择优先做别的", nextEligibleAt: null },
+    ],
+  };
+
+  const thought = buildAutonomyTickThought(result, NOW);
+  assert.doesNotMatch(thought.summary, /世界观察：/);
+  assert.match(thought.summary, /未行动原因：三个话题最近都刚看过/);
+  assert.match(thought.summary, /记忆反思：等待中/);
+  assert.match(thought.summary, /归档写作：已关闭/);
+  assert.match(thought.summary, /群聊主动开口：本轮顺延/);
+});

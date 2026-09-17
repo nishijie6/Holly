@@ -1,19 +1,13 @@
-// L1: the one place every timer / WS trigger turns "something happened" into
-// a typed event, instead of each timer deciding what to do and calling the
-// model itself (main.ts's dispatchAgentEvent is L2: the single place a
-// dispatched event turns into an actual, route-serialized model call via
-// RouteQueue).
+// L1：所有定时器和 WebSocket 触发都只在这里把「有事发生」转换成类型化事件，
+// 而不是各自判断该做什么并直接调用模型。main.ts 中的 dispatchAgentEvent 是 L2：
+// 它负责把已分发的事件转换成由 RouteQueue 按路由串行执行的真实模型调用。
 //
-// Events are bare signals, never payloads — the same lesson kagami's
-// AGENTS.md documents for its "Foreground Input" path: separate the knock
-// from the content, pull content fresh at dispatch time. This fits Holly's
-// existing shape for free, since unreadModelMessagesByGroup/dirtyGroupKeys
-// are already the source of truth for content; the event only says "go
-// look," so a message that arrives between push and dispatch is never lost
-// or duplicated — the buffer it lands in is read at dispatch time either way.
+// 事件只传信号，不携带业务数据。这与 kagami 的 AGENTS.md 为「Foreground Input」
+// 路径记录的原则相同：把通知与内容分开，在分发时重新读取最新内容。Holly 已将
+// unreadModelMessagesByGroup 作为内容的唯一事实来源，事件只表示「去看看」；因此，
+// 在入队和分发之间到达的消息既不会丢失也不会重复，分发时总会读取它所在的缓冲区。
 export type AgentEvent =
   | { type: "message_batch_ready"; groupKey: string }
-  | { type: "context_warm_due"; groupKey: string }
   | { type: "autonomy_tick_due" };
 
 export type AgentEventLogEntry = {
@@ -37,13 +31,10 @@ export class AgentEventQueue {
     this.handlers.push(handler);
   }
 
-  // Dispatches synchronously, in push order — Holly's scale doesn't need a
-  // real async drain loop, and every source already coalesces before pushing
-  // (a group has at most one pending batch/warm state). A handler that
-  // throws is isolated so it never stops the next handler, or the next
-  // pushed event, from running; a handler kicking off async work (RouteQueue)
-  // is expected to handle its own rejection instead of letting it surface
-  // here, exactly like today's per-call .catch() blocks in main.ts.
+  // 按入队顺序同步分发。Holly 当前的规模不需要真正的异步排空循环，而且各事件源
+  // 会在入队前先合并，同一个群最多只有一个待处理批次。单个处理器抛错会被隔离，
+  // 不会阻止后续处理器或后续事件运行；通过 RouteQueue 启动异步工作的处理器应自行
+  // 处理拒绝，方式与 main.ts 中各调用点的 .catch() 一致。
   push(event: AgentEvent): void {
     this.history.push({ event, at: this.now() });
     if (this.history.length > MAX_HISTORY) {
@@ -58,9 +49,8 @@ export class AgentEventQueue {
     }
   }
 
-  // Most recent first isn't the point here — callers (the monitor panel)
-  // want "what happened, in order," so oldest-of-the-window first, newest
-  // last, matching how conversation turns and monitor entries already read.
+  // 返回当前窗口内按时间正序排列的事件，供监控面板依次展示发生过的事情；这与
+  // 对话轮次和监控记录的既有读取顺序一致。
   recent(limit = DEFAULT_RECENT_LIMIT): readonly AgentEventLogEntry[] {
     if (limit <= 0) return [];
     return this.history.slice(Math.max(0, this.history.length - limit));

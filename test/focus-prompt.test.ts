@@ -47,15 +47,20 @@ test("focus 协议和决策协议是两份不同的东西", () => {
   assert.equal(FOCUS_LOOP_PROMPT.includes("Return JSON only"), false);
 });
 
-test("协议交代了三个工具、以及不调工具就是不做事", () => {
-  for (const tool of ["list_conversations", "open_conversation", "send_message"]) {
+test("协议交代了五个工具、以及不调工具就是不做事", () => {
+  for (const tool of ["list_conversations", "open_conversation", "send_message", "search_web", "read_page"]) {
     assert.ok(FOCUS_LOOP_PROMPT.includes(tool), `协议里该讲清 ${tool}`);
   }
   assert.match(FOCUS_LOOP_PROMPT, /不调任何工具就结束这一轮/u);
 });
 
-test("协议说明本模式没有搜索,免得模型许一个办不到的承诺", () => {
-  assert.match(FOCUS_LOOP_PROMPT, /没有联网搜索工具/u);
+// 这条以前是反过来的：协议写着「你没有联网搜索工具」,她照着跟人说自己查不了。加了
+// search_web 之后那句话必须消失,否则她会守着工具声称自己不能联网。
+test("协议让她去搜,而不是声称自己不能联网", () => {
+  assert.equal(FOCUS_LOOP_PROMPT.includes("没有联网搜索工具"), false);
+  assert.equal(FOCUS_LOOP_PROMPT.includes("你搜不了"), false);
+  // 搜索期间先说一句话是这个工具的一半价值,协议里必须交代 saying 怎么用。
+  assert.match(FOCUS_LOOP_PROMPT, /saying/u);
 });
 
 test("system prompt 是 persona 接协议,persona 在前", () => {

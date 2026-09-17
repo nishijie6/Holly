@@ -9,12 +9,12 @@ test("events dispatch to a handler in push order", () => {
   queue.onEvent((event) => seen.push(event));
 
   queue.push({ type: "message_batch_ready", groupKey: "A" });
-  queue.push({ type: "context_warm_due", groupKey: "A" });
+  queue.push({ type: "message_batch_ready", groupKey: "B" });
   queue.push({ type: "autonomy_tick_due" });
 
   assert.deepEqual(seen, [
     { type: "message_batch_ready", groupKey: "A" },
-    { type: "context_warm_due", groupKey: "A" },
+    { type: "message_batch_ready", groupKey: "B" },
     { type: "autonomy_tick_due" },
   ]);
 });
@@ -49,12 +49,12 @@ test("a handler that throws does not stop the next pushed event from dispatching
   let calls = 0;
   queue.onEvent((event) => {
     calls += 1;
-    if (event.type === "context_warm_due") {
+    if (event.type === "message_batch_ready") {
       throw new Error("boom");
     }
   });
 
-  queue.push({ type: "context_warm_due", groupKey: "A" });
+  queue.push({ type: "message_batch_ready", groupKey: "A" });
   queue.push({ type: "autonomy_tick_due" });
 
   assert.equal(calls, 2);

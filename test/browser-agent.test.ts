@@ -1,7 +1,35 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { planBrowseCandidates, screenSearchResults } from "../browser-agent.js";
+import { isSafeExternalPageUrl, planBrowseCandidates, screenSearchResults } from "../browser-agent.js";
+
+// read_page 的 URL 是模型自己写的，会直接进浏览器。这台机器上 SearxNG、NapCat、Qdrant
+// 都在本地端口听着，一个内网地址就能把自家后台读出来发进群，所以这道闸只放行公网网页。
+test("isSafeExternalPageUrl 只放行公网 http/https", () => {
+  for (const url of [
+    "https://www.quantamagazine.org/mathematics/",
+    "http://example.com/a?b=1",
+  ]) {
+    assert.equal(isSafeExternalPageUrl(url), true, `${url} 该放行`);
+  }
+  for (const url of [
+    "http://127.0.0.1:8888/search?q=x",
+    "http://localhost:3000/",
+    "http://192.168.1.10/admin",
+    "http://10.0.0.5/",
+    "http://172.16.0.1/",
+    "http://169.254.169.254/latest/meta-data/",
+    "http://[::1]:6333/collections",
+    "http://napcat.local/",
+    "file:///path/to/Holly/.env",
+    "javascript:alert(1)",
+    "data:text/html,<script>1</script>",
+    "不是个网址",
+    "",
+  ]) {
+    assert.equal(isSafeExternalPageUrl(url), false, `${url} 该拦下`);
+  }
+});
 
 // 固定来源每轮都读，不能和搜索结果抢那几个名额。
 test("planBrowseCandidates puts fixed sources first and gives them their own page budget", () => {

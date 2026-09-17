@@ -18,6 +18,8 @@ const CONVERSATIONS: ConversationSummary[] = [
 function harness(overrides: Partial<QqToolDeps> = {}) {
   let focus: string | null = null;
   const sent: Array<{ id: string; message: string }> = [];
+  const searched: string[] = [];
+  const read: string[] = [];
   const deps: QqToolDeps = {
     listConversations: async () => CONVERSATIONS,
     readConversation: async (id) => (CONVERSATIONS.some((c) => c.id === id) ? [`${id} 的最近消息`] : null),
@@ -26,6 +28,14 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
     setFocus: (id) => { focus = id; },
     canSend: () => ({ allowed: true, reason: "" }),
     roundConversationId: null,
+    searchWeb: async (query) => {
+      searched.push(query);
+      return { ok: true, text: `[联网搜索结果] 关于「${query}」查到以下资料` };
+    },
+    readPage: async (url) => {
+      read.push(url);
+      return { ok: true, text: `[网页正文] ${url}` };
+    },
     ...overrides,
   };
   const bind = (run: ReturnType<typeof createQqToolRunner>) =>
@@ -35,14 +45,16 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
   // 下一轮：焦点和发送记录沿用，runner 新建一个——main.ts 每轮就是这么做的。
   const nextRound = (roundConversationId: string | null) =>
     bind(createQqToolRunner({ ...deps, roundConversationId }));
-  return { call, nextRound, sent, focus: () => focus };
+  return { call, nextRound, sent, searched, read, focus: () => focus };
 }
 
-test("the three tools are declared with closed schemas", () => {
+test("the five tools are declared with closed schemas", () => {
   assert.deepEqual(QQ_TOOL_DEFINITIONS.map((t) => t.name), [
     "list_conversations",
     "open_conversation",
     "send_message",
+    "search_web",
+    "read_page",
   ]);
   for (const tool of QQ_TOOL_DEFINITIONS) {
     assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} should reject extra args`);
@@ -197,4 +209,146 @@ test("an unknown tool name is refused rather than throwing", async () => {
   const result = await call("delete_everything", {});
   assert.equal(result.ok, false);
   assert.match(result.error, /unknown tool/);
+});
+
+// --- search_web ------------------------------------------------------------
+//
+// 一次搜索十几秒。工具自己先把「我搜一下」发出去，是为了让等的人立刻看见动静；下面几条
+// 钉的是这句话的边界：只发一次、不发到错的群、发不出去也不耽误搜索。
+
+test("search_web 先把那句话发到当前会话,再去搜", async () => {
+  const { call, sent, searched } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("search_web", { query: "长沙 天气", saying: "我搜一下哈" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, true);
+  assert.match(result.results, /长沙 天气/);
+  assert.deepEqual(sent, [{ id: "qq_group:100", message: "我搜一下哈" }]);
+  assert.deepEqual(searched, ["长沙 天气"]);
+});
+
+test("一轮里搜第二次,不再重复说「我搜一下」", async () => {
+  const { call, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  const second = await call("search_web", { query: "长沙 明天 天气", saying: "再搜一下" });
+  assert.equal(second.ok, true);
+  assert.equal(second.noticeSent, false);
+  assert.equal(sent.length, 1);
+});
+
+test("saying 留空也有一句兜底的话,不让人干等", async () => {
+  const { call, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("search_web", { query: "OpenAI 最新模型" });
+  assert.equal(sent.length, 1);
+  assert.ok(sent[0].message.trim().length > 0);
+});
+
+test("焦点还停在上一轮的会话上时,那句话不会误发过去,搜索照做", async () => {
+  const { call, nextRound, sent, searched } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound("qq_group:200");
+  const result = await round("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(searched, ["长沙 天气"]);
+});
+
+test("发送被抑制时不发那句话,但搜索照样做完", async () => {
+  const { call, sent, searched } = harness({
+    canSend: () => ({ allowed: false, reason: "QQ 处于观察模式，不发送。" }),
+  });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(searched, ["长沙 天气"]);
+});
+
+test("那句话发失败,搜索不受影响", async () => {
+  const { call, searched } = harness({
+    sendToConversation: async () => { throw new Error("NapCat 断线"); },
+  });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, false);
+  assert.deepEqual(searched, ["长沙 天气"]);
+});
+
+test("空 query 直接拒,不会白发一句「我搜一下」", async () => {
+  const { call, sent, searched } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("search_web", { query: "   ", saying: "我搜一下" });
+  assert.equal(result.ok, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(searched, []);
+});
+
+test("搜索不可用时,把原因原样交回模型", async () => {
+  const { call } = harness({
+    searchWeb: async () => ({ ok: false, text: "联网搜索当前没有启用。" }),
+  });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /没有启用/);
+});
+
+// --- read_page -------------------------------------------------------------
+
+test("read_page 先说一句再打开页面,正文交回模型", async () => {
+  const { call, sent, read } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("read_page", { url: "https://example.com/a", saying: "我点进去看看" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, true);
+  assert.match(result.content, /example\.com/);
+  assert.deepEqual(sent, [{ id: "qq_group:100", message: "我点进去看看" }]);
+  assert.deepEqual(read, ["https://example.com/a"]);
+});
+
+// 搜一下、再点开细看，是一轮里最常见的组合。两个工具共用同一个「本轮已经说过」的标记，
+// 否则她会连着说「我搜一下」「我点进去看看」，像在自言自语。
+test("搜完紧接着点开,不再重复吆喝一声", async () => {
+  const { call, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  const opened = await call("read_page", { url: "https://example.com/a", saying: "我点进去看看" });
+  assert.equal(opened.ok, true);
+  assert.equal(opened.noticeSent, false);
+  assert.deepEqual(sent, [{ id: "qq_group:100", message: "我搜一下" }]);
+});
+
+test("空 url 直接拒,不会白发一句话", async () => {
+  const { call, sent, read } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("read_page", { url: "   ", saying: "我点进去看看" });
+  assert.equal(result.ok, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(read, []);
+});
+
+test("页面打不开时,原因原样交回模型", async () => {
+  const { call } = harness({
+    readPage: async () => ({ ok: false, text: "这个地址不能打开：只支持公网的 http/https 网页。" }),
+  });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("read_page", { url: "http://127.0.0.1:8888/", saying: "我看看" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /公网/);
+});
+
+test("焦点还停在上一轮的会话上时,那句话不会误发过去,页面照读", async () => {
+  const { call, nextRound, sent, read } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound("qq_group:200");
+  const result = await round("read_page", { url: "https://example.com/a", saying: "我点进去看看" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(read, ["https://example.com/a"]);
 });

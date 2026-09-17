@@ -214,7 +214,7 @@ test("per-client token queues cannot overwrite each other and preserve completio
   };
 
   firstClient.record(first, "reply-decision");
-  secondClient.record(second, "context-warm");
+  secondClient.record(second, "focus-loop");
   firstClient.record(second, "memory-reflection");
 
   assert.deepEqual(firstClient.consume(), {
@@ -225,7 +225,7 @@ test("per-client token queues cannot overwrite each other and preserve completio
   });
   assert.deepEqual(secondClient.consume(), {
     model: "claude-sonnet-4-6",
-    purpose: "context-warm",
+    purpose: "focus-loop",
     ...second,
     capturedAt: 2_000,
   });
@@ -260,7 +260,7 @@ test("a call's cache hit rate is measured against the input it actually accounte
   });
 });
 
-test("a warm call that only writes cache reports a 0% hit rather than nothing", async () => {
+test("a call that only writes cache reports a 0% hit rather than nothing", async () => {
   const { summarizePromptCacheCall } = await loadUsageModule();
   assert.deepEqual(summarizePromptCacheCall({
     inputTokens: 54_643,
@@ -358,13 +358,13 @@ test("each queued call keeps the purpose it was made for, in completion order", 
     outputTokens: 1,
   };
 
-  // A warm and the reply that reads it back are the same model on the same
-  // client: only the purpose tells the write apart from the read it paid for.
-  client.record(usage, "context-warm");
-  client.record(usage, "reply-decision");
+  // 账本压缩和紧接着的焦点循环用的是同一个模型、同一个 client，只有 purpose 能把
+  // 两次调用区分开。
+  client.record(usage, "ledger-compaction");
+  client.record(usage, "focus-loop");
 
-  assert.equal(client.consume()?.purpose, "context-warm");
-  assert.equal(client.consume()?.purpose, "reply-decision");
+  assert.equal(client.consume()?.purpose, "ledger-compaction");
+  assert.equal(client.consume()?.purpose, "focus-loop");
   assert.equal(client.consume(), null);
 });
 
@@ -394,7 +394,7 @@ test("the hourly series keeps empty hours as gaps instead of dropping them", asy
   assert.equal(series[2].inputTokens, 1_000);
 });
 
-test("the purpose rollup separates what warming wrote from what replies read back", async () => {
+test("the purpose rollup keeps a purpose that only writes apart from one that reads back", async () => {
   const {
     addSummaryToPromptCacheCounts,
     buildPromptCachePurposeStats,
@@ -402,7 +402,7 @@ test("the purpose rollup separates what warming wrote from what replies read bac
     summarizePromptCacheCall,
   } = await loadUsageModule();
 
-  const warm = summarizePromptCacheCall({
+  const writer = summarizePromptCacheCall({
     inputTokens: 50_000,
     uncachedInputTokens: 0,
     cacheCreationInputTokens: 50_000,
@@ -416,18 +416,18 @@ test("the purpose rollup separates what warming wrote from what replies read bac
     cacheReadInputTokens: 50_000,
     outputTokens: 200,
   }, "claude-sonnet-4-6");
-  assert.ok(warm && reply);
+  assert.ok(writer && reply);
 
   const stats = buildPromptCachePurposeStats(new Map([
-    ["context-warm", addSummaryToPromptCacheCounts(emptyPromptCacheCounts(), warm, 1)],
+    ["ledger-compaction", addSummaryToPromptCacheCounts(emptyPromptCacheCounts(), writer, 1)],
     ["reply-decision", addSummaryToPromptCacheCounts(emptyPromptCacheCounts(), reply, 200)],
   ]));
 
   const byPurpose = Object.fromEntries(stats.map((stat) => [stat.purpose, stat]));
-  assert.equal(byPurpose["context-warm"].hitRate, 0);
-  assert.equal(byPurpose["context-warm"].cacheCreationInputTokens, 50_000);
+  assert.equal(byPurpose["ledger-compaction"].hitRate, 0);
+  assert.equal(byPurpose["ledger-compaction"].cacheCreationInputTokens, 50_000);
   assert.equal(byPurpose["reply-decision"].cacheReadInputTokens, 50_000);
-  // The warm paid for itself here: the reply read back everything it wrote.
+  // 分开记，只写不读的那个用途拉不低读回来的那个用途的命中率。
   assert.ok(byPurpose["reply-decision"].hitRate! > 0.98);
 });
 

@@ -4,7 +4,7 @@
 // for the same reason as decision-prompt.ts: one place to read and edit what
 // actually reaches the model, without hunting through main.ts's business logic.
 import { type ProactiveWorldObservation } from "./proactive-engine.js";
-import { type AutonomyJudgmentRequest } from "./autonomy-engine.js";
+import { type AutonomyJudgmentRequest, type WorldTopicStatus } from "./autonomy-engine.js";
 import { type BroadcastSourceKind } from "./world-observation-freshness.js";
 
 export const WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT =
@@ -149,7 +149,7 @@ export function selectBroadcastItems(
 // 当没筛过。
 
 export const SEARCH_RESULT_JUDGE_SYSTEM_PROMPT =
-  "You screen web search results before any page is opened for Holly's hourly world observation, and return structured JSON only.";
+  "You screen web search results before any page is opened for Holly's world observation, and return structured JSON only.";
 
 export type SearchResultForJudge = { title: string; url: string; snippet: string };
 
@@ -238,8 +238,8 @@ export const MEMORY_REFLECTION_SYSTEM_PROMPT =
 
 // Split into the half that repeats between calls and the half that does not, so
 // the caller can put a cache breakpoint between them. The instructions and the
-// world observations are shared by consecutive ticks (observations arrive about
-// hourly, this runs about every half hour); now/reason and the memory and
+// world observations are shared by consecutive ticks (a new observation only
+// appears when Holly goes looking); now/reason and the memory and
 // conversation windows change on nearly every call, and used to sit *ahead* of
 // the material — a timestamp at the front of the prefix invalidates everything
 // after it, so the order matters as much as the split.
@@ -324,11 +324,24 @@ function candidateLine(label: string, candidate: { eligible: boolean; note: stri
   return `- ${label}: ${candidate.eligible ? "可选" : "不可选"} — ${candidate.note}`;
 }
 
+// 世界观察可选时，逐个话题列出上次什么时候看的、看完怎样了。判断「要不要去、看哪个」要的就是这几条
+// 事实：刚看过又发了的话题不急，上次页面上没新东西的可以缓缓，很久没看的才可能攒了新动态。分钟数
+// 跟 autonomy-engine.ts 的 freshnessNote 一样取整分钟，同一段提示词里不混两种写法。
+function worldTopicLines(topics: readonly WorldTopicStatus[], nowMs: number): string[] {
+  return topics.map((status) => {
+    const when = status.lastAt > 0
+      ? `${Math.max(0, Math.round((nowMs - status.lastAt) / 60_000))} 分钟前看过`
+      : "最近没有看过的记录";
+    return `  · ${status.topic}：${when}${status.outcome ? `，${status.outcome}` : ""}`;
+  });
+}
+
 export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): string {
   return [
     "现在是自主循环的一次 tick。下面是当前可以从中选择的候选，只列出真实状态，没有对话内容。",
     "",
     candidateLine("world_observation（浏览网页，产出一条世界观察）", request.worldObservation),
+    ...worldTopicLines(request.worldTopics, Date.parse(request.nowIso)),
     candidateLine("memory_reflection（写一条内部记忆）", request.memoryReflection),
     candidateLine("archive_writing（写一篇文章或一首诗）", request.archiveWriting),
     `- group_proactive（主动在某个群里接话）: 可选 — ${request.groupProactiveNote}`,
@@ -338,7 +351,76 @@ export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): s
     "",
     "从「可选」的候选里挑一个最值得现在做的，或者选 do_nothing（这一轮什么都不做也完全正常，大多数 tick 应该如此）。",
     "不可选的候选禁止选中——它们的 interval/重试窗口还没到。",
+    "world_observation 没有固定间隔，几乎一直可选，这不代表该去。只有真对某个话题起了兴趣、想看看它最近有什么新动态时才选它，并在 topic 里填那个话题的原文：挑现在最好奇、也最可能攒了新东西的。刚看过的话题（尤其几十分钟内看过的）、上次没看到新东西的话题，再去多半还是同样的内容。看完要不要发到群里，之后会单独判断，不用在这里考虑。",
+    "选其他动作时 topic 填空串。",
     "返回 JSON only，shape：",
-    '{"action": "do_nothing" | "world_observation" | "memory_reflection" | "archive_writing" | "group_proactive", "reason": "一句简短中文，说明为什么选它（或为什么什么都不做）"}',
+    '{"action": "do_nothing" | "world_observation" | "memory_reflection" | "archive_writing" | "group_proactive", "topic": "话题原文；不是 world_observation 时填空串", "reason": "一句简短中文，说明为什么选它（或为什么什么都不做）"}',
   ].join("\n");
+}
+
+// ---------- 看完之后要不要发到群里 ----------
+//
+// 播报以前只要过了日期、冷场、去重几道闸就一定发出去，Holly 自己从没被问过「这条想不想说」。闸门只
+// 回答得了「能不能发」——是不是最近 24 小时的、群里是不是正在聊、是不是发过了；回答不了「值不值得
+// 发」：一条增量很小的融资消息、连着几轮没人接的播报、跟群里气氛完全不搭的内容，闸门统统放行。
+//
+// 这一步放在改写之后：交给她的是真正会发出去的那几条中文，已经过了日期和去重。放在改写之前，她得
+// 先读几页原始网页摘录才判断得了，读的还多半是注定被日期闸门筛掉的噪声。代价是她说不发时，那次
+// 改写白做了。闸门照旧在前面拦，这一步只在「能发」的稿子里挑「想发」的，不替代任何一道闸。
+
+export const WORLD_OBSERVATION_SHARE_SYSTEM_PROMPT =
+  "You are Holly, deciding whether to share news you just read with one of your QQ groups. Return structured JSON only.";
+
+export type WorldObservationShareTurn = { timestamp: string; speaker: string; content: string };
+
+export function buildWorldObservationSharePrompt(input: {
+  topic: string;
+  // 北京时间，形如「2026-09-11 13:00」。
+  nowLabel: string;
+  groupId: string;
+  // 群里最后一条消息距今几分钟；null 表示查不到。
+  idleMinutes: number | null;
+  // 从旧到新。
+  recentTurns: readonly WorldObservationShareTurn[];
+  draft: string;
+}): string {
+  const turnsBlock = input.recentTurns
+    .map((turn) => `- [${turn.timestamp}] ${turn.speaker}: ${turn.content}`)
+    .join("\n");
+  return [
+    `你是 Holly。你刚自己上网看了看「${input.topic}」最近的动态，整理出了下面这条消息，准备发到群 ${input.groupId}。发不发由你决定。`,
+    "值得发：你自己确实觉得有意思，群里的人大概也会想知道，是你平时也会主动跟朋友提一句的东西。",
+    "可以不发的情况：内容平淡，或者只是很小的进展；你最近已经在这个群发过几条类似的消息却没人接话，再发就成了自说自话；群里正聊着别的事，插进去很突兀；现在这个时间点发不合适。",
+    "不用每次看到新闻都发，不发完全正常，看过的东西照样留在你的记忆里。只判断发不发，不要改写这条消息。",
+    '返回 JSON only，shape：{"send": true | false, "reason": "一句简短中文，说明为什么发或不发"}',
+    "",
+    `现在是 ${input.nowLabel}（北京时间）。`,
+    input.idleMinutes === null ? "群里最后一条消息是什么时候：不清楚。" : `群里最后一条消息在 ${input.idleMinutes} 分钟前。`,
+    "",
+    "群里最近的聊天（从旧到新，Holly 就是你自己）：",
+    turnsBlock || "(没有记录)",
+    "",
+    "准备发出的消息：",
+    input.draft,
+  ].join("\n");
+}
+
+export const WORLD_OBSERVATION_SHARE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  additionalProperties: false,
+  required: ["send", "reason"],
+  properties: {
+    send: { type: "boolean" },
+    reason: { type: "string" },
+  },
+};
+
+export type WorldObservationShareDecision = { send: boolean; reason: string };
+
+// send 必须是真正的布尔值，"true" 这样的字符串不算。解析不出表态就返回 null，调用方按「没点头」处理：不发。
+export function parseWorldObservationShareDecision(raw: unknown): WorldObservationShareDecision | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  if (typeof record.send !== "boolean") return null;
+  return { send: record.send, reason: typeof record.reason === "string" ? record.reason.trim() : "" };
 }

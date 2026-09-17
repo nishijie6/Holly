@@ -51,6 +51,13 @@ function formatCheck(check: AutonomyCheck, tickAt: number): string {
   return `- ${CHECK_LABELS[check.name]}：${STATUS_LABELS[check.status]}——${compact(check.reason, 600)}${wait}`;
 }
 
+// 世界观察取消固定间隔以后几乎每轮都可选，模型没选它的时候，这一行每分钟都是同一句「本轮顺延」，
+// 不带任何信息，只会把真正有用的明细淹掉——这一轮为什么没去看，「未行动原因」里已经写了。
+// 等重试、已行动、已关闭都还有信息量，照常列出。
+function shouldListCheck(check: AutonomyCheck): boolean {
+  return !(check.name === "world_observation" && check.status === "deferred");
+}
+
 function formatProactiveAnswers(result: AutonomyLoopResult): {
   groupId: string | null;
   finalAnswer: string;
@@ -93,6 +100,8 @@ export function buildAutonomyTickThought(
       lines.push(action.observed
         ? `本轮结果：已执行世界观察，主题为“${compact(action.topic, 160)}”。`
         : `本轮结果：已尝试世界观察“${compact(action.topic, 160)}”，但没有获得可用内容。`);
+      // 去不去、看哪个话题现在是模型自己挑的，理由要在监控页上看得见，才看得出它挑得对不对。
+      if (action.reason) lines.push(`观察原因：${compact(action.reason, 600)}`);
       outcome = action.observed ? "world_observed" : "world_empty";
       break;
     case "write_memory":
@@ -120,7 +129,7 @@ export function buildAutonomyTickThought(
     }
   }
 
-  lines.push("检查明细：", ...result.checks.map((check) => formatCheck(check, tickAt)));
+  lines.push("检查明细：", ...result.checks.filter(shouldListCheck).map((check) => formatCheck(check, tickAt)));
   const answer = formatProactiveAnswers(result);
   return {
     summary: lines.join("\n"),

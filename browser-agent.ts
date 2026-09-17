@@ -669,6 +669,27 @@ export async function browseTopicWithBrowserAgent(
   return browseUrlsWithBrowserAgent(cleanQuery, plan.urls, { ...config, maxPages: plan.maxPages }, logger, reputation);
 }
 
+// 模型自己给出的 URL 不能直接喂进浏览器。这台机器上跑着 SearxNG(127.0.0.1:8888)、
+// NapCat、Qdrant，一个内网地址就能让 Holly 把自家后台读出来发进群；file:// 更是直接
+// 读本地文件。所以只放行公网的 http/https，其余一律拒绝。搜索和世界观察的 URL 来自
+// 搜索引擎，不走这里；这道闸是给「模型说读哪个就读哪个」的路径准备的。
+const PRIVATE_HOST_PATTERN =
+  /^(localhost|127\.|0\.0\.0\.0$|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?f[cd])/i;
+
+export function isSafeExternalPageUrl(rawUrl: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(rawUrl.trim());
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+  const hostname = url.hostname.toLowerCase();
+  if (!hostname) return false;
+  if (hostname.endsWith(".local") || hostname.endsWith(".internal")) return false;
+  return !PRIVATE_HOST_PATTERN.test(hostname);
+}
+
 // Walks candidate URLs (a superset of maxPages, typically all of
 // searchTopK) until maxPages of them yield real content, instead of
 // visiting exactly the first maxPages and giving up if those happen to be

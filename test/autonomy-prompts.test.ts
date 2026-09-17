@@ -3,10 +3,13 @@ import test from "node:test";
 
 import {
   buildArchiveCompositionPrompt,
+  buildAutonomyJudgmentPrompt,
   buildMemoryReflectionPrompt,
   buildSearchResultJudgePrompt,
   buildWorldObservationBroadcastPrompt,
+  buildWorldObservationSharePrompt,
   isTruncatedBroadcastText,
+  parseWorldObservationShareDecision,
   selectBroadcastItems,
   selectJudgedSearchResults,
 } from "../autonomy-prompts.js";
@@ -305,5 +308,76 @@ test("selectJudgedSearchResults drops what the model rejected and keeps everythi
 test("selectJudgedSearchResults returns null when nothing in the reply is usable, so the caller does not screen", () => {
   for (const raw of [undefined, null, "keep all", {}, { decisions: [] }, { decisions: [{ index: "1", keep: false }, { index: 1 }] }]) {
     assert.equal(selectJudgedSearchResults(raw, MATH_SEARCH_RESULTS), null, JSON.stringify(raw));
+  }
+});
+
+test("世界观察可选时，判断提示词逐个话题列出上次什么时候看的、看完怎样了", () => {
+  const nowIso = "2026-09-14T12:00:00.000Z";
+  const nowMs = Date.parse(nowIso);
+  const prompt = buildAutonomyJudgmentPrompt({
+    nowIso,
+    worldObservation: { eligible: true, note: "距上次已 70 分钟" },
+    worldTopics: [
+      { topic: "人工智能", lastAt: nowMs - 52 * 60_000, outcome: "发到了群里" },
+      { topic: "天文学", lastAt: nowMs - 180 * 60_000, outcome: "" },
+      { topic: "数学", lastAt: 0, outcome: "" },
+    ],
+    memoryReflection: { eligible: false, note: "距离上次完成尚未达到配置间隔" },
+    archiveWriting: { eligible: false, note: "归档写作已关闭" },
+    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
+    pendingReplyGroupCount: 0,
+    lastActionSummary: "尚未行动过",
+  });
+
+  assert.match(prompt, /· 人工智能：52 分钟前看过，发到了群里\n/);
+  // 结局不清楚就不写，不留一个悬空的逗号。
+  assert.match(prompt, /· 天文学：180 分钟前看过\n/);
+  assert.match(prompt, /· 数学：最近没有看过的记录\n/);
+  assert.match(prompt, /"topic"/);
+});
+
+test("发不发的提示词带着话题、群里最近的聊天、冷场时长，成稿原样放在最后", () => {
+  const draft = "詹姆斯·韦布望远镜发现一颗新的系外行星。 https://example.com/b";
+  const prompt = buildWorldObservationSharePrompt({
+    topic: "天文学",
+    nowLabel: "2026-09-14 20:00",
+    groupId: "20000001",
+    idleMinutes: 95,
+    recentTurns: [
+      { timestamp: "2026-09-14T10:20:00.000Z", speaker: "Holly", content: "1. 韦布望远镜拍到新图像。 https://example.com/a" },
+      { timestamp: "2026-09-14T10:25:00.000Z", speaker: "小明(10001)", content: "今晚有人打游戏吗" },
+    ],
+    draft,
+  });
+
+  assert.match(prompt, /「天文学」/);
+  assert.match(prompt, /群 20000001/);
+  assert.match(prompt, /现在是 2026-09-14 20:00/);
+  assert.match(prompt, /群里最后一条消息在 95 分钟前/);
+  assert.match(prompt, /- \[2026-09-14T10:20:00\.000Z\] Holly: 1\. 韦布望远镜拍到新图像。/);
+  assert.match(prompt, /- \[2026-09-14T10:25:00\.000Z\] 小明\(10001\): 今晚有人打游戏吗/);
+  assert.match(prompt, /"send"/);
+  assert.ok(prompt.endsWith(`准备发出的消息：\n${draft}`));
+});
+
+test("查不到群里动静时，发不发的提示词如实说不清楚，而不是编一个冷场时长", () => {
+  const prompt = buildWorldObservationSharePrompt({
+    topic: "数学",
+    nowLabel: "2026-09-14 20:00",
+    groupId: "20000002",
+    idleMinutes: null,
+    recentTurns: [],
+    draft: "陶哲轩团队公布了新证明。 https://example.com/c",
+  });
+
+  assert.match(prompt, /群里最后一条消息是什么时候：不清楚/);
+  assert.match(prompt, /\(没有记录\)/);
+});
+
+test("parseWorldObservationShareDecision 只认真正的布尔表态，其余一律当没表态", () => {
+  assert.deepEqual(parseWorldObservationShareDecision({ send: false, reason: " 进展太小 " }), { send: false, reason: "进展太小" });
+  assert.deepEqual(parseWorldObservationShareDecision({ send: true }), { send: true, reason: "" });
+  for (const raw of [undefined, null, "send", [], {}, { send: "true", reason: "字符串不算" }, { send: 1 }]) {
+    assert.equal(parseWorldObservationShareDecision(raw), null, JSON.stringify(raw));
   }
 });

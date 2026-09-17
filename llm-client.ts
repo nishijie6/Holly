@@ -101,41 +101,26 @@ export type LlmClient = {
   systemPrompt: string;
   displayName: string;
   consumeTokenUsage(): import("./token-usage.js").CallTokenUsage | null;
-  // purpose is required so a new call site cannot land unattributed: it is what
-  // the token ledger and the per-call prompt-cache entry are keyed by.
+  // purpose 必填，防止新调用点产生无法归因的用量；token 账本和逐次提示缓存记录
+  // 都以它作为分类依据。
   //
-  // cacheRoute is required for the same reason, one level down: it names the
-  // prompt-cache lineage this request expects to hit, and every call is
-  // inspected against the last request on that route (see cache-prefix.ts). A
-  // call site that puts volatile text in the cached prefix is reported on its
-  // next request instead of quietly costing a full re-read forever. Requests
-  // meant to hit different cache entries (per group, per prompt shape) must
-  // pass different routes.
+  // cacheRoute 同样必填，但粒度更细：它标识本次请求预期命中的提示缓存谱系，每次调用
+  // 都会与同一路由的上一次请求比较（见 cache-prefix.ts）。如果调用点把易变文本放进
+  // 缓存前缀，下一次请求就会报告，而不会一直悄悄承担完整重读成本。预期命中不同缓存
+  // 条目（按群、按提示结构区分）的请求必须使用不同路由。
   generateText(input: {
     messages: LlmMessage[];
     systemPrompt?: string;
     jsonSchema?: Record<string, unknown>;
     purpose: LlmCallPurpose;
     cacheRoute: string;
-    // Set when the caller knowingly rebuilt the prefix (context compression
-    // dropping or rewriting old turns). The rebuild is still reported, just not
-    // as a defect.
+    // 调用方明确知道前缀已重建时设置，例如上下文压缩删改了旧轮次。重建仍会记录，
+    // 但不会标记为缺陷。
     expectRebuild?: boolean;
   }): Promise<string>;
-  // Re-send the context with max_tokens=1 purely to refresh the prompt cache.
-  // No-op for non-Claude providers (Anthropic-cache-specific). Always recorded
-  // as "context-warm" — the method is the purpose.
-  warmContext(input: {
-    messages: LlmMessage[];
-    systemPrompt?: string;
-    cacheRoute: string;
-    expectRebuild?: boolean;
-  }): Promise<void>;
-  // The agentic sibling of generateText. It exists on the client rather than as
-  // a bare function call so the focus pipeline inherits the same instrumentation
-  // every other call gets: per-purpose token accounting, cache-prefix inspection
-  // on every round, and the connection watchdog. Bypassing the client would make
-  // the one pipeline whose economics are under review the only unmeasured one.
+  // generateText 的智能体式对应方法。它挂在客户端上而不是裸函数，是为了让焦点管线
+  // 继承其他调用都有的观测能力：按用途统计 token、逐轮检查缓存前缀，以及连接看门狗。
+  // 绕过客户端会让这个正在评估成本的管线反而成为唯一未被测量的调用路径。
   runToolLoop(input: {
     messages: LlmMessage[];
     tools: LlmToolDefinition[];
@@ -214,10 +199,9 @@ const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 const codexRateLimitGate = new ProviderRateLimitGate({ provider: "Codex" });
 
 const CLAUDE_CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
-// On macOS, Claude Code stores its OAuth blob in the login Keychain, not in the
-// .credentials.json file (which is the Linux/CI location). Service + account
-// match what the CLI writes: service "Claude Code-credentials", account = the
-// current username.
+// 在 macOS 上，Claude Code 把 OAuth 数据存进登录钥匙串，而不是 Linux/CI 使用的
+// .credentials.json 文件。服务名和账户名与 CLI 的写入方式保持一致：服务名为
+// "Claude Code-credentials"，账户名为当前用户名。
 const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
 const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
@@ -225,10 +209,9 @@ const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
 const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 const claudeRateLimitGate = new ProviderRateLimitGate({ provider: "Claude" });
-const CLAUDE_CACHE_WARMUP_PLACEHOLDER = "warmup";
-// OAuth subscription tokens are only accepted when the first system block is this exact string.
+// OAuth 订阅 token 仅在第一个系统块与此字符串完全一致时才会被接受。
 const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
-// Opus 4.x supports 128K output tokens; Sonnet 4.6 / Haiku 4.5 cap at 64K.
+// Opus 4.x 支持 128K 输出 token；Sonnet 4.6 / Haiku 4.5 的上限为 64K。
 function claudeMaxOutputTokens(model: string): number {
   return /opus/i.test(model) ? 128_000 : 64_000;
 }
@@ -1028,9 +1011,8 @@ function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): 
     const volatile = index >= volatileFrom;
     const textBlocks: ClaudeMessageBlock[] = content ? [{ text: content, volatile }] : [];
     const last = merged[merged.length - 1];
-    // A structural turn opens its own message, and never absorbs a later one:
-    // merging would reorder tool_use/tool_result blocks relative to the prose
-    // the model paired them with.
+    // 结构化轮次必须独立成一条消息，不能吸收后续轮次；否则合并会打乱 tool_use /
+    // tool_result 块与模型原本配对正文之间的顺序。
     if (last && last.role === role && !structural && !last.structural) {
       last.blocks.push(...textBlocks);
     } else {
@@ -1042,18 +1024,16 @@ function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): 
     }
   }
 
-  // The Messages API requires the first message to be a user turn.
+  // Messages API 要求第一条消息必须是用户轮次。
   while (merged.length > 0 && merged[0].role === "assistant" && !merged[0].structural) {
     merged.shift();
   }
 
-  // It must also END with a user turn: a trailing assistant message is treated
-  // as prefill, which the subscription/OAuth models reject ("does not support
-  // assistant message prefill"). This happens on the cache-warm path, which
-  // sends history with no new user turn appended (its empty current message is
-  // dropped above), leaving the bot's own last reply as the final turn.
-  // A structural assistant turn is exempt: mid tool loop it is answered by the
-  // tool_result turn after it, and dropping it orphans that result's id.
+  // 最后一条消息也必须是用户轮次：末尾的助手消息会被当作预填充，而订阅/OAuth 模型
+  // 不支持助手消息预填充。如果调用方的当前消息为空并在上方被丢弃，机器人的上一条
+  // 回复就会落在末尾，因此需要移除。
+  // 结构化助手轮次除外：工具循环中它后面会紧跟对应的 tool_result；删除它会让结果 ID
+  // 失去所属的调用。
   while (
     merged.length > 0
     && merged[merged.length - 1].role === "assistant"
@@ -1075,8 +1055,7 @@ function buildClaudeMessagesBody(
     role: message.role,
     content: [
       ...message.blocks.map((block) => ({ type: "text", text: block.text })),
-      // Structural blocks always follow the prose of their own turn, matching
-      // the order the model emits them in.
+      // 结构化块始终紧跟本轮正文，保持模型生成时的原始顺序。
       ...(message.structural ?? []).map(toClaudeStructuralBlock),
     ],
   }));
@@ -1149,20 +1128,6 @@ export function buildClaudeRequestBody(
   }
 
   return body;
-}
-
-export function prepareClaudeCacheWarmRequest(messages: LlmMessage[]): {
-  messages: LlmMessage[];
-  options: ClaudeRequestOptions;
-} {
-  return {
-    messages: [...messages, { role: "user", content: CLAUDE_CACHE_WARMUP_PLACEHOLDER }],
-    options: {
-      maxTokens: 0,
-      cacheStablePrefix: true,
-      volatileTailMessages: 1,
-    },
-  };
 }
 
 function extractClaudeText(data: unknown): string {
@@ -1703,9 +1668,8 @@ export async function createLlmClient(
         runTool: input.runTool,
         options: { cacheStablePrefix: true, volatileTailMessages: 1 },
         recordUsage: recordUsageFor(input.purpose),
-        // Inspected per round, not per turn: each round is its own request, and
-        // a prefix that stops extending mid-loop is exactly the regression the
-        // ledger is meant to make impossible.
+        // 按循环轮数而不是消息轮次检查：每轮循环都是独立请求，而循环途中前缀停止延长
+        // 正是账本设计要阻止的回归。
         // expectRebuild 只交给第一轮，原因见 LlmClient.runToolLoop 的类型说明。
         inspectBody: (body, round) =>
           inspectPrefixFor(input.purpose, input.cacheRoute, round === 1 && (input.expectRebuild ?? false))(body),
@@ -1729,8 +1693,8 @@ export async function createLlmClient(
           {
             jsonSchema: input.jsonSchema,
             cacheStablePrefix: true,
-            // Every production generateText caller puts its per-request input in
-            // the final LlmMessage. Cache the stable history immediately before it.
+            // 生产环境中每个 generateText 调用方都会把本次请求输入放在最后一条
+            // LlmMessage 中，因此缓存它前面的稳定历史。
             volatileTailMessages: 1,
           },
           recordUsage,
@@ -1738,36 +1702,9 @@ export async function createLlmClient(
         );
       }
 
-      // Codex caches on prompt_cache_key + its own prefix rules and reports no
-      // breakpoint to digest, so there is nothing to inspect there.
+      // Codex 按 prompt_cache_key 及自身前缀规则缓存，且不报告可供摘要的断点，
+      // 因此这里没有可检查内容。
       return requestCodexText(profile.model, systemPrompt, contents, recordUsage);
-    },
-    async warmContext(input): Promise<void> {
-      if (profile.provider !== "claude") {
-        return;
-      }
-
-      const recordUsage = recordUsageFor("context-warm");
-
-      const { systemPrompt, contents } = splitSystemPrompt(
-        input.messages,
-        input.systemPrompt ?? profile.systemPrompt,
-      );
-      if (contents.length === 0) {
-        return;
-      }
-
-      // A volatile placeholder keeps an assistant-ending history valid for the
-      // Messages API while leaving the breakpoint on the complete stable history.
-      const warm = prepareClaudeCacheWarmRequest(contents);
-      await requestClaudeText(
-        profile.model,
-        systemPrompt,
-        warm.messages,
-        warm.options,
-        recordUsage,
-        inspectPrefixFor("context-warm", input.cacheRoute, input.expectRebuild ?? false),
-      );
     },
   };
 }

@@ -38,7 +38,8 @@ export type ArchiveWorkKind = "article" | "poem";
 export type AutonomyConfig = {
   enabled: boolean;
   worldObservationEnabled: boolean;
-  worldObservationIntervalMs: number;
+  // 世界观察没有固定间隔：只要开着、配了话题，每轮都可以去，去不去、看哪个由每轮的判断定。这个值只管
+  // 抓取失败之后多久才能再试——失败通常说明这会儿就是抓不动，立刻重试只会接着失败。
   worldObservationRetryMs: number;
   worldObservationBroadcastGroupId: string | null;
   // Failed observations (empty fetch, page errors, unusable content) get a
@@ -156,9 +157,20 @@ export type AutonomyJudgmentCandidate = {
   note: string;
 };
 
+// 每个世界观察话题的近况，交给每轮判断去决定去不去、看哪个。只放事实，不替模型下结论。
+export type WorldTopicStatus = {
+  topic: string;
+  // 这个话题最近一次观察或尝试的时间；0 表示手上没有记录（观察记忆只留 24 小时，失败的尝试重启就忘）。
+  lastAt: number;
+  // 那一次的结局，一句中文，比如「发到了群里」「页面上没有最近 24 小时的新内容」；空串表示不清楚。
+  outcome: string;
+};
+
 export type AutonomyJudgmentRequest = {
   nowIso: string;
   worldObservation: AutonomyJudgmentCandidate;
+  // 只在世界观察可选时才有内容：不可选时模型本来就不能选它，列出来只是白花 token。
+  worldTopics: WorldTopicStatus[];
   memoryReflection: AutonomyJudgmentCandidate;
   archiveWriting: AutonomyJudgmentCandidate;
   groupProactiveNote: string;
@@ -168,7 +180,8 @@ export type AutonomyJudgmentRequest = {
 
 export type AutonomyJudgmentDecision =
   | { action: "do_nothing"; reason: string }
-  | { action: "world_observation"; reason: string }
+  // topic 是模型挑的话题。没给、或给了配置里没有的，引擎退回轮转。
+  | { action: "world_observation"; reason: string; topic?: string }
   | { action: "memory_reflection"; reason: string }
   | { action: "archive_writing"; reason: string }
   | { action: "group_proactive"; reason: string };
@@ -185,6 +198,8 @@ export type AutonomyDeps = {
   writeArchive: (request: AutonomyArchiveWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
   requestJudgment: (request: AutonomyJudgmentRequest) => Promise<AutonomyJudgmentDecision>;
+  // 各话题的近况，只在世界观察可选的那一轮取。确定性、无副作用。
+  worldTopicStatuses: () => WorldTopicStatus[];
   // 主动发言这条线此刻有没有事可做。确定性、无副作用，用来在三个定时候选都没到期时
   // 省掉那次判断调用——见下面 runAutonomyLoop 里的短路。
   hasProactiveWork: () => boolean;
@@ -228,19 +243,40 @@ function pickWorldTopic(state: AutonomyLoopState, topics: readonly string[]): st
   return topics[index];
 }
 
+// 最近一次尝试没拿到观察、还在重试间隔里时，返回可以再试的时间；否则 null。尝试时间比成功时间新，
+// 就说明最近那次失败了——成功的那次，两个时间是同一刻。
+function worldObservationRetryAt(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): number | null {
+  const attemptAt = state.lastWorldObservationAttemptAt;
+  if (attemptAt <= 0 || attemptAt <= state.lastWorldObservationAt) return null;
+  const retryAt = attemptAt + cfg.worldObservationRetryMs;
+  return retryAt > now ? retryAt : null;
+}
+
+// 以前这里还有一道「距上次成功满 60 分钟」的闸，2026-09-15 取消：什么时候想去看看由 Holly 自己判断，
+// 不按钟点排班。刚看完紧接着再去也放行——挡住无谓重复的是判断时看到的话题近况，不是时钟。
+// 重试间隔只在失败后生效：成功之后不用等，失败之后才要缓一缓。
 function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
   if (!cfg.worldObservationEnabled) return false;
   if (cfg.worldTopics.length === 0) return false;
-  if (state.lastWorldObservationAt > 0 && now - state.lastWorldObservationAt < cfg.worldObservationIntervalMs) {
-    return false;
+  return worldObservationRetryAt(cfg, state, now) === null;
+}
+
+// 世界观察没有配置间隔，不套 scheduledCheckWhenNotDue：没到期只可能是关着、没配话题，或者失败后在等重试。
+function worldObservationCheckWhenNotDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): AutonomyCheck {
+  if (!cfg.worldObservationEnabled || cfg.worldTopics.length === 0) {
+    return {
+      name: "world_observation",
+      status: "disabled",
+      reason: cfg.worldObservationEnabled ? "没有配置世界观察主题" : "世界观察已关闭",
+      nextEligibleAt: null,
+    };
   }
-  if (
-    state.lastWorldObservationAttemptAt > 0 &&
-    now - state.lastWorldObservationAttemptAt < cfg.worldObservationRetryMs
-  ) {
-    return false;
-  }
-  return true;
+  return {
+    name: "world_observation",
+    status: "waiting",
+    reason: "上次观察没拿到可用内容，还在重试间隔里",
+    nextEligibleAt: worldObservationRetryAt(cfg, state, now),
+  };
 }
 
 function memoryReflectionDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
@@ -367,16 +403,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
   // Ineligible candidates get their real trace entry now -- nothing changes
   // it between here and the end of the tick, since only the judge's pick
   // (if any) ever runs.
-  const worldNotDueCheck = worldEligible ? null : scheduledCheckWhenNotDue({
-    name: "world_observation",
-    enabled: cfg.worldObservationEnabled && cfg.worldTopics.length > 0,
-    disabledReason: cfg.worldObservationEnabled ? "没有配置世界观察主题" : "世界观察已关闭",
-    lastCompletedAt: state.lastWorldObservationAt,
-    intervalMs: cfg.worldObservationIntervalMs,
-    lastAttemptAt: state.lastWorldObservationAttemptAt,
-    retryMs: cfg.worldObservationRetryMs,
-    now,
-  });
+  const worldNotDueCheck = worldEligible ? null : worldObservationCheckWhenNotDue(cfg, state, now);
   const memoryNotDueCheck = memoryEligible ? null : scheduledCheckWhenNotDue({
     name: "memory_reflection",
     enabled: cfg.memoryReflectionEnabled,
@@ -411,6 +438,9 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
   // 多数轮次三个定时候选都没到期、主动发言也在冷却里，那一轮无论模型答什么都只能落到
   // do_nothing，这次调用纯属白花。
   //
+  // 世界观察取消固定间隔（2026-09-15）之后几乎每轮都可选，这个短路只剩它关着、或者抓取失败在等
+  // 重试的时候才省得下来，判断调用基本回到每分钟一次。这是让 Holly 随时能起兴去看看的代价。
+  //
   // 短路条件取得保守：只要还有任何一条线可能动，就照常问模型。尤其是主动发言，它的资格
   // 由 proactive 那边的规则闸说了算（包括「有观察窗待结算」这种必须跑一趟的情况），所以
   // 这里问的是 hasProactiveWork 而不是自己另写一套判断。判断权本身没有被拿走：模型仍然
@@ -437,6 +467,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         eligible: worldEligible,
         note: worldNotDueCheck?.reason ?? freshnessNote(state.lastWorldObservationAt, now),
       },
+      worldTopics: worldEligible ? deps.worldTopicStatuses() : [],
       memoryReflection: {
         eligible: memoryEligible,
         note: memoryNotDueCheck?.reason ?? freshnessNote(state.lastMemoryReflectionAt, now),
@@ -472,10 +503,13 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
 
   if (decision.action === "world_observation") {
     executed = "world_observation";
+    // 看哪个话题由判断自己挑。没挑、或挑了配置里没有的（schema 的枚举本该挡住，换成不认枚举的服务端
+    // 就不一定），才退回轮转：配置里没有的话题既没有固定来源也没有播报群，不能去。
     // worldEligible guarantees cfg.worldTopics.length > 0 (see
     // worldObservationDue), so pickWorldTopic never returns null here.
-    const topic = pickWorldTopic(state, cfg.worldTopics)!;
-    const reason = "scheduled world observation";
+    const chosenTopic = decision.topic && cfg.worldTopics.includes(decision.topic) ? decision.topic : null;
+    const topic = chosenTopic ?? pickWorldTopic(state, cfg.worldTopics)!;
+    const reason = decision.reason || "world observation";
     state.lastWorldObservationAttemptAt = now;
     state.worldObservationDailyCount += 1;
     let observation: ProactiveWorldObservation | null = null;

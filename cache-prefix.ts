@@ -1,32 +1,27 @@
 import { createHash } from "node:crypto";
 
-// Holly rebuilds the whole request on every call instead of growing one
-// append-only message list, so nothing structurally prevents a volatile value
-// from drifting into the cached prefix. What can be enforced is that no call
-// escapes inspection: the LLM client digests the prefix it is about to send and
-// reports how it relates to the last request on the same cache route, so a
-// regression surfaces as a monitor entry on the next reply instead of as a
-// number nobody reads in tomorrow's token table.
+// Holly 每次调用都会重建整个请求，而不是持续扩展只追加的消息列表，因此结构上无法
+// 阻止易变值漂入缓存前缀。这里能强制保证的是每次调用都经过检查：LLM 客户端为即将
+// 发送的前缀生成摘要，并报告它与同一缓存路由上次请求的关系。这样，回归会在下一次
+// 回复时直接出现在监控记录里，而不是变成第二天 token 表中无人留意的数字。
 
-// One prompt-cache lineage. Two requests share a route only if they are meant
-// to hit the same cache entry: same model, same stable prefix, growing at the
-// tail. Per-group timelines are separate lineages; giving them one route would
-// report every group switch as drift.
+// 一条路由代表一条提示缓存谱系。只有预期命中同一缓存条目的请求才共享路由：模型相同、
+// 稳定前缀相同，并且只在末尾增长。每个群的时间线属于不同谱系；若共用一条路由，
+// 每次切换群都会被误报为漂移。
 export type CachePrefixDigest = {
   systemDigest: string;
-  // One digest per cached content block, in wire order.
+  // 按线上传输顺序，为每个缓存内容块保存一份摘要。
   blockDigests: string[];
 };
 
 export type CachePrefixStatus =
-  // First request on this route since boot: nothing to compare against.
+  // 启动后该路由的第一次请求，没有历史可供比较。
   | "fresh"
-  // Byte-identical prefix, a clean cache read.
+  // 前缀逐字节相同，可正常读取缓存。
   | "unchanged"
-  // Previous prefix is a strict prefix of this one: append-only, cache survives.
+  // 上一个前缀是当前前缀的真前缀，只发生末尾追加，缓存仍然有效。
   | "extended"
-  // Something before the breakpoint changed, or the prefix got shorter. The
-  // entry is dead and the whole prefix is paid for again.
+  // 断点前有内容变化，或前缀缩短；原条目已经失效，整个前缀需要重新计费。
   | "rebuilt";
 
 export type CachePrefixInspection = {
@@ -35,8 +30,7 @@ export type CachePrefixInspection = {
   previousBlocks: number;
   currentBlocks: number;
   systemChanged: boolean;
-  // Index of the first block whose bytes differ, or -1 when the divergence is
-  // in the system prefix (or when nothing diverged).
+  // 第一个字节不同的内容块索引；差异位于系统前缀或没有差异时为 -1。
   divergedAt: number;
 };
 
@@ -49,23 +43,20 @@ export function buildCachePrefixDigest(
   blockTexts: readonly string[],
 ): CachePrefixDigest {
   return {
-    // The system blocks are cached as one unit up to their breakpoint, so they
-    // get one digest: knowing which system block moved would not change the
-    // verdict, since a change anywhere in them invalidates all of it.
+    // 系统块从开头到断点会作为整体缓存，因此只生成一份摘要。无需判断具体哪个系统块
+    // 发生变化，因为任意位置的改变都会使整体失效，结论相同。
     systemDigest: digestText(systemTexts.join("\0")),
     blockDigests: blockTexts.map(digestText),
   };
 }
 
-// Bounded so a long-lived process with many groups cannot grow this without
-// limit; the oldest route is dropped and simply reports "fresh" next time.
+// 设置容量上限，避免长期运行且群很多的进程无限增长；最旧路由被淘汰，下次出现时
+// 直接报告为 "fresh"。
 const DEFAULT_MAX_ROUTES = 64;
 
-// The other half of the same question. CachePrefixTracker observes what was
-// actually sent; this records what the caller *meant* to change. A route that
-// caches a rolling window rebuilds its prefix on purpose whenever the window
-// moves, and only a rebuild nobody intended deserves an alarm — without this
-// the two are indistinguishable at the monitor.
+// 用来回答同一问题的另一半。CachePrefixTracker 观察实际发送内容，这里则记录调用方
+// 有意改变了什么。缓存滚动窗口的路由会在窗口移动时主动重建前缀，只有非预期重建才
+// 值得报警；没有这份意图记录，监控端无法区分两者。
 export class StablePrefixLedger {
   private readonly maxRoutes: number;
   private readonly digests = new Map<string, string[]>();
@@ -74,9 +65,8 @@ export class StablePrefixLedger {
     this.maxRoutes = Math.max(1, maxRoutes);
   }
 
-  // True when this route's stable half differs from the one it last sent. The
-  // first call returns false: a route with no history inspects as "fresh"
-  // rather than "rebuilt", so there is nothing to excuse.
+  // 当前路由的稳定部分与上次发送内容不同时返回 true。首次调用返回 false：没有历史的
+  // 路由会被检查为 "fresh" 而非 "rebuilt"，因此也没有需要豁免的重建。
   //
   // 稳定段按块传进来，判断口径和 CachePrefixTracker 一致：只在末尾多了几块叫「延长」，缓存照样
   // 读得回来，不算变化；前面某一块变了、或者块变少了，才是真的重建。以前按整段字符串比，窗口里
@@ -139,8 +129,7 @@ export class CachePrefixTracker {
       }
     }
 
-    // A shorter prefix that still matches block-for-block is a rebuild too: the
-    // cached entry reaches past the new breakpoint, so nothing reads it back.
+    // 即使逐块匹配，前缀缩短也属于重建：原缓存条目越过了新的断点，不会再被读回。
     if (digest.blockDigests.length < previous.blockDigests.length) {
       return {
         ...base,
@@ -159,7 +148,7 @@ export class CachePrefixTracker {
   }
 
   private remember(route: string, digest: CachePrefixDigest): void {
-    // Re-insert so the Map's insertion order doubles as recency.
+    // 删除后重新插入，让 Map 的插入顺序同时表示最近使用顺序。
     this.digests.delete(route);
     this.digests.set(route, digest);
     while (this.digests.size > this.maxRoutes) {

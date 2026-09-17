@@ -20,7 +20,6 @@ function baseConfig(overrides: Partial<AutonomyConfig> = {}): AutonomyConfig {
   return {
     enabled: true,
     worldObservationEnabled: true,
-    worldObservationIntervalMs: 60 * MIN,
     worldObservationRetryMs: 10 * MIN,
     worldObservationBroadcastGroupId: null,
     worldObservationFailureGroupId: null,
@@ -90,6 +89,7 @@ function baseDeps(overrides: Partial<AutonomyDeps> & { config?: AutonomyConfig; 
     // 默认「主动发言没事做」：这样一个三候选都没到期的 deps 会走短路，想测判断调用的
     // 用例本来就都有候选到期，不受影响。
     hasProactiveWork: () => false,
+    worldTopicStatuses: () => [],
     pendingReplyGroupCount: () => 0,
     log: () => {},
     recordWorldObservation: () => {},
@@ -118,7 +118,7 @@ test("cfg.enabled=false short-circuits without calling requestJudgment", async (
 
 test("the judgment request reports eligibility matching the due checks, and group_proactive as always offerable", async () => {
   const state = baseState({
-    // World: interval cleared (60min ago). Memory: not yet (10min ago, 30min interval).
+    // 世界观察没有间隔，一直可选。记忆反思还没到（10 分钟前做过，间隔 30 分钟）。
     lastWorldObservationAt: NOW - 65 * MIN,
     lastMemoryReflectionAt: NOW - 10 * MIN,
   });
@@ -368,9 +368,9 @@ test("picking do_nothing runs no branch dep at all and keeps the model's reason"
 });
 
 test("a judgment pick of an ineligible candidate is defensively ignored, not executed", async () => {
-  // world_observation is NOT due (just observed 5min ago against a 60min
-  // interval); a malformed/hallucinated pick of it must never run the branch.
-  const state = baseState({ lastWorldObservationAt: NOW - 5 * MIN });
+  // 世界观察这一轮不可选：5 分钟前那次抓取失败，还在 10 分钟的重试间隔里。模型乱选、幻觉出来的
+  // 选择绝不能真的跑起来。
+  const state = baseState({ lastWorldObservationAt: NOW - 90 * MIN, lastWorldObservationAttemptAt: NOW - 5 * MIN });
   let observeCalls = 0;
 
   const result = await runAutonomyLoop(baseDeps({
@@ -427,8 +427,10 @@ test("an eligible-but-unpicked candidate is traced as deferred, not disabled/wai
 // 不该省的一次都不能省——漏掉一次主动发言的机会，代价是 Holly 该说话时没说。
 
 const allIdleState = () => baseState({
-  // 三个定时候选都刚做过，离下次到期还早。
-  lastWorldObservationAt: NOW - 1 * MIN,
+  // 记忆反思和归档写作都刚做过，离下次到期还早。世界观察没有间隔，不可选只有一种情况：失败后在等
+  // 重试——一分钟前那次没抓到东西。
+  lastWorldObservationAt: NOW - 90 * MIN,
+  lastWorldObservationAttemptAt: NOW - 1 * MIN,
   lastMemoryReflectionAt: NOW - 1 * MIN,
   lastArchiveWritingAt: NOW - 1 * MIN,
 });
@@ -467,7 +469,7 @@ test("主动发言有事可做时照常问模型，哪怕三个定时候选都�
 test("任何一个定时候选到期都照常问模型，不看主动发言的脸色", async () => {
   for (const [label, state] of [
     ["world", baseState({ lastWorldObservationAt: NOW - 65 * MIN, lastMemoryReflectionAt: NOW - 1 * MIN, lastArchiveWritingAt: NOW - 1 * MIN })],
-    ["memory", baseState({ lastWorldObservationAt: NOW - 1 * MIN, lastMemoryReflectionAt: NOW - 35 * MIN, lastArchiveWritingAt: NOW - 1 * MIN })],
+    ["memory", baseState({ lastWorldObservationAt: NOW - 90 * MIN, lastWorldObservationAttemptAt: NOW - 1 * MIN, lastMemoryReflectionAt: NOW - 35 * MIN, lastArchiveWritingAt: NOW - 1 * MIN })],
   ] as const) {
     let judgmentCalls = 0;
     await runAutonomyLoop(baseDeps({
@@ -542,4 +544,110 @@ test("worldObservationBroadcastGroupIds lists every group a broadcast can land i
     worldObservationBroadcastGroupIds({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} }),
     [],
   );
+});
+
+test("世界观察看哪个话题由判断挑，判断给的理由一路带到观察请求里", async () => {
+  const state = baseState({ lastWorldObservationAt: NOW - 65 * MIN });
+  const requests: Array<{ topic: string; reason: string }> = [];
+
+  const result = await runAutonomyLoop(baseDeps({
+    state,
+    requestJudgment: async () => ({ action: "world_observation", topic: "astronomy latest", reason: "天文好久没看了" }),
+    observeWorld: async (request) => {
+      requests.push(request);
+      return OBSERVATION;
+    },
+  }));
+
+  assert.deepEqual(requests, [{ topic: "astronomy latest", reason: "天文好久没看了" }]);
+  assert.equal(result.action.type === "observe_world" && result.action.topic, "astronomy latest");
+  assert.equal(result.action.type === "observe_world" && result.action.reason, "天文好久没看了");
+  // 轮转指针只在退回轮转时才动：模型自己挑的那一轮不该把兜底顺序推乱。
+  assert.equal(state.nextWorldTopicIndex, 0);
+});
+
+test("判断挑了配置里没有的话题就退回轮转——没配过的话题既没有固定来源也没有播报群", async () => {
+  const state = baseState({ lastWorldObservationAt: NOW - 65 * MIN });
+  const topics: string[] = [];
+
+  await runAutonomyLoop(baseDeps({
+    state,
+    requestJudgment: async () => ({ action: "world_observation", topic: "biology", reason: "随便看看" }),
+    observeWorld: async (request) => {
+      topics.push(request.topic);
+      return OBSERVATION;
+    },
+  }));
+
+  assert.deepEqual(topics, ["AI latest"]);
+  assert.equal(state.nextWorldTopicIndex, 1);
+});
+
+test("世界观察可选时判断请求带上各话题近况；不可选时连取都不取", async () => {
+  const statuses = [
+    { topic: "AI latest", lastAt: NOW - 70 * MIN, outcome: "发到了群里" },
+    { topic: "astronomy latest", lastAt: 0, outcome: "" },
+  ];
+  let statusCalls = 0;
+  let seen: AutonomyJudgmentRequest | null = null;
+  const deps = (state: AutonomyLoopState) => baseDeps({
+    state,
+    worldTopicStatuses: () => {
+      statusCalls += 1;
+      return statuses;
+    },
+    requestJudgment: async (request) => {
+      seen = request;
+      return { action: "do_nothing", reason: "先不动" };
+    },
+  });
+
+  await runAutonomyLoop(deps(baseState({ lastWorldObservationAt: NOW - 65 * MIN })));
+  assert.deepEqual(seen!.worldTopics, statuses);
+  assert.equal(statusCalls, 1);
+
+  // 世界观察刚抓取失败、在等重试；记忆反思从没做过、已经到期，所以判断照样会被问到。
+  await runAutonomyLoop(deps(baseState({ lastWorldObservationAt: NOW - 90 * MIN, lastWorldObservationAttemptAt: NOW - 1 * MIN })));
+  assert.deepEqual(seen!.worldTopics, []);
+  assert.equal(statusCalls, 1);
+});
+
+// ---------- 世界观察没有固定间隔 ----------
+
+test("世界观察没有固定间隔：一分钟前刚观察成功，这一轮照样可选", async () => {
+  let seen: AutonomyJudgmentRequest | null = null;
+  await runAutonomyLoop(baseDeps({
+    // 成功的那次，尝试时间和成功时间是同一刻。
+    state: baseState({ lastWorldObservationAt: NOW - 1 * MIN, lastWorldObservationAttemptAt: NOW - 1 * MIN }),
+    requestJudgment: async (request) => {
+      seen = request;
+      return { action: "do_nothing", reason: "刚看过" };
+    },
+  }));
+
+  assert.equal(seen!.worldObservation.eligible, true);
+});
+
+test("抓取失败后要等满重试间隔才又可选，等待时 trace 报的是重试", async () => {
+  const failedAt = NOW - 5 * MIN;
+  const waiting = await runAutonomyLoop(baseDeps({
+    // 关掉记忆反思，让这一轮什么都不可选、走短路，trace 里留下的就是世界观察自己的原因。
+    config: baseConfig({ memoryReflectionEnabled: false }),
+    state: baseState({ lastWorldObservationAt: NOW - 90 * MIN, lastWorldObservationAttemptAt: failedAt }),
+  }));
+  const world = waiting.checks.find((check) => check.name === "world_observation");
+  assert.equal(world?.status, "waiting");
+  assert.match(world?.reason ?? "", /重试/);
+  assert.equal(world?.nextEligibleAt, failedAt + 10 * MIN);
+
+  let seen: AutonomyJudgmentRequest | null = null;
+  await runAutonomyLoop(baseDeps({
+    config: baseConfig({ memoryReflectionEnabled: false }),
+    state: baseState({ lastWorldObservationAt: NOW - 90 * MIN, lastWorldObservationAttemptAt: NOW - 11 * MIN }),
+    requestJudgment: async (request) => {
+      seen = request;
+      return { action: "do_nothing", reason: "先不去" };
+    },
+  }));
+  assert.equal(seen!.worldObservation.eligible, true);
 });
