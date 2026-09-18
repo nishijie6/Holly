@@ -1,5 +1,6 @@
 import type { LlmToolDefinition, LlmToolUseBlock } from "./llm-client.js";
 import { loadPromptText } from "./prompt-text.js";
+import { createSelfToolRunner, SELF_SUBTOOL_NAMES, type SelfToolDeps } from "./self-tools.js";
 
 // The four tools that make "one screen at a time" real, modelled on kagami's
 // QQ app: list_conversations reads the roster without moving anything,
@@ -105,7 +106,7 @@ export const FOCUS_TOOL_DEFINITIONS: readonly LlmToolDefinition[] = [
   },
 ];
 
-/** 子工具名单。不进请求，只用于 help 的返回和调错时的提示。 */
+/** QQ 客户端那一组子工具。不进请求，只用于 help 的返回和调错时的提示。 */
 export const QQ_SUBTOOL_NAMES = [
   "list_conversations",
   "open_conversation",
@@ -114,6 +115,14 @@ export const QQ_SUBTOOL_NAMES = [
   "read_page",
   "read_source",
 ] as const;
+
+/**
+ * 她能调的全部子工具：QQ 客户端那一组，加上她自己的事那一组。
+ *
+ * 壳的好处在这里兑现了一次——新增一整组能力，FOCUS_TOOL_DEFINITIONS 一个字没动，稳定前缀
+ * 也就一个字节没变。说明进的是 help 文档，那是工具结果，落在易变尾部。
+ */
+export const ALL_SUBTOOL_NAMES = [...QQ_SUBTOOL_NAMES, ...SELF_SUBTOOL_NAMES] as const;
 
 // 每个字段都要过一道判据：她需不需要看到它，来决定下一步做什么。不需要就不给。
 //
@@ -151,8 +160,15 @@ function refuse(error: string, note: string): string {
  * 她对着一句「未知工具」重试，不如当场把名单给她。这段文字落在工具结果里，属于易变尾部，
  * 不进缓存前缀，所以带全名单是免费的。
  */
-export function createFocusToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) => Promise<string> {
-  const runSubtool = createQqToolRunner(deps);
+export function createFocusToolRunner(
+  deps: QqToolDeps & SelfToolDeps,
+): (call: LlmToolUseBlock) => Promise<string> {
+  const runQqSubtool = createQqToolRunner(deps);
+  const runSelfSubtool = createSelfToolRunner(deps);
+  const runSubtool = (call: LlmToolUseBlock): Promise<string> =>
+    (SELF_SUBTOOL_NAMES as readonly string[]).includes(call.name)
+      ? runSelfSubtool(call)
+      : runQqSubtool(call);
 
   return async (call: LlmToolUseBlock): Promise<string> => {
     if (call.name === "help") {
@@ -165,12 +181,12 @@ export function createFocusToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock)
 
     const tool = typeof call.input.tool === "string" ? call.input.tool.trim() : "";
     if (!tool) {
-      return refuse("missing tool", `invoke 要 tool 参数。可用的子工具：${QQ_SUBTOOL_NAMES.join("、")}。`);
+      return refuse("missing tool", `invoke 要 tool 参数。可用的子工具：${ALL_SUBTOOL_NAMES.join("、")}。`);
     }
-    if (!(QQ_SUBTOOL_NAMES as readonly string[]).includes(tool)) {
+    if (!(ALL_SUBTOOL_NAMES as readonly string[]).includes(tool)) {
       return refuse(
         `unknown subtool ${tool}`,
-        `没有这个子工具。可用的是：${QQ_SUBTOOL_NAMES.join("、")}；用 help 看各自怎么用。`,
+        `没有这个子工具。可用的是：${ALL_SUBTOOL_NAMES.join("、")}；用 help 看各自怎么用。`,
       );
     }
 

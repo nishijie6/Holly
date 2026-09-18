@@ -4807,6 +4807,12 @@ function buildFocusToolRunner(
   onSuppressed?: (reason: string) => void,
 ): (call: LlmToolUseBlock) => Promise<string> {
   return createFocusToolRunner({
+    // 她自己的事：落盘走的还是 autonomy 那两条既有路径，一个字没改。区别只在于内容现在
+    // 由她在参数里直接给出，而不是再起一次 LLM 去生成。
+    writeMemory: async ({ topic, content, reason }) =>
+      await writeMemoryForAutonomy({ topic, content, reason }),
+    writeArchive: async ({ kind, title, content, reason }) =>
+      await writeArchiveForAutonomy({ kind, title, content, reason }),
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
       renderConversationRecent(id, focusModeConfig.recentTurnsPerConversation),

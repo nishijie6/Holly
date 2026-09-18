@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { FOCUS_TOOL_DEFINITIONS, QQ_SUBTOOL_NAMES, createFocusToolRunner } from "../qq-tools.js";
+import { ALL_SUBTOOL_NAMES, FOCUS_TOOL_DEFINITIONS, QQ_SUBTOOL_NAMES, createFocusToolRunner } from "../qq-tools.js";
 import type { ConversationSummary, QqToolDeps } from "../qq-tools.js";
 import type { LlmToolUseBlock } from "../llm-client.js";
 
@@ -41,6 +41,8 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
       sourceReads.push(path);
       return { ok: true, text: `[源码] ${path || "."}` };
     },
+    writeMemory: async () => {},
+    writeArchive: async () => {},
     ...overrides,
   };
   // 子工具一律经 invoke 壳进去，和生产路径一致；下面每个用例写的还是子工具名。
@@ -71,7 +73,7 @@ test("顶层只有 invoke 和 help", () => {
 // 子工具名单一旦写进 invoke 的说明，就等于搬回了前缀，这个壳也就白套了。
 test("子工具名单不出现在顶层工具的说明里", () => {
   const described = FOCUS_TOOL_DEFINITIONS.map((tool) => `${tool.description} ${JSON.stringify(tool.inputSchema)}`).join(" ");
-  for (const name of QQ_SUBTOOL_NAMES) {
+  for (const name of ALL_SUBTOOL_NAMES) {
     assert.ok(!described.includes(name), `${name} 不该出现在顶层工具的 description/schema 里`);
   }
 });
@@ -80,7 +82,7 @@ test("help 给出子工具清单", async () => {
   const { callTop } = harness();
   const result = await callTop("help");
   assert.equal(result.ok, true);
-  for (const name of QQ_SUBTOOL_NAMES) {
+  for (const name of ALL_SUBTOOL_NAMES) {
     assert.match(result.tools, new RegExp(name));
   }
 });
@@ -91,7 +93,7 @@ test("调错子工具名时，错误里直接给出名单", async () => {
   const { callTop } = harness();
   const result = await callTop("invoke", { tool: "send_qq_message", args: {} });
   assert.equal(result.ok, false);
-  for (const name of QQ_SUBTOOL_NAMES) {
+  for (const name of ALL_SUBTOOL_NAMES) {
     assert.match(result.note, new RegExp(name));
   }
 });
@@ -116,6 +118,16 @@ test("顶层认不出的名字被挡回去", async () => {
   const result = await callTop("send_message", { message: "在的" });
   assert.equal(result.ok, false);
   assert.match(result.note, /invoke/);
+});
+
+// 壳的收益在这里第一次兑现：新增一整组能力，FOCUS_TOOL_DEFINITIONS 一个字没动。
+test("invoke 认得她自己那组子工具", async () => {
+  const { callTop } = harness();
+  const result = await callTop("invoke", {
+    tool: "write_memory",
+    args: { topic: "关于噪音", content: "今天群里聊到耳鸣" },
+  });
+  assert.equal(result.ok, true);
 });
 
 // --- list_conversations ----------------------------------------------------
