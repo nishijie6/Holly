@@ -47,8 +47,8 @@ test("focus 协议和决策协议是两份不同的东西", () => {
   assert.equal(FOCUS_LOOP_PROMPT.includes("Return JSON only"), false);
 });
 
-test("协议交代了五个工具、以及不调工具就是不做事", () => {
-  for (const tool of ["list_conversations", "open_conversation", "send_message", "search_web", "read_page"]) {
+test("协议交代了六个工具、以及不调工具就是不做事", () => {
+  for (const tool of ["list_conversations", "open_conversation", "send_message", "search_web", "read_page", "read_source"]) {
     assert.ok(FOCUS_LOOP_PROMPT.includes(tool), `协议里该讲清 ${tool}`);
   }
   assert.match(FOCUS_LOOP_PROMPT, /不调任何工具就结束这一轮/u);

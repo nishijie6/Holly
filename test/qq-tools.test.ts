@@ -20,6 +20,7 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
   const sent: Array<{ id: string; message: string }> = [];
   const searched: string[] = [];
   const read: string[] = [];
+  const sourceReads: string[] = [];
   const deps: QqToolDeps = {
     listConversations: async () => CONVERSATIONS,
     readConversation: async (id) => (CONVERSATIONS.some((c) => c.id === id) ? [`${id} 的最近消息`] : null),
@@ -36,6 +37,10 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
       read.push(url);
       return { ok: true, text: `[网页正文] ${url}` };
     },
+    readSource: async (path) => {
+      sourceReads.push(path);
+      return { ok: true, text: `[源码] ${path || "."}` };
+    },
     ...overrides,
   };
   const bind = (run: ReturnType<typeof createQqToolRunner>) =>
@@ -45,16 +50,17 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
   // 下一轮：焦点和发送记录沿用，runner 新建一个——main.ts 每轮就是这么做的。
   const nextRound = (roundConversationId: string | null) =>
     bind(createQqToolRunner({ ...deps, roundConversationId }));
-  return { call, nextRound, sent, searched, read, focus: () => focus };
+  return { call, nextRound, sent, searched, read, sourceReads, focus: () => focus };
 }
 
-test("the five tools are declared with closed schemas", () => {
+test("the six tools are declared with closed schemas", () => {
   assert.deepEqual(QQ_TOOL_DEFINITIONS.map((t) => t.name), [
     "list_conversations",
     "open_conversation",
     "send_message",
     "search_web",
     "read_page",
+    "read_source",
   ]);
   for (const tool of QQ_TOOL_DEFINITIONS) {
     assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} should reject extra args`);
@@ -351,4 +357,33 @@ test("焦点还停在上一轮的会话上时,那句话不会误发过去,页面
   assert.equal(result.noticeSent, false);
   assert.deepEqual(sent, []);
   assert.deepEqual(read, ["https://example.com/a"]);
+});
+
+// --- read_source -----------------------------------------------------------
+
+test("read_source 把路径原样递给实现方,正文交回模型", async () => {
+  const { call, sent, sourceReads } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("read_source", { path: "qq-tools.ts" });
+  assert.equal(result.ok, true);
+  assert.match(result.content, /qq-tools\.ts/);
+  assert.deepEqual(sourceReads, ["qq-tools.ts"]);
+  // 本地读文件是毫秒级的，没人会干等，所以这个工具不吆喝那一句。
+  assert.deepEqual(sent, []);
+});
+
+test("空 path 照样递过去——那是「列出仓库根目录」,不是漏填", async () => {
+  const { call, sourceReads } = harness();
+  const result = await call("read_source", { path: "" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(sourceReads, [""]);
+});
+
+test("读不了的路径,原因原样交回模型", async () => {
+  const { call } = harness({
+    readSource: async () => ({ ok: false, text: "点开头的文件和目录（.env、.git、.claude 这些）读不到。" }),
+  });
+  const result = await call("read_source", { path: ".env" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /读不到/);
 });
