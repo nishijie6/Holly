@@ -57,6 +57,7 @@ function baseState(overrides: Partial<AutonomyLoopState> = {}): AutonomyLoopStat
     archiveWritingDailyDate: "2026-01-01",
     archiveWritingDailyCount: 0,
     recentActions: [],
+    lastJudgmentAt: 0,
     judgmentFailureStreak: 0,
     lastJudgmentFailureAt: 0,
     ...overrides,
@@ -93,6 +94,8 @@ function baseDeps(overrides: Partial<AutonomyDeps> & { config?: AutonomyConfig; 
     writeArchive: unexpected("writeArchive"),
     runGroupProactiveAction: unexpected("runGroupProactiveAction"),
     requestJudgment: async () => ({ action: "do_nothing", reason: "test default" }),
+    // 0 = 本次启动以来群里没动静 = 她闲着，触发门控放行。要测「正忙着」的用例自己覆盖它。
+    lastFocusActivityAt: () => 0,
     // 默认「主动发言没事做」：这样一个三候选都没到期的 deps 会走短路，想测判断调用的
     // 用例本来就都有候选到期，不受影响。
     hasProactiveWork: () => false,
@@ -388,6 +391,75 @@ test("记忆反思仍然按间隔来", async () => {
       return { action: "do_nothing", reason: "还没到" };
     },
   }));
+});
+
+// ---------- 闲下来才问，别每分钟都问一次 ----------
+
+test("她正在群里说话时，这一轮不问模型", async () => {
+  const state = baseState();
+  let calls = 0;
+  const result = await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    lastFocusActivityAt: () => NOW - 1 * MIN,
+    requestJudgment: async () => { calls += 1; return { action: "do_nothing", reason: "x" }; },
+  }));
+
+  assert.equal(calls, 0, "她忙着的时候不该问");
+  assert.equal(result.action.type, "do_nothing");
+  assert.deepEqual([...new Set(result.checks.map((check) => check.status))], ["waiting"]);
+});
+
+test("刚问过就不再问，直到不应期过去", async () => {
+  const state = baseState({ lastJudgmentAt: NOW - 3 * MIN });
+  let calls = 0;
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => { calls += 1; return { action: "do_nothing", reason: "x" }; },
+  }));
+
+  assert.equal(calls, 0);
+});
+
+test("问出去的那一刻就记下时间，不等答案", async () => {
+  const state = baseState();
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => ({ action: "do_nothing", reason: "这会儿不想做" }),
+  }));
+
+  assert.equal(state.lastJudgmentAt, NOW);
+});
+
+// 失败另有连败退避管着。要是失败不算数，一个每次都报错的调用就能绕开不应期，退回每分钟一次。
+test("问失败了也算问过，一样要等不应期", async () => {
+  const state = baseState();
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => { throw new Error("boom"); },
+  }));
+
+  assert.equal(state.lastJudgmentAt, NOW);
+});
+
+// 没有任何候选可做的那种轮次，上面的短路已经返回了，根本到不了门控。所以一串空轮不会
+// 把不应期白白用光——她真闲下来、又有事可做的时候，第一时间就能问。
+test("没有候选可做的轮次不消耗不应期", async () => {
+  const state = baseState();
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({
+      worldObservationEnabled: false,
+      memoryReflectionEnabled: false,
+      archiveWritingEnabled: false,
+    }),
+    hasProactiveWork: () => false,
+  }));
+
+  assert.equal(state.lastJudgmentAt, 0, "压根没问，不该记成问过");
 });
 
 // ---------- 判断调用连着失败时别每分钟都去撞墙 ----------

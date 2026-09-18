@@ -910,6 +910,15 @@ const conversationLedger = new ConversationLedger({
   },
 });
 const FOCUS_LEDGER_CACHE_ROUTE = "focus-ledger";
+
+/**
+ * 上次群里有动静的时刻：每进一轮 focus 就刷新。autonomy 的触发门控用它判断她闲不闲——
+ * 她正跟人说着话的时候，不该被那个循环拉去想自己的事。
+ *
+ * 只活在内存里，不进存档：它描述的是「本次运行期间她在忙什么」，重启后本来就无从得知。
+ * 0 按闲处理，宁可早一步问，也不要因为不知道而把她按在原地。
+ */
+let lastFocusActivityAt = 0;
 let ledgerStore: LedgerStore | null = null;
 // 好友名单缓存：私聊只回好友，而好友列表要向上游要。缓存 + 单飞 Promise 是
 // 为了让密集的私聊消息不会每条都触发一次拉取；refreshPromise 非空即表示
@@ -5217,6 +5226,10 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     codeJobNote: latestCodeJob?.context.adminCodeJobNote ?? null,
   };
 
+  // 前台后台都算：有人直接找她是动静，群里只是有人说话也是动静——两种情况下她都在读群里的
+  // 内容，都不是发呆。
+  lastFocusActivityAt = Date.now();
+
   if (decision.foreground) {
     // Being addressed is not something the model gets to overlook: take the
     // focus and put the content in front of it, no tool call required.
@@ -8195,6 +8208,7 @@ function buildAutonomyDeps() {
     writeArchive: writeArchiveForAutonomy,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
     requestJudgment: requestAutonomyJudgment,
+    lastFocusActivityAt: () => lastFocusActivityAt,
     worldTopicStatuses: worldTopicStatusesForJudgment,
     // 让 autonomy 在三个定时候选都没到期时能先问一句「主动发言有事做吗」，没有就整轮
     // 跳过判断调用。闸门复用 proactive 自己那套，见 proactive-engine.hasProactiveWork。

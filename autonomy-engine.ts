@@ -2,6 +2,10 @@ import type {
   ProactiveTickResult,
   ProactiveWorldObservation,
 } from "./proactive-engine.js";
+import {
+  evaluateAutonomyTrigger,
+  type AutonomyIdlePolicy,
+} from "./autonomy-idle.js";
 
 export type AutonomyAction =
   | { type: "do_nothing"; reason: string }
@@ -184,6 +188,8 @@ export type AutonomyLoopState = {
   archiveWritingDailyCount: number;
   /** 最近若干次写下的题目，最新的在最后。老存档没有这个字段，读出来是空数组。 */
   recentActions: RecentAutonomyAction[];
+  /** 上次真正发出判断调用的时刻，喂给触发门控算不应期。 */
+  lastJudgmentAt: number;
   /** 判断调用连续失败了几次。成功一次即清零。 */
   judgmentFailureStreak: number;
   /** 最近一次判断调用失败的时刻，配合 streak 算退避到什么时候。 */
@@ -267,6 +273,13 @@ export type AutonomyDeps = {
   writeArchive: (request: AutonomyArchiveWriteRequest) => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
   requestJudgment: (request: AutonomyJudgmentRequest) => Promise<AutonomyJudgmentDecision>;
+  /**
+   * 上次群里有动静的时刻（本次启动以来）。喂给触发门控判断她闲不闲——她正跟人说着话的
+   * 时候，不该被这个循环拉去想自己的事。0 表示启动以来一直没动静，按闲处理。
+   */
+  lastFocusActivityAt: () => number;
+  /** 触发门控的参数，测试用；不给就用默认。 */
+  idlePolicy?: AutonomyIdlePolicy;
   // 各话题的近况，只在世界观察可选的那一轮取。确定性、无副作用。
   worldTopicStatuses: () => WorldTopicStatus[];
   // 主动发言这条线此刻有没有事可做。确定性、无副作用，用来在三个定时候选都没到期时
@@ -595,6 +608,34 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         .map((name) => ({ name, status: "waiting" as const, reason, nextEligibleAt: backoffUntil })),
     };
   }
+
+  // 触发门控（零 LLM）：她闲不闲、刚问过没有、是不是深夜。排在连败退避之后——那条管的是
+  // 故障，这条管的是常规节奏，故障优先。
+  //
+  // 放在候选资格算完之后也是有意的：没有任何候选可做时，上面那个短路已经返回了，根本轮不到
+  // 这里；于是「不应期」只会被真正问得出东西的轮次消耗掉，不会被一串空轮白白用光。
+  const verdict = evaluateAutonomyTrigger({
+    now,
+    signals: { lastJudgmentAt: state.lastJudgmentAt ?? 0, lastFocusActivityAt: deps.lastFocusActivityAt() },
+    ...(deps.idlePolicy ? { policy: deps.idlePolicy } : {}),
+  });
+  if (!verdict.ask) {
+    return {
+      action: { type: "do_nothing", reason: verdict.reason },
+      // 报 waiting：这一轮不是她挑了别的，是压根没问。和退避那条同一个口径。
+      checks: (["world_observation", "memory_reflection", "archive_writing", "group_proactive"] as const)
+        .map((name) => ({
+          name,
+          status: "waiting" as const,
+          reason: verdict.reason,
+          nextEligibleAt: verdict.nextEligibleAt,
+        })),
+    };
+  }
+
+  // 记在发出之前：这一次问出去了就算数，哪怕它抛错。失败另有连败退避管，不该让一个每次
+  // 都失败的调用绕开不应期、退回每分钟一次。
+  state.lastJudgmentAt = now;
 
   let rawDecision: AutonomyJudgmentDecision;
   try {
