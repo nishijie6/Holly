@@ -1446,6 +1446,21 @@ export async function runClaudeToolLoop(input: {
 
     const toolUses = parseClaudeToolUses(data);
     if (toolUses.length === 0) {
+      // 一个字都不调工具就收尾，是这条管线上最常见的一轮：大多数群消息本来就不需要她
+      // 出声，FOCUS_LOOP_PROMPT 也明写这是合法选择。但这一轮她通常不是什么都没干——
+      // 她看了消息、想了一遍、决定不接话。以前这段话只作为 lastText 进监控页，account
+      // 里一个字都不留，于是下一轮她看到的是同一批消息和一片空白：不知道自己已经看过，
+      // 也不知道当时为什么决定放着。留下来，她才接得上自己的上一个念头。
+      //
+      // 代价是账本长得更快、压缩来得更勤。这是想清楚之后认的：planLedgerCompaction 本来
+      // 就按 token 阈值走，多出来的这些字只是让那条线早一点到。
+      //
+      // 空 text 要跳过。appendAssistantTurn 对「既没有话也没有工具调用」是直接 throw 的，
+      // 那种空轮确实没有任何东西值得留。
+      if (text) {
+        messages.push({ role: "assistant", content: text });
+        input.onAssistantTurn?.(text, []);
+      }
       return { text: lastText, messages, rounds: round, exhausted: false };
     }
 

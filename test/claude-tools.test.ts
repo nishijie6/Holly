@@ -216,10 +216,15 @@ test("the loop runs a tool, feeds the result back, and stops at end_turn", async
     assert.equal(result.rounds, 2);
     assert.equal(result.exhausted, false);
     // Grown, not rewritten: the original turn is still message 0.
-    assert.equal(result.messages.length, 3);
+    assert.equal(result.messages.length, 4);
     assert.equal(result.messages[0].content, "weather?");
     assert.equal(result.messages[1].blocks?.[0].type, "tool_use");
     assert.equal(result.messages[2].blocks?.[0].type, "tool_result");
+    // 收尾那一轮不调工具，但她在这一轮说了查到的结果。以前这句话只进监控页、不进账本，
+    // 下一轮她就看不到自己刚说过什么了；现在它是账本的最后一条，不带 blocks。
+    assert.equal(result.messages[3].role, "assistant");
+    assert.equal(result.messages[3].content, "18C in Paris");
+    assert.equal(result.messages[3].blocks, undefined);
   } finally {
     restore();
   }
@@ -325,7 +330,10 @@ test("parallel calls produce one user turn holding every result", async () => {
       runTool: async () => "ok",
       recordUsage: noUsage,
     });
-    const resultTurn = result.messages.at(-1);
+    // 找工具结果那一轮，而不是取最后一条：收尾的纯文本轮如今也留在账本里，末尾已经不是它了。
+    const resultTurn = result.messages.findLast(
+      (message) => (message.blocks ?? []).some((block) => block.type === "tool_result"),
+    );
     assert.equal(resultTurn?.role, "user");
     assert.equal(resultTurn?.blocks?.length, 2);
     assert.deepEqual(resultTurn?.blocks?.map((b) => (b as { toolUseId: string }).toolUseId), ["tu_1", "tu_2"]);
@@ -348,7 +356,10 @@ test("a throwing tool still answers its tool_use id, flagged as an error", async
       runTool: async () => { throw new Error("tool exploded"); },
       recordUsage: noUsage,
     });
-    const block = result.messages.at(-1)?.blocks?.[0] as { toolUseId: string; content: string; isError?: boolean };
+    const resultTurn = result.messages.findLast(
+      (message) => (message.blocks ?? []).some((block) => block.type === "tool_result"),
+    );
+    const block = resultTurn?.blocks?.[0] as { toolUseId: string; content: string; isError?: boolean };
     // An unanswered tool_use id is a 400 on the next round — one tool bug must
     // not become a dead loop.
     assert.equal(block.toolUseId, "tu_1");

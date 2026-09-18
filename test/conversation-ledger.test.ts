@@ -198,10 +198,15 @@ test("the tool loop's turn hooks keep a ledger in step, in order", async () => {
 
   // The ledger's own pairing checks did not fire, which is the point: the loop
   // hands it turns in an order the ledger considers legal.
-  assert.equal(ledger.size, 3);
+  assert.equal(ledger.size, 4);
   assert.deepEqual([...ledger.pendingToolUses], []);
   assert.equal(ledger.snapshot()[1].blocks?.[0].type, "tool_use");
   assert.equal(ledger.snapshot()[2].blocks?.[0].type, "tool_result");
+  // 收尾那一轮没有工具调用，只有她说的话。账本对「有话、没有工具」这种回合本来就放行，
+  // 循环现在也确实把它交进来了——这条断言守的就是这条新接上的路。
+  assert.equal(ledger.snapshot()[3].role, "assistant");
+  assert.equal(ledger.snapshot()[3].content, "18C");
+  assert.equal(ledger.snapshot()[3].blocks, undefined);
 });
 
 // --- compaction, the one sanctioned rewrite --------------------------------
