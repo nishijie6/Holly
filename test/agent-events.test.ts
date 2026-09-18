@@ -1,63 +1,64 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AgentEventQueue, type AgentEvent } from "../agent-events.js";
+import { AgentEventQueue } from "../agent-events.js";
 
-test("events dispatch to a handler in push order", () => {
+// 队列的性质，不是分发器的性质：push 只入队并唤醒，取和执行全归消费循环。
+// 下面钉的三件事——按序、一次取干净、唤醒不丢——是那个循环能成立的全部前提。
+
+test("takeAll 按入队顺序一次取干净", () => {
   const queue = new AgentEventQueue();
-  const seen: AgentEvent[] = [];
-  queue.onEvent((event) => seen.push(event));
-
   queue.push({ type: "message_batch_ready", groupKey: "A" });
   queue.push({ type: "message_batch_ready", groupKey: "B" });
   queue.push({ type: "autonomy_tick_due" });
 
-  assert.deepEqual(seen, [
+  assert.deepEqual(queue.takeAll(), [
     { type: "message_batch_ready", groupKey: "A" },
     { type: "message_batch_ready", groupKey: "B" },
     { type: "autonomy_tick_due" },
   ]);
+  assert.equal(queue.pending, 0);
+  assert.deepEqual(queue.takeAll(), [], "取过之后就空了，同一个事件不会被消费两次");
 });
 
-test("every registered handler sees every event", () => {
+test("队列非空时 waitNonEmpty 立刻返回", async () => {
   const queue = new AgentEventQueue();
-  const seenByFirst: AgentEvent[] = [];
-  const seenBySecond: AgentEvent[] = [];
-  queue.onEvent((event) => seenByFirst.push(event));
-  queue.onEvent((event) => seenBySecond.push(event));
+  queue.push({ type: "autonomy_tick_due" });
+  await queue.waitNonEmpty();
+  assert.equal(queue.pending, 1);
+});
+
+// 消费循环空转的唯一方式就是挂在这里。挂不住就会变成忙等，挂住了醒不来就是彻底停摆。
+test("空队列时 waitNonEmpty 挂起，push 把它唤醒", async () => {
+  const queue = new AgentEventQueue();
+  let woke = false;
+  const waiting = queue.waitNonEmpty().then(() => { woke = true; });
+
+  await Promise.resolve();
+  assert.equal(woke, false, "还没有人 push，不该醒");
 
   queue.push({ type: "autonomy_tick_due" });
-
-  assert.equal(seenByFirst.length, 1);
-  assert.equal(seenBySecond.length, 1);
+  await waiting;
+  assert.equal(woke, true);
 });
 
-test("a handler that throws does not stop the next handler for the same event", () => {
+test("一次 push 唤醒所有等待者", async () => {
   const queue = new AgentEventQueue();
-  const seenBySecond: AgentEvent[] = [];
-  queue.onEvent(() => {
-    throw new Error("boom");
-  });
-  queue.onEvent((event) => seenBySecond.push(event));
-
-  assert.doesNotThrow(() => queue.push({ type: "autonomy_tick_due" }));
-  assert.equal(seenBySecond.length, 1);
+  const waits = [queue.waitNonEmpty(), queue.waitNonEmpty(), queue.waitNonEmpty()];
+  queue.push({ type: "autonomy_tick_due" });
+  await Promise.all(waits);
+  assert.equal(queue.pending, 1, "唤醒不消费；取还是取一次");
 });
 
-test("a handler that throws does not stop the next pushed event from dispatching", () => {
+// 攒着的事件要能被一起看见——Step 2 的合并全靠这个，一个一个取就没得合并了。
+test("消费者忙的时候攒下的事件，一次全拿到", () => {
   const queue = new AgentEventQueue();
-  let calls = 0;
-  queue.onEvent((event) => {
-    calls += 1;
-    if (event.type === "message_batch_ready") {
-      throw new Error("boom");
-    }
-  });
-
   queue.push({ type: "message_batch_ready", groupKey: "A" });
+  queue.push({ type: "message_batch_ready", groupKey: "A" });
+  queue.push({ type: "message_batch_ready", groupKey: "B" });
   queue.push({ type: "autonomy_tick_due" });
 
-  assert.equal(calls, 2);
+  assert.equal(queue.takeAll().length, 4);
 });
 
 test("recent() returns events oldest-first within the requested window", () => {
@@ -71,6 +72,14 @@ test("recent() returns events oldest-first within the requested window", () => {
     { type: "message_batch_ready", groupKey: "B" },
     { type: "message_batch_ready", groupKey: "C" },
   ]);
+});
+
+// 监控面板记的是「推进来过什么」，和有没有被消费无关。
+test("takeAll 之后 recent() 里那些事件还在", () => {
+  const queue = new AgentEventQueue();
+  queue.push({ type: "message_batch_ready", groupKey: "A" });
+  queue.takeAll();
+  assert.equal(queue.recent().length, 1);
 });
 
 test("recent() drops the oldest entries once the bounded history fills up", () => {

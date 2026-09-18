@@ -4890,16 +4890,16 @@ function buildFocusToolRunner(
     },
     // 读她自己的源码。能读什么、不能读什么全在 source-reader.ts，这里只把仓库根交给它——
     // 那份白名单是这条通路唯一的闸，逻辑散到两处就迟早对不上。
-    readSource: async (path) => {
-      const result = await readSourceEntry(APP_ROOT, path);
+    readSource: async (path, offset) => {
+      const result = await readSourceEntry(APP_ROOT, path, offset);
       if (!result.ok) {
-        pushMonitorEntry("status", "Source Read Refused", `path=${path || "."}\n${result.reason}`);
+        pushMonitorEntry("status", "Source Read Refused", `path=${path || "."} offset=${offset}\n${result.reason}`);
         return { ok: false, text: result.reason };
       }
       pushMonitorEntry(
         "status",
         "Source Read",
-        `path=${result.path || "."}\nkind=${result.kind} chars=${result.text.length}`,
+        `path=${result.path || "."}\nkind=${result.kind} offset=${offset} chars=${result.text.length}`,
       );
       return { ok: true, text: result.text };
     },
@@ -5778,21 +5778,23 @@ async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingMod
 
 // 把一批未读消息投递到模型队列上。真正的排队/并发控制在 RouteQueue 里，
 // 这里只负责挂上错误兜底——队列上的任务抛异常不会有人接，必须就地吞掉并上报。
-function enqueueUnreadBatchForModel(messages: PendingModelMessage[]): void {
+// 由消费循环 await。错误在这里收口而不是往外抛：一批消息处理失败，不该让循环这一轮
+// 里其他群的批次跟着一起没了。
+async function runUnreadBatchForModel(messages: PendingModelMessage[]): Promise<void> {
   // Every message in a batch was queued under the same group key (see
   // queueUnreadMessageForModel), so the first is representative of them all.
   const groupKey = messages[0]?.context.groupId ?? null;
-  void modelRouteQueue
-    .submit(replyCacheRoute(groupKey), () => forwardUnreadMessagesToModel(messages))
-    .catch(async (error) => {
-      // forwardUnreadMessagesToModel handles model/parse failures internally (it
-      // retries in place, then drops). Anything reaching here is an unexpected
-      // error; drop the batch (never re-queue) and log it.
-      const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Model Error", detail);
-      console.error("Model request failed:", error);
-      await sendAdminFailureReply(messages, "处理消息时发生内部错误，无法可靠执行这条消息。");
-    });
+  try {
+    await modelRouteQueue.submit(replyCacheRoute(groupKey), () => forwardUnreadMessagesToModel(messages));
+  } catch (error) {
+    // forwardUnreadMessagesToModel handles model/parse failures internally (it
+    // retries in place, then drops). Anything reaching here is an unexpected
+    // error; drop the batch (never re-queue) and log it.
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Model Error", detail);
+    console.error("Model request failed:", error);
+    await sendAdminFailureReply(messages, "处理消息时发生内部错误，无法可靠执行这条消息。");
+  }
 }
 
 // ---------- 影子信号：只观察，不干预 ----------
@@ -8142,11 +8144,11 @@ function scheduleAutonomyTick(): void {
 // 在同一实例，submitExclusive 会等待自己尚未完成的队尾而自锁；完整理由见
 // autonomyTickQueue 的声明。"tick" 路由仍提供原 autonomyQueue 的保证：第 i+1 轮
 // 必须等第 i 轮彻底结束后才开始。
-function dispatchAutonomyTickDue(): void {
+async function runAutonomyTick(): Promise<void> {
   const deps = buildAutonomyDeps();
   if (!deps) return;
-  void autonomyTickQueue
-    .submit("tick", async () => {
+  try {
+    await autonomyTickQueue.submit("tick", async () => {
       const startedAt = Date.now();
       try {
         const result = await runAutonomyLoop(deps);
@@ -8175,12 +8177,12 @@ function dispatchAutonomyTickDue(): void {
         });
         throw error;
       }
-    })
-    .catch((error) => {
-      const detail = error instanceof Error ? error.message : String(error);
-      pushMonitorEntry("error", "Autonomy Tick Error", detail);
-      console.error("Autonomy tick failed:", error);
     });
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Autonomy Tick Error", detail);
+    console.error("Autonomy tick failed:", error);
+  }
 }
 
 // 实时 WebSocket 摄取的幂等保护。消息 ID 首次出现时记录并返回 true；TTL 内再次出现
@@ -8245,9 +8247,13 @@ function queueUnreadMessageForModel(message: string, context: ModelRequestContex
   return pendingMessages.length;
 }
 
-function flushUnreadGroupToModel(groupKey: string): void {
+// 把一个群攒下的未读取走，顺带过一遍「这会儿到底发不发言」的闸。返回 null 表示这一次
+// 没有可交给模型的东西——缓冲是空的，或者整批在抑制状态下被丢掉了。
+//
+// 取和跑分开，是因为消费循环需要先把若干个群的批次都取出来，再决定拿它们跑几轮。
+function takeUnreadBatchForModel(groupKey: string): PendingModelMessage[] | null {
   const messages = unreadModelMessagesByGroup.get(groupKey);
-  if (!messages || messages.length === 0) return;
+  if (!messages || messages.length === 0) return null;
   unreadModelMessagesByGroup.delete(groupKey);
 
   const adminBatch = isForcedAdminBatch(messages);
@@ -8257,7 +8263,7 @@ function flushUnreadGroupToModel(groupKey: string): void {
       "QQ Participation Suppressed",
       `${qqSuppressionDetail()}\nDropped ${messages.length} queued unread message(s) without model processing.`,
     );
-    return;
+    return null;
   }
 
   pushMonitorEntry(
@@ -8265,7 +8271,7 @@ function flushUnreadGroupToModel(groupKey: string): void {
     adminBatch ? "Admin Batch Ready" : "Unread Batch Ready",
     `conversation_id=${groupKey}\nunread_messages=${messages.length}`,
   );
-  enqueueUnreadBatchForModel(messages);
+  return messages;
 }
 
 function flushUnreadMessagesToModel(): void {
@@ -8282,22 +8288,48 @@ function flushUnreadMessagesToModel(): void {
   }
 }
 
-// L2：已分发事件只在这里决定如何转换成按路由串行的模型调用。进程内所有触发源——
-// 60 秒未读批次定时器、管理员强制立即回复路径、60 秒自主定时器——都会汇入此处。
-// 所有定时器和 WebSocket 触发都只往事件队列里塞一个类型化事件，由这里统一分发。
-// 这样「什么时候该做」和「做什么」是分开的两件事：定时器不需要知道一轮自主检查怎么跑，
-// 分发器不需要知道它是被谁唤醒的。
-function dispatchAgentEvent(event: AgentEvent): void {
-  switch (event.type) {
-    case "message_batch_ready":
-      flushUnreadGroupToModel(event.groupKey);
-      break;
-    case "autonomy_tick_due":
-      dispatchAutonomyTickDue();
-      break;
+// L2：进程里唯一消费事件的地方，也是唯一决定「这一刻做什么」的地方。进程内所有触发源
+// ——未读批次定时器、管理员强制立即回复路径、自主定时器——都只往队列里塞一个类型化事件，
+// 在这里被取出来执行。
+//
+// 为什么是一个循环而不是一组回调：同步分发把「何时触发」和「何时执行」焊死了，定时器
+// 一响就地开工，而它响的那一刻完全可能落在一轮工具循环的中间——账本写到一半、tool_use
+// 还没等到 tool_result 的那个瞬间。那时候往账本里追加会当场抛错（ConversationLedger
+// 就是为拦这个写的）。现在不会了：循环体是串行 await 的，想插进来没有入口，因为没有
+// 「中间」这个时刻可以被调度到。
+//
+// 下游那几个 RouteQueue 暂时原样留着。它们现在只有一个调用方、而且调用方本就串行，
+// 已经是退化的；留着是为了这一步只改执行骨架、不动任何一条具体路径。
+async function handleAgentEvents(events: readonly AgentEvent[]): Promise<void> {
+  for (const event of events) {
+    switch (event.type) {
+      case "message_batch_ready": {
+        const messages = takeUnreadBatchForModel(event.groupKey);
+        if (messages) await runUnreadBatchForModel(messages);
+        break;
+      }
+      case "autonomy_tick_due":
+        await runAutonomyTick();
+        break;
+    }
   }
 }
-agentEvents.onEvent(dispatchAgentEvent);
+
+// 绝不因为一轮出错而退出。它停了，Holly 就再也不回消息了——而且是静悄悄地停，
+// 进程还在、端口还开着、监控页照常打开，只是再也没有下一轮。所以这里兜住一切。
+async function runAgentEventLoop(): Promise<void> {
+  for (;;) {
+    await agentEvents.waitNonEmpty();
+    const events = agentEvents.takeAll();
+    try {
+      await handleAgentEvents(events);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      pushMonitorEntry("error", "Agent Loop Error", detail);
+      console.error("Agent event loop iteration failed:", error);
+    }
+  }
+}
 
 function handleMonitorStream(req: IncomingMessage, res: ServerResponse): void {
   res.writeHead(200, {
@@ -8619,8 +8651,9 @@ function connectWebSocketClient(forceReconnect = false): void {
       && adminPolicyConfig.immediateReply
       && unreadCount !== null
     ) {
-      // agentEvents dispatches synchronously, so this reaches
-      // flushUnreadGroupToModel just as immediately as calling it directly did.
+      // 推一个事件，由消费循环取走。这条路径要的「立即」是不等 60 秒的批次定时器，
+      // 而不是抢在当前这一轮前面——消费循环空闲时下一个微任务就轮到它，循环正忙时
+      // 它本来也得排在那一轮后面（以前经 focusLoopQueue 排，现在经这个队列排）。
       if (conversationId) agentEvents.push({ type: "message_batch_ready", groupKey: conversationId });
     }
   });
@@ -8760,6 +8793,9 @@ async function bootstrap(): Promise<void> {
   // 离线、仅观察还是活跃状态。
   await runHollyBootstrap();
   startConfigWatcher();
+
+  // 起消费循环。它不会自己结束，也不该被 await——后面的启动步骤还要接着跑。
+  void runAgentEventLoop();
 
   // 分批审视群内未读动态，使 Holly 回应整段对话，而不是每收到一条消息就立即反应。
   setInterval(flushUnreadMessagesToModel, UNREAD_MODEL_FLUSH_INTERVAL_MS);
