@@ -91,7 +91,7 @@ import {
   type ProactiveWorldObservationRequest,
 } from "./proactive-engine.js";
 import {
-  resolveWorldObservationBroadcastGroupId,
+  resolveWorldObservationBroadcastGroupIds,
   runAutonomyLoop,
   worldObservationBroadcastGroupIds,
   type ArchiveWorkKind,
@@ -506,6 +506,13 @@ type AutonomySidebarObservation = {
 
 // 自主状态在侧栏的投影。计数和「最近一条」都在这里算好再发，页面不做聚合：
 // 页面随时可能刷新，让它去累计就意味着刷新一次数字就归零。
+// Broadcast 标签页要的全部数据：这个 QQ 号在的所有群，加上每个话题选中了哪几个。页面要显示
+// 「没选中」的群才有得选，所以群名单来自 NapCat，而不是配置里已经写下的那几个。
+type WorldBroadcastSettings = {
+  groups: Array<{ groupId: string; name: string }>;
+  topics: Array<{ topic: string; groupIds: string[] }>;
+};
+
 type AutonomySidebarSnapshot = {
   enabled: boolean;
   worldObservationEnabled: boolean;
@@ -865,6 +872,7 @@ let archiveWriteQueue: Promise<void> = Promise.resolve();
 // 仍能保留所选状态。
 let readOnlyMode = false;
 let readOnlyPersistQueue: Promise<void> = Promise.resolve();
+let worldBroadcastPersistQueue: Promise<void> = Promise.resolve();
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
@@ -1027,15 +1035,21 @@ function readOptionalGroupId(value: unknown, defaultValue: string | null): strin
   return Number.isSafeInteger(numeric) && numeric > 0 ? normalized : defaultValue;
 }
 
-// 话题 → 群号。不能复用 readStringRecord：YAML 里没加引号的群号会被解析成数字，而
+// 话题 → 群号列表。不能复用 readStringRecord：YAML 里没加引号的群号会被解析成数字，而
 // readStringRecord 只收字符串，这一项会被悄悄丢掉，话题落回默认群——发错了群却没有任何提示。
 // 这里数字和字符串都接受，逐项按群号校验；不是合法群号的项才丢弃。
-function readGroupIdRecord(value: unknown, defaultValue: Record<string, string>): Record<string, string> {
+//
+// 一个话题可以配多个群：写单个群号照旧，写成列表就每个群都发一份（同一条内容、同一次判断）。
+function readGroupIdRecord(value: unknown, defaultValue: Record<string, string[]>): Record<string, string[]> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return defaultValue;
-  const record: Record<string, string> = {};
-  for (const [topic, item] of Object.entries(value as Record<string, unknown>)) {
-    const groupId = readOptionalGroupId(item, null);
-    if (groupId) record[topic.trim()] = groupId;
+  const record: Record<string, string[]> = {};
+  for (const [topic, items] of Object.entries(value as Record<string, unknown>)) {
+    const groupIds = (Array.isArray(items) ? items : [items])
+      .map((item) => readOptionalGroupId(item, null))
+      .filter((id): id is string => id !== null);
+    // 空列表要保留：监控页上把一个话题的群全关掉，存下来就是空列表，它和「没配过这个话题」是
+    // 两回事——后者会落回默认群，前者是「这个话题不播报」。
+    record[topic.trim()] = [...new Set(groupIds)];
   }
   return record;
 }
@@ -1297,6 +1311,23 @@ function persistReadOnlyMode(enabled: boolean): Promise<void> {
       await writeFile(CONFIG_PATH, String(doc), "utf-8");
     });
   return readOnlyPersistQueue;
+}
+
+// 同上，只改 autonomy.world_topic_broadcast_group_overrides 这一个键：监控页上的开关要在重启
+// 之后还算数，而 config.yaml 是这份配置唯一的真相，所以写回这里，而不是另起一个状态文件。
+// 空列表照写不误——那是「这个话题不播报」，删掉键反而会让它落回默认群。
+function persistWorldBroadcastTargets(overrides: Record<string, string[]>): Promise<void> {
+  worldBroadcastPersistQueue = worldBroadcastPersistQueue
+    .catch(() => {
+      // Keep the queue alive after a previous failure.
+    })
+    .then(async () => {
+      const raw = existsSync(CONFIG_PATH) ? await readFile(CONFIG_PATH, "utf-8") : "";
+      const doc = YAML.parseDocument(raw);
+      doc.setIn(["autonomy", "world_topic_broadcast_group_overrides"], overrides);
+      await writeFile(CONFIG_PATH, String(doc), "utf-8");
+    });
+  return worldBroadcastPersistQueue;
 }
 
 function applyReadOnlyMode(enabled: boolean, source: string): void {
@@ -2569,6 +2600,38 @@ async function sendWsAction(action: string, params: Record<string, unknown>): Pr
 
   client.send(JSON.stringify(payload));
   return result;
+}
+
+// 这个 QQ 号加入的所有群，给监控页的 Broadcast 标签页用：要挑「发到哪些群」，就得先看得见全部群，
+// 而不只是配置里已经写下的那几个。群列表不常变，缓存 5 分钟，免得每开一次页面就去问 NapCat。
+const QQ_GROUP_LIST_TTL_MS = 5 * 60 * 1000;
+let qqGroupListCache: Array<{ groupId: string; name: string }> = [];
+let qqGroupListUpdatedAtMs = 0;
+
+async function fetchQqGroupList(force = false): Promise<Array<{ groupId: string; name: string }>> {
+  const now = Date.now();
+  if (!force && qqGroupListUpdatedAtMs > 0 && now - qqGroupListUpdatedAtMs < QQ_GROUP_LIST_TTL_MS) {
+    return qqGroupListCache;
+  }
+  const response = await sendWsAction("get_group_list", {});
+  const rows = Array.isArray(response.data) ? response.data : [];
+  const groups: Array<{ groupId: string; name: string }> = [];
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue;
+    const record = row as Record<string, unknown>;
+    const rawId = record.group_id;
+    const groupId = typeof rawId === "number"
+      ? String(rawId)
+      : typeof rawId === "string" ? rawId.trim() : "";
+    if (!groupId) continue;
+    const rawName = record.group_name;
+    const name = typeof rawName === "string" && rawName.trim() ? rawName.trim() : groupId;
+    groups.push({ groupId, name });
+  }
+  groups.sort((left, right) => left.name.localeCompare(right.name, "zh-Hans-CN"));
+  qqGroupListCache = groups;
+  qqGroupListUpdatedAtMs = Date.now();
+  return groups;
 }
 
 async function refreshPrivateFriendCache(force = false): Promise<Set<string>> {
@@ -5694,6 +5757,27 @@ function toSidebarWorldObservation(
   };
 }
 
+// Broadcast 标签页的数据源，也是 /api/world-broadcast 的返回体。选中状态直接取自
+// resolveWorldObservationBroadcastGroupIds——页面上看到的勾，和真正发送时走的是同一个函数。
+async function buildWorldBroadcastSettings(): Promise<WorldBroadcastSettings> {
+  const groups = await fetchQqGroupList();
+  // 配置里写着、但这个号已经不在的群也要列出来：否则它从页面上消失了，却还在继续收播报。
+  const known = new Set(groups.map((group) => group.groupId));
+  const orphans: Array<{ groupId: string; name: string }> = [];
+  const topics = autonomyConfig.worldTopics.map((topic) => ({
+    topic,
+    groupIds: resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic),
+  }));
+  for (const entry of topics) {
+    for (const groupId of entry.groupIds) {
+      if (known.has(groupId)) continue;
+      known.add(groupId);
+      orphans.push({ groupId, name: `${groupId}（已不在这个群）` });
+    }
+  }
+  return { groups: [...groups, ...orphans], topics };
+}
+
 function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
   const state = hollyStateStore?.getAutonomyState() ?? null;
   const recentMemories = hollyMemorySidebarRecords.slice(-12);
@@ -6632,8 +6716,10 @@ async function maybeBroadcastWorldObservation(
   observedAtIso: string,
   pages: readonly BrowserPageObservation[],
 ): Promise<string> {
-  const targetGroupId = resolveWorldObservationBroadcastGroupId(autonomyConfig, topic);
-  if (!targetGroupId) return "这个话题没配播报群，没发";
+  // 一个话题可以配多个群。内容和「发不发」都只判断一次，发送时每个群再各自过自己的冷场闸——
+  // 同一条观察发两个群，不该让她为同一件事被问两遍，也不该因为一个群正热闹就整条不发。
+  const targetGroupIds = resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic);
+  if (targetGroupIds.length === 0) return "这个话题没配播报群，没发";
 
   // 只读时照常走完日期闸门和改写，把本来要发的内容记进监控，但不发群、不写对话历史、不记 AI 味。
   // 只读是紧急停发，不该连「这一轮会发什么」都看不见：2026-09-11 只读开着的一整晚，8 轮观察全在这里
@@ -6648,12 +6734,19 @@ async function maybeBroadcastWorldObservation(
     return "当时 QQ 处于不发言的模式，没发";
   }
 
-  const groupKey = normalizeConversationGroupKey(targetGroupId);
-  const numericGroupId = Number(groupKey);
-  if (!groupKey || !Number.isSafeInteger(numericGroupId) || numericGroupId <= 0) {
-    pushMonitorEntry("error", "World Observation Broadcast Skipped", `Invalid group_id=${targetGroupId}`);
-    return "播报群号配置有误，没发";
+  const targets: Array<{ key: string; numericId: number }> = [];
+  for (const id of targetGroupIds) {
+    const key = normalizeConversationGroupKey(id);
+    const numericId = Number(key);
+    if (!key || !Number.isSafeInteger(numericId) || numericId <= 0) {
+      pushMonitorEntry("error", "World Observation Broadcast Skipped", `Invalid group_id=${id}`);
+      continue;
+    }
+    targets.push({ key, numericId });
   }
+  if (targets.length === 0) return "播报群号配置有误，没发";
+  // 监控行、以及「发不发」判断看的那个群的上下文，都用第一个群：内容是同一条，判断也只做一次。
+  const groupKey = targets[0].key;
 
   const pageErrors = observation.pageErrors ?? [];
   if (pageErrors.length > 0) {
@@ -6698,22 +6791,10 @@ async function maybeBroadcastWorldObservation(
       .filter((url, index, all) => Boolean(url) && all.indexOf(url) === index),
   };
 
-  // Success path only interrupts the broadcast group when the conversation
-  // there has lulled; an active chat means the news can wait for the next run.
-  // 试运行不发消息，谈不上打断谁，冷场闸门不拦。但群里最后一条消息是什么时候，还要交给 Holly
-  // 判断发不发，所以试运行也照样取。
+  // 冷场闸挪到了发送那一步，按群各判各的：两个目标群一个正热闹、一个安静，不该整条都不发。
+  // 这里取第一个群的最后活动时间，是给 Holly 判断发不发时当上下文用的；试运行不发消息、谈不上
+  // 打断谁，但这个时间照样要取。
   const latestActivity = await latestKnownGroupActivity(groupKey);
-  if (latestActivity && !dryRun) {
-    const idleMs = Date.now() - latestActivity.timestampMs;
-    if (idleMs < autonomyConfig.worldObservationBroadcastLullMs) {
-      pushMonitorEntry(
-        "status",
-        "World Observation Broadcast Skipped",
-        `group_id=${groupKey}\nConversation still active: idle_minutes=${Math.floor(idleMs / 60000)} < ${Math.ceil(autonomyConfig.worldObservationBroadcastLullMs / 60000)}`,
-      );
-      return "群里当时正在聊天，没发";
-    }
-  }
 
   // 跨群去重：把所有播报目标群的历史合在一起判，原因见 autonomy-engine.ts 的
   // worldObservationBroadcastGroupIds。本次的目标群本来就在其中，这里先放进去只是保险。
@@ -6774,39 +6855,70 @@ async function maybeBroadcastWorldObservation(
     pushMonitorEntry(
       "status",
       "World Observation Share Declined",
-      `group_id=${groupKey}\nobserved_at=${observedAtIso}\ntopic=${topic}\n${shareReasonLine}${dryRun ? "\nread_only=true" : ""}\n${message}`,
+      `group_id=${targets.map((target) => target.key).join(",")}\nobserved_at=${observedAtIso}\ntopic=${topic}\n${shareReasonLine}${dryRun ? "\nread_only=true" : ""}\n${message}`,
     );
     return share.reason ? `看完决定不发：${share.reason}` : "看完决定不发";
   }
 
-  if (dryRun) {
-    // 不写对话历史：去重读的就是这份历史，写进去等于告诉它「发过了」，而群里其实没人见过。
-    // 代价是试运行之间互相不去重，同一条可能连着几轮都出现在这里。
+  // 她已经说了这条值得发，剩下的是每个群自己的事：正热闹的群等下一轮，安静的群照发。
+  const sentGroups: string[] = [];
+  const busyGroups: string[] = [];
+  const dryRunGroups: string[] = [];
+  for (const target of targets) {
+    if (!dryRun) {
+      // 第一个群的活动时间上面已经取过，别再问一次。
+      const activity = target.key === groupKey ? latestActivity : await latestKnownGroupActivity(target.key);
+      if (activity) {
+        const idleMs = Date.now() - activity.timestampMs;
+        if (idleMs < autonomyConfig.worldObservationBroadcastLullMs) {
+          pushMonitorEntry(
+            "status",
+            "World Observation Broadcast Skipped",
+            `group_id=${target.key}\nConversation still active: idle_minutes=${Math.floor(idleMs / 60000)} < ${Math.ceil(autonomyConfig.worldObservationBroadcastLullMs / 60000)}`,
+          );
+          busyGroups.push(target.key);
+          continue;
+        }
+      }
+    }
+
+    if (dryRun) {
+      // 不写对话历史：去重读的就是这份历史，写进去等于告诉它「发过了」，而群里其实没人见过。
+      // 代价是试运行之间互相不去重，同一条可能连着几轮都出现在这里。
+      pushMonitorEntry(
+        "status",
+        "World Observation Broadcast Dry Run",
+        `group_id=${target.key}\nobserved_at=${observedAtIso}\ntopic=${topic}\nduplicates_removed=${translation.duplicateItemsRemoved}\n${shareReasonLine}\nread_only=true — nothing was sent\n${message}`,
+      );
+      dryRunGroups.push(target.key);
+      continue;
+    }
+
+    recordOutgoingAiTone(message, target.key);
+    const sentMessageId = await sendGroupMessage(target.numericId, message);
+    appendConversationTurn({
+      groupId: target.key,
+      role: "assistant",
+      senderName: null,
+      userId: null,
+      content: message,
+      timestamp: new Date().toISOString(),
+      messageId: sentMessageId,
+    });
     pushMonitorEntry(
-      "status",
-      "World Observation Broadcast Dry Run",
-      `group_id=${groupKey}\nobserved_at=${observedAtIso}\ntopic=${topic}\nduplicates_removed=${translation.duplicateItemsRemoved}\n${shareReasonLine}\nread_only=true — nothing was sent\n${message}`,
+      "outgoing",
+      "World Observation Broadcast Sent",
+      `group_id=${target.key}\nobserved_at=${observedAtIso}\ntopic=${topic}\nduplicates_removed=${translation.duplicateItemsRemoved}\n${shareReasonLine}\n${message}`,
     );
-    return "看完决定发，但当时是只读模式，没发出去";
+    sentGroups.push(target.key);
   }
 
-  recordOutgoingAiTone(message, groupKey);
-  const sentMessageId = await sendGroupMessage(numericGroupId, message);
-  appendConversationTurn({
-    groupId: groupKey,
-    role: "assistant",
-    senderName: null,
-    userId: null,
-    content: message,
-    timestamp: new Date().toISOString(),
-    messageId: sentMessageId,
-  });
-  pushMonitorEntry(
-    "outgoing",
-    "World Observation Broadcast Sent",
-    `group_id=${groupKey}\nobserved_at=${observedAtIso}\ntopic=${topic}\nduplicates_removed=${translation.duplicateItemsRemoved}\n${shareReasonLine}\n${message}`,
-  );
-  return "发到了群里";
+  if (dryRunGroups.length > 0) return "看完决定发，但当时是只读模式，没发出去";
+  if (sentGroups.length === 0) return "群里当时正在聊天，没发";
+  if (busyGroups.length > 0) {
+    return `发到了 ${sentGroups.length} 个群，还有 ${busyGroups.length} 个群当时正在聊天，没发`;
+  }
+  return targets.length > 1 ? `发到了 ${sentGroups.length} 个群里` : "发到了群里";
 }
 
 type KnownGroupActivity = {
@@ -9232,6 +9344,15 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     button.sec { color: var(--btn-sec-fg); background: var(--btn-sec-bg); }
     button.sec:hover { background: var(--btn-sec-hover-bg); color: var(--btn-sec-hover-fg); }
     button.sm { padding: 6px 11px; font-size: 11px; }
+    .bc-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .bc-table th { text-align: left; padding: 8px 10px; font-size: 11px; opacity: 0.7; font-weight: 600; }
+    .bc-table th:not(:first-child), .bc-table td:not(:first-child) { text-align: center; width: 92px; }
+    .bc-table td { padding: 6px 10px; border-top: 1px solid hsl(var(--edge-soft-c) / var(--edge-soft-a)); }
+    .bc-name span { display: block; }
+    .bc-name small { opacity: 0.55; font-size: 11px; }
+    .bc-cell { padding: 4px 8px; }
+    .bc-cell .mode-switch { pointer-events: none; }
+    .bc-hint { padding: 12px 10px 2px; font-size: 11px; opacity: 0.6; line-height: 1.7; }
 
     input, select {
       width: 100%; border-radius: var(--radius-sm);
@@ -9610,6 +9731,14 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
         </svg>
         <span class="nav-label">Reflect</span>
       </li>
+      <li class="nav-item" :class="{active: tab === 'broadcast'}" @click="tab = 'broadcast'; loadWorldBroadcast()">
+        <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v12"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5 11a7 7 0 0114 0"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M8.5 13a3.5 3.5 0 017 0"/>
+        </svg>
+        <span class="nav-label">Broadcast</span>
+      </li>
       <li class="nav-item" :class="{active: tab === 'archive'}" @click="tab = 'archive'">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
           <path stroke-linecap="round" stroke-linejoin="round" d="M4 19.5A2.5 2.5 0 016.5 17H20"/>
@@ -9916,6 +10045,40 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
     </div>
 
     <!-- Reflect -->
+    <div v-else-if="tab === 'broadcast'">
+      <div class="panel">
+        <div class="ph2">
+          <span class="ph2-title">世界观察播报</span>
+          <button class="sec sm" @click="loadWorldBroadcast" :disabled="bcLoading">{{ bcLoading ? '读取中…' : '刷新群列表' }}</button>
+        </div>
+        <div class="pb">
+          <div v-if="bcError" class="empty">{{ bcError }}</div>
+          <div v-else-if="!bcGroups.length" class="empty">{{ bcLoading ? '正在向 NapCat 要群列表…' : '没拿到群列表，NapCat 可能没连上。' }}</div>
+          <table v-else class="bc-table">
+            <thead>
+              <tr>
+                <th>群</th>
+                <th v-for="t in bcTopics" :key="t.topic">{{ t.topic }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="g in bcGroups" :key="g.groupId">
+                <td class="bc-name"><span>{{ g.name }}</span><small>{{ g.groupId }}</small></td>
+                <td v-for="t in bcTopics" :key="t.topic">
+                  <button class="bc-cell" :class="{on: bcChecked(t.topic, g.groupId)}" :disabled="bcSwitching"
+                    :title="bcChecked(t.topic, g.groupId) ? '点一下：这个话题不再发到这个群' : '点一下：这个话题发到这个群'"
+                    @click="toggleWorldBroadcast(t.topic, g.groupId, !bcChecked(t.topic, g.groupId))">
+                    <span class="mode-switch" :class="{on: bcChecked(t.topic, g.groupId)}"></span>
+                  </button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="bc-hint">勾上＝这个话题的世界观察会发到那个群。点一下立刻生效，并写回 config.yaml，重启后还在。一个话题一个群都不勾，它就不播报了。</div>
+        </div>
+      </div>
+    </div>
+
     <div v-else-if="tab === 'reflect'">
       <div class="ph">
         <div class="ph-eye signal">Holly</div>
@@ -10241,6 +10404,35 @@ createApp({
       var items = autonomySidebar.value && autonomySidebar.value.recentWorldObservations;
       return Array.isArray(items) ? items.slice().reverse() : [];
     });
+    // Broadcast 标签页。群列表要现问 NapCat，所以这一页自己取数据，不搭 autonomy 快照的便车。
+    var bcSwitching = ref(false);
+    var bcLoading = ref(false);
+    var bcError = ref('');
+    var bcGroups = ref([]);
+    var bcTopics = ref([]);
+    function applyBroadcastSettings(d) {
+      bcGroups.value = Array.isArray(d.groups) ? d.groups : [];
+      bcTopics.value = Array.isArray(d.topics) ? d.topics : [];
+    }
+    function loadWorldBroadcast() {
+      if (bcLoading.value) return;
+      bcLoading.value = true;
+      bcError.value = '';
+      fetch('/api/world-broadcast').then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to load broadcast settings');
+          applyBroadcastSettings(d);
+        });
+      }).catch(function(e) {
+        bcError.value = e.message;
+      }).finally(function() {
+        bcLoading.value = false;
+      });
+    }
+    function bcChecked(topic, groupId) {
+      var entry = bcTopics.value.find(function(t) { return t.topic === topic; });
+      return !!entry && entry.groupIds.indexOf(groupId) >= 0;
+    }
 
     // Archive state
     var archiveItems = ref([]);
@@ -10554,6 +10746,29 @@ createApp({
       if (!exists) archiveItems.value.unshift(work);
     }
 
+    // 勾一个「话题→群」。服务端保存后把最新的全量设置回给我们，直接用它覆盖，省得本地再拼一遍
+    // 状态——本地拼错的话，页面显示的和真正会发的就对不上了。
+    function toggleWorldBroadcast(topic, groupId, enabled) {
+      if (bcSwitching.value) return;
+      bcSwitching.value = true;
+      bcError.value = '';
+      fetch('/api/world-broadcast', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ topic: topic, group_id: groupId, enabled: enabled })
+      }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok) throw new Error(d.error || 'Failed to switch broadcast');
+          applyBroadcastSettings(d);
+        });
+      }).catch(function(e) {
+        bcError.value = e.message;
+        pushEntry({ id: Date.now(), kind: 'error', title: 'Broadcast Switch Failed', body: e.message, timestamp: new Date().toISOString() });
+      }).finally(function() {
+        bcSwitching.value = false;
+      });
+    }
+
     function toggleReadOnly() {
       if (modeSwitching.value) return;
       var next = !readOnly.value;
@@ -10706,6 +10921,8 @@ createApp({
       profiles, selProfile, profileMeta, switching,
       mf, memItems, memCollection, memLoading, memErr, memMsg, memPath,
       autonomySidebar, reflectMemories, reflectWorldObservations,
+      bcGroups, bcTopics, bcChecked, bcLoading, bcError, bcSwitching,
+      loadWorldBroadcast, toggleWorldBroadcast,
       archiveItems, archiveLoading, archiveErr,
       readOnly, modeSwitching, toggleReadOnly,
       theme, toggleTheme,
@@ -10856,7 +11073,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupId(autonomyConfig, topic) ?? "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic).join("+") || "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",
@@ -11046,6 +11263,60 @@ async function bootstrap(): Promise<void> {
         applyReadOnlyMode(flag, "monitor ui");
         await persistReadOnlyMode(flag);
         sendJson(res, 200, { readOnly: readOnlyMode, qqMode: qqRuntimeMode });
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === "/api/world-broadcast") {
+        try {
+          sendJson(res, 200, await buildWorldBroadcastSettings());
+        } catch (error) {
+          // 群列表要问 NapCat。它断线的时候别让整页空白，把原因交给页面显示出来。
+          sendJson(res, 502, { error: `取群列表失败：${error instanceof Error ? error.message : String(error)}` });
+        }
+        return;
+      }
+
+      // 勾一个「话题→群」：勾上就是这个话题发到这个群，取消就是不发。全取消存成空列表，
+      // 表示这个话题不播报——删掉这个键反而会让它落回默认群。
+      if (req.method === "POST" && url.pathname === "/api/world-broadcast") {
+        const data = (await readJsonBody(req)) as { topic?: unknown; group_id?: unknown; enabled?: unknown };
+        const topic = typeof data.topic === "string" ? data.topic.trim() : "";
+        const groupId = typeof data.group_id === "string"
+          ? data.group_id.trim()
+          : typeof data.group_id === "number"
+            ? String(data.group_id)
+            : "";
+        const enabled = data.enabled;
+        if (!topic || !groupId || typeof enabled !== "boolean") {
+          sendJson(res, 400, { error: "topic, group_id and enabled (boolean) are required" });
+          return;
+        }
+        if (!autonomyConfig.worldTopics.includes(topic)) {
+          sendJson(res, 400, { error: `unknown topic: ${topic}` });
+          return;
+        }
+        if (!/^[0-9]{5,12}$/.test(groupId)) {
+          sendJson(res, 400, { error: `invalid group_id: ${groupId}` });
+          return;
+        }
+        const overrides: Record<string, string[]> = { ...autonomyConfig.worldTopicBroadcastGroupOverrides };
+        // 从「现在实际发到哪些群」起步：这个话题原本没配过的话，起点就是默认群，取消它才有意义。
+        const current = new Set(resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic));
+        if (enabled) current.add(groupId);
+        else current.delete(groupId);
+        overrides[topic] = [...current];
+        autonomyConfig = { ...autonomyConfig, worldTopicBroadcastGroupOverrides: overrides };
+        await persistWorldBroadcastTargets(overrides);
+        pushMonitorEntry(
+          "status",
+          enabled ? "World Broadcast Target Added" : "World Broadcast Target Removed",
+          `topic=${topic}\ngroup_id=${groupId}\nsource=monitor ui\ntargets=${overrides[topic].join(",") || "(none)"}`,
+        );
+        try {
+          sendJson(res, 200, await buildWorldBroadcastSettings());
+        } catch (error) {
+          sendJson(res, 502, { error: `已保存，但取群列表失败：${error instanceof Error ? error.message : String(error)}` });
+        }
         return;
       }
 

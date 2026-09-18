@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  resolveWorldObservationBroadcastGroupId,
+  resolveWorldObservationBroadcastGroupIds,
   runAutonomyLoop,
   worldObservationBroadcastGroupIds,
   type AutonomyConfig,
@@ -513,17 +513,37 @@ test("短路不写状态：跳过的那一轮不该看起来像做过什么", as
 
 // ---------- 世界观察播报的目标群 ----------
 
-test("a topic with its own broadcast group goes there, and every other topic goes to the default group", () => {
+test("一个话题可以配多个群，没配过的话题落回默认群", () => {
   const config = {
     worldObservationBroadcastGroupId: "20000001",
-    worldTopicBroadcastGroupOverrides: { 数学趣题: "20000002" },
+    worldTopicBroadcastGroupOverrides: {
+      数学趣题: ["20000002"],
+      天文学: ["20000001", "20000002"],
+    },
   };
 
-  assert.equal(resolveWorldObservationBroadcastGroupId(config, "数学趣题"), "20000002");
-  assert.equal(resolveWorldObservationBroadcastGroupId(config, "天文学"), "20000001");
-  assert.equal(
-    resolveWorldObservationBroadcastGroupId({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} }, "天文学"),
-    null,
+  assert.deepEqual(resolveWorldObservationBroadcastGroupIds(config, "数学趣题"), ["20000002"]);
+  // 同一条观察发进两个群，这正是 2026-09-18 加多群的理由。
+  assert.deepEqual(resolveWorldObservationBroadcastGroupIds(config, "天文学"), ["20000001", "20000002"]);
+  assert.deepEqual(resolveWorldObservationBroadcastGroupIds(config, "人工智能"), ["20000001"]);
+  assert.deepEqual(
+    resolveWorldObservationBroadcastGroupIds(
+      { worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} },
+      "天文学",
+    ),
+    [],
+  );
+});
+
+// 监控页上的开关直接改这份名单，所以「空列表」和「没配过」必须是两回事：把一个话题的群全关掉，
+// 它就该彻底不播报；要是这时候落回默认群，关掉最后一个开关反而会让它跑去别的群发。
+test("一个群都没选的话题彻底不播报，不落回默认群", () => {
+  assert.deepEqual(
+    resolveWorldObservationBroadcastGroupIds(
+      { worldObservationBroadcastGroupId: "20000001", worldTopicBroadcastGroupOverrides: { 天文学: [] } },
+      "天文学",
+    ),
+    [],
   );
 });
 
@@ -532,16 +552,24 @@ test("worldObservationBroadcastGroupIds lists every group a broadcast can land i
   assert.deepEqual(
     worldObservationBroadcastGroupIds({
       worldObservationBroadcastGroupId: "20000001",
-      worldTopicBroadcastGroupOverrides: { 人工智能: "20000001", 天文学: "20000001", 数学趣题: "20000002" },
+      worldTopicBroadcastGroupOverrides: { 人工智能: ["20000001", "20000002"], 天文学: ["20000001"], 数学趣题: ["20000002"] },
     }),
     ["20000001", "20000002"],
   );
+  // 页面上取消勾选的群会从名单里消失，但它以前发过的内容仍然是同一条内容流的一部分——这里只看
+  // 当前配置，所以重新勾回来的那一刻，去重靠的是那个群自己的历史。
   assert.deepEqual(
-    worldObservationBroadcastGroupIds({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: { 数学趣题: "20000002" } }),
+    worldObservationBroadcastGroupIds({
+      worldObservationBroadcastGroupId: null,
+      worldTopicBroadcastGroupOverrides: { 数学趣题: ["20000002"] },
+    }),
     ["20000002"],
   );
   assert.deepEqual(
-    worldObservationBroadcastGroupIds({ worldObservationBroadcastGroupId: null, worldTopicBroadcastGroupOverrides: {} }),
+    worldObservationBroadcastGroupIds({
+      worldObservationBroadcastGroupId: null,
+      worldTopicBroadcastGroupOverrides: {},
+    }),
     [],
   );
 });

@@ -61,8 +61,9 @@ export type AutonomyConfig = {
   // Missing entry = use browser_agent.query_suffix as before; "" = no suffix.
   worldTopicQuerySuffixOverrides: Record<string, string>;
   // 按话题覆盖播报目标群，键是 worldTopics 里的话题原文。没列出的话题发往
-  // worldObservationBroadcastGroupId。
-  worldTopicBroadcastGroupOverrides: Record<string, string>;
+  // worldObservationBroadcastGroupId。一个话题可以配多个群：同一条内容、同一次「发不发」的判断，
+  // 每个群再各自过自己的冷场闸。配置里写单个群号也照收，main.ts 读进来时统一成列表。
+  worldTopicBroadcastGroupOverrides: Record<string, string[]>;
   // 按话题的固定来源网址，每轮和搜索结果一起读，不看搜索排名。键是 worldTopics 里的话题原文。
   worldTopicSourceUrls: Record<string, string[]>;
   // 按话题写给播报改写那一步的内容范围，比如「数学」要研究新闻和理论突破、不要趣味题。话题名
@@ -82,15 +83,22 @@ export type AutonomyConfig = {
 
 type BroadcastRoutingConfig = Pick<
   AutonomyConfig,
-  "worldObservationBroadcastGroupId" | "worldTopicBroadcastGroupOverrides"
+  | "worldObservationBroadcastGroupId"
+  | "worldTopicBroadcastGroupOverrides"
 >;
 
-// 话题单独指定了群就发那里，否则发默认群。键按话题原文逐字匹配，写法必须和 worldTopics 一致。
-export function resolveWorldObservationBroadcastGroupId(
+// 这个话题要发进哪几个群。键按话题原文逐字匹配，写法必须和 worldTopics 一致。
+//
+// 监控页上的开关直接改这份名单，所以「配了、但是空的」是一个有意义的状态：一个群都没选就是这个
+// 话题不播报，绝不能落回默认群——否则关掉最后一个开关，它反而跑去默认群发。只有从没配过这个话题
+// （键都不存在）才落回默认群。
+export function resolveWorldObservationBroadcastGroupIds(
   config: BroadcastRoutingConfig,
   topic: string,
-): string | null {
-  return config.worldTopicBroadcastGroupOverrides[topic] ?? config.worldObservationBroadcastGroupId;
+): string[] {
+  const override = config.worldTopicBroadcastGroupOverrides[topic];
+  if (override !== undefined) return [...new Set(override)];
+  return config.worldObservationBroadcastGroupId ? [config.worldObservationBroadcastGroupId] : [];
 }
 
 // 所有可能收到世界观察播报的群。去重时要把它们的历史合在一起看。
@@ -102,7 +110,9 @@ export function resolveWorldObservationBroadcastGroupId(
 export function worldObservationBroadcastGroupIds(config: BroadcastRoutingConfig): string[] {
   const ids = [
     config.worldObservationBroadcastGroupId,
-    ...Object.values(config.worldTopicBroadcastGroupOverrides),
+    // flat()：一个话题可以配多个群，漏了这一步这里拿到的是数组，会被下面的字符串过滤悄悄丢掉，
+    // 那个群发过的内容就不参与去重了。
+    ...Object.values(config.worldTopicBroadcastGroupOverrides).flat(),
   ];
   return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))];
 }
