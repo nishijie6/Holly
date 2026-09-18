@@ -138,6 +138,27 @@ export type RecentAutonomyAction = {
 /** 往回看几条。够看出「最近一直在绕着同一件事打转」，又不至于让判断提示词变长。 */
 export const RECENT_AUTONOMY_ACTION_LIMIT = 6;
 
+/**
+ * 判断调用连着失败多少次才开始缓一缓。
+ *
+ * 一次失败不算事：网络抖一下、模型偶尔吐个解析不了的 JSON，下一分钟多半就好了，为这个
+ * 停摆反而让她白白闲着。连着失败就不一样——那通常是凭证过期、模型下线、schema 和服务端
+ * 对不上这类系统性故障，每分钟再问一次只会得到同一个错误，白烧一次调用。
+ *
+ * 调小：更快进入退避，省钱，但偶发抖动也会让她停一会儿。调大：抖动免疫更好，故障期间多烧
+ * 几次调用。
+ */
+export const JUDGMENT_FAILURE_BACKOFF_THRESHOLD = 3;
+
+/**
+ * 进入退避后隔多久再试一次。
+ *
+ * 和 worldObservationRetryMs 同一个道理：失败之后才要缓一缓，成功之后不用等。退避期内整轮
+ * 短路，连 judgment 都不调——她这一分钟不做事，但也不花钱。故障修好后的第一次成功会把计数
+ * 清零，立刻回到每分钟一次。
+ */
+export const JUDGMENT_FAILURE_BACKOFF_MS = 10 * 60 * 1000;
+
 export type AutonomyLoopState = {
   lastWorldObservationAt: number;
   lastWorldObservationAttemptAt: number;
@@ -154,6 +175,10 @@ export type AutonomyLoopState = {
   archiveWritingDailyCount: number;
   /** 最近若干次写下的题目，最新的在最后。老存档没有这个字段，读出来是空数组。 */
   recentActions: RecentAutonomyAction[];
+  /** 判断调用连续失败了几次。成功一次即清零。 */
+  judgmentFailureStreak: number;
+  /** 最近一次判断调用失败的时刻，配合 streak 算退避到什么时候。 */
+  lastJudgmentFailureAt: number;
 };
 
 export type AutonomyWorldObservationRequest = {
@@ -285,6 +310,15 @@ function worldObservationRetryAt(cfg: AutonomyConfig, state: AutonomyLoopState, 
   if (attemptAt <= 0 || attemptAt <= state.lastWorldObservationAt) return null;
   const retryAt = attemptAt + cfg.worldObservationRetryMs;
   return retryAt > now ? retryAt : null;
+}
+
+// 判断调用还在退避里吗——连续失败到阈值之后才开始算，单次失败不挡路。
+// 形状照抄 worldObservationRetryAt：不存「退避到什么时候」，用「上次失败时刻 + 间隔」现算，
+// 少一个会和 streak 不同步的状态字段。
+function judgmentBackoffUntil(state: AutonomyLoopState, now: number): number | null {
+  if ((state.judgmentFailureStreak ?? 0) < JUDGMENT_FAILURE_BACKOFF_THRESHOLD) return null;
+  const until = (state.lastJudgmentFailureAt ?? 0) + JUDGMENT_FAILURE_BACKOFF_MS;
+  return until > now ? until : null;
 }
 
 // 以前这里还有一道「距上次成功满 60 分钟」的闸，2026-09-15 取消：什么时候想去看看由 Holly 自己判断，
@@ -509,6 +543,21 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     };
   }
 
+  // 判断调用连着失败到阈值之后，缓一缓再问。单次失败不到这里——它照常降级成这一轮的
+  // do_nothing，下一分钟接着问。挡住的是「凭证过期了，于是每分钟报同一个错烧同一笔钱，
+  // 直到有人发现」那种跑法。
+  const backoffUntil = judgmentBackoffUntil(state, now);
+  if (backoffUntil !== null) {
+    const minutes = Math.max(1, Math.round((backoffUntil - now) / 60_000));
+    const reason = `判断调用已连续失败 ${state.judgmentFailureStreak} 次，暂停 ${minutes} 分钟后再试`;
+    // 报成 waiting 而不是 deferred：这一轮不是模型挑了别的，是压根没问成。
+    return {
+      action: { type: "do_nothing", reason },
+      checks: (["world_observation", "memory_reflection", "archive_writing", "group_proactive"] as const)
+        .map((name) => ({ name, status: "waiting" as const, reason, nextEligibleAt: backoffUntil })),
+    };
+  }
+
   let rawDecision: AutonomyJudgmentDecision;
   try {
     rawDecision = await deps.requestJudgment({
@@ -531,11 +580,25 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       lastActionSummary: lastAutonomyActionSummary(state, now),
       recentActions: [...(state.recentActions ?? [])],
     });
+    // 成功一次就把连败清零：故障修好之后立刻回到每分钟一次，不用等退避自然到期。
+    state.judgmentFailureStreak = 0;
+    state.lastJudgmentFailureAt = 0;
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    deps.log("error", "Autonomy judgment call failed", detail);
+    state.judgmentFailureStreak = (state.judgmentFailureStreak ?? 0) + 1;
+    state.lastJudgmentFailureAt = now;
+    const streak = state.judgmentFailureStreak;
+    // 连败到阈值的那一条要能从一片单次失败里跳出来：后面跟着的是十分钟停摆，不是又一次抖动。
+    deps.log(
+      "error",
+      "Autonomy judgment call failed",
+      streak >= JUDGMENT_FAILURE_BACKOFF_THRESHOLD
+        ? `连续第 ${streak} 次失败，接下来 ${Math.round(JUDGMENT_FAILURE_BACKOFF_MS / 60_000)} 分钟不再调用：${detail}`
+        : detail,
+    );
     rawDecision = { action: "do_nothing", reason: `判断调用失败：${detail}` };
   }
+  await deps.saveState();
 
   // Defensive: the caller is expected to build a JSON schema whose enum only
   // contains currently-eligible candidates (plus do_nothing/group_proactive,

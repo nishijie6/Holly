@@ -42,6 +42,8 @@ export type HollyAutonomyState = {
   archiveWritingDailyDate: string;
   archiveWritingDailyCount: number;
   recentActions: HollyAutonomyRecentAction[];
+  judgmentFailureStreak: number;
+  lastJudgmentFailureAt: number;
 };
 
 export type HollyLifecycleState = {
@@ -119,6 +121,8 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     archiveWritingDailyDate: dateKey,
     archiveWritingDailyCount: 0,
     recentActions: [],
+    judgmentFailureStreak: 0,
+    lastJudgmentFailureAt: 0,
   };
 }
 
@@ -180,6 +184,12 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
       ? Math.max(0, Math.floor(v.archiveWritingDailyCount))
       : 0,
     recentActions: coerceAutonomyRecentActions(v.recentActions),
+    // 连败计数跨重启保留：进程崩了重来不该把「已经连着失败三次」忘掉，否则一个反复重启的
+    // 故障永远攒不到阈值，退避就永远不生效。负数和小数按 0 处理。
+    judgmentFailureStreak: isFiniteNumber(v.judgmentFailureStreak)
+      ? Math.max(0, Math.floor(v.judgmentFailureStreak))
+      : 0,
+    lastJudgmentFailureAt: isFiniteNumber(v.lastJudgmentFailureAt) ? v.lastJudgmentFailureAt : 0,
   };
 }
 

@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  JUDGMENT_FAILURE_BACKOFF_MS,
+  JUDGMENT_FAILURE_BACKOFF_THRESHOLD,
   RECENT_AUTONOMY_ACTION_LIMIT,
   resolveWorldObservationBroadcastGroupIds,
   runAutonomyLoop,
@@ -54,6 +56,8 @@ function baseState(overrides: Partial<AutonomyLoopState> = {}): AutonomyLoopStat
     archiveWritingDailyDate: "2026-01-01",
     archiveWritingDailyCount: 0,
     recentActions: [],
+    judgmentFailureStreak: 0,
+    lastJudgmentFailureAt: 0,
     ...overrides,
   };
 }
@@ -307,6 +311,89 @@ test("picking archive_writing runs only composeArchive+writeArchive", async () =
   assert.equal(writeCalls, 1);
   assert.equal(state.archiveWritingDailyCount, 1);
   assert.equal(state.lastArchiveWritingAt, NOW);
+});
+
+// ---------- 判断调用连着失败时别每分钟都去撞墙 ----------
+
+test("一次失败只是这一轮做不成，下一轮照常问", async () => {
+  const state = baseState();
+  let calls = 0;
+  const result = await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => { calls += 1; throw new Error("boom"); },
+  }));
+
+  assert.equal(calls, 1);
+  assert.equal(state.judgmentFailureStreak, 1);
+  assert.equal(state.lastJudgmentFailureAt, NOW);
+  assert.equal(result.action.type, "do_nothing");
+  assert.match((result.action as { reason: string }).reason, /判断调用失败/);
+});
+
+test("连着失败到阈值就停一段时间，期间一次都不调", async () => {
+  const state = baseState({
+    judgmentFailureStreak: JUDGMENT_FAILURE_BACKOFF_THRESHOLD,
+    lastJudgmentFailureAt: NOW - 60_000,
+  });
+  let calls = 0;
+  const result = await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => { calls += 1; throw new Error("boom"); },
+  }));
+
+  assert.equal(calls, 0, "退避期内不该再问模型");
+  assert.equal(result.action.type, "do_nothing");
+  assert.match((result.action as { reason: string }).reason, /连续失败/);
+  // 这一轮不是模型挑了别的，是压根没问成——四条候选都该报成等待，而不是顺延。
+  assert.deepEqual([...new Set(result.checks.map((check) => check.status))], ["waiting"]);
+});
+
+test("退避到期后自己恢复，不用人去清", async () => {
+  const state = baseState({
+    judgmentFailureStreak: JUDGMENT_FAILURE_BACKOFF_THRESHOLD,
+    lastJudgmentFailureAt: NOW - JUDGMENT_FAILURE_BACKOFF_MS - 1000,
+  });
+  let calls = 0;
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => {
+      calls += 1;
+      return { action: "do_nothing", reason: "没什么想做的" };
+    },
+  }));
+
+  assert.equal(calls, 1);
+});
+
+test("成功一次就把连败清零，立刻回到每分钟一次", async () => {
+  const state = baseState({
+    judgmentFailureStreak: JUDGMENT_FAILURE_BACKOFF_THRESHOLD - 1,
+    lastJudgmentFailureAt: NOW - 60_000,
+  });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => ({ action: "do_nothing", reason: "没什么想做的" }),
+  }));
+
+  assert.equal(state.judgmentFailureStreak, 0);
+  assert.equal(state.lastJudgmentFailureAt, 0);
+});
+
+// do_nothing 是这条循环的常态，提示词自己就写着「大多数 tick 应该如此」。它绝不能算进
+// 连败——那样退避会在一切正常的时候触发，把她按在原地。
+test("模型说不做事不算失败", async () => {
+  const state = baseState({ judgmentFailureStreak: 2, lastJudgmentFailureAt: NOW - 60_000 });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async () => ({ action: "do_nothing", reason: "这会儿不想写" }),
+  }));
+
+  assert.equal(state.judgmentFailureStreak, 0);
 });
 
 // ---------- 最近写过什么，判断层要看得见 ----------

@@ -157,6 +157,35 @@ test("autonomy state: 名单里坏掉的条目被丢掉，好的留下", async (
   await rm(path, { force: true });
 });
 
+// 连败计数必须跨重启活着。一个「启动就崩」的故障会让进程反复重来，计数每次归零就永远
+// 攒不到阈值，退避等于不存在——而那恰好是最该退避的情形。
+test("autonomy state: 判断连败计数跨重启保留", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  store.getAutonomyState().judgmentFailureStreak = 3;
+  store.getAutonomyState().lastJudgmentFailureAt = 1700;
+  await store.save();
+
+  const reloaded = await HollyStateStore.load(path, TTL);
+  assert.equal(reloaded.getAutonomyState().judgmentFailureStreak, 3);
+  assert.equal(reloaded.getAutonomyState().lastJudgmentFailureAt, 1700);
+  await rm(path, { force: true });
+});
+
+test("autonomy state: 连败计数是坏值就当没失败过", async () => {
+  const path = tmpPath();
+  await writeFile(
+    path,
+    JSON.stringify({ autonomy: { judgmentFailureStreak: -5, lastJudgmentFailureAt: "昨天" } }),
+    "utf-8",
+  );
+
+  const store = await HollyStateStore.load(path, TTL);
+  assert.equal(store.getAutonomyState().judgmentFailureStreak, 0);
+  assert.equal(store.getAutonomyState().lastJudgmentFailureAt, 0);
+  await rm(path, { force: true });
+});
+
 test("lifecycle state: persists boot thought and QQ mode decision", async () => {
   const path = tmpPath();
   const store = await HollyStateStore.load(path, TTL);
