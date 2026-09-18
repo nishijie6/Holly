@@ -13,6 +13,13 @@ import type { LlmToolUseBlock } from "./llm-client.js";
 // 库，作品进 archive/）。这里只负责把她填的参数递过去。
 
 export type SelfToolDeps = {
+  /**
+   * 去看一眼某个话题的近况，返回观察摘要；看完不替她发给任何人。
+   * null 表示这次什么都没看到（抓取失败、页面上没有新内容）。
+   */
+  observeWorld: (topic: string) => Promise<{ summary: string } | null>;
+  /** 允许看的话题，来自配置。填了别的会被挡下并给出名单。 */
+  worldTopics: () => readonly string[];
   /** 写一条内部记忆。topic 是题目，content 是正文。 */
   writeMemory: (input: { topic: string; content: string; reason: string }) => Promise<void>;
   /** 写一篇文章或一首诗。 */
@@ -24,7 +31,7 @@ export type SelfToolDeps = {
   }) => Promise<void>;
 };
 
-export const SELF_SUBTOOL_NAMES = ["write_memory", "write_archive"] as const;
+export const SELF_SUBTOOL_NAMES = ["write_memory", "write_archive", "observe_world"] as const;
 
 function ok(payload: Record<string, unknown> = {}): string {
   return JSON.stringify({ ok: true, ...payload });
@@ -69,8 +76,34 @@ export function createSelfToolRunner(
         return ok();
       }
 
+      case "observe_world": {
+        const topics = deps.worldTopics();
+        if (topics.length === 0) {
+          return refuse("no topics configured", "现在一个可看的话题都没配。");
+        }
+        const topic = readText(call.input.topic);
+        if (!topic) {
+          return refuse("missing topic", `topic 要填一个话题。能看的是：${topics.join("、")}。`);
+        }
+        // 话题按原文逐字匹配配置：每个话题的固定来源页是按名字配的，编一个名字出来就没有
+        // 来源可读。挡下时把名单给她，不让她对着一句「不认识」反复猜。
+        if (!topics.includes(topic)) {
+          return refuse("unknown topic", `没有这个话题。能看的是：${topics.join("、")}。`);
+        }
+
+        const observed = await deps.observeWorld(topic);
+        if (!observed) {
+          return refuse("nothing found", "这次没看到什么新东西，过会儿再来吧。");
+        }
+        return ok({
+          summary: observed.summary,
+          // 看完是否说给谁听由她决定——这正是这个工具和以前那条自动播报路径的区别。
+          note: "这些是刚看到的。想说给谁听，自己 open_conversation 再 send_message；觉得不值得说就放着。",
+        });
+      }
+
       default:
-        return refuse(`unknown subtool ${call.name}`, "这个 runner 只认她自己的那两个子工具。");
+        return refuse(`unknown subtool ${call.name}`, "这个 runner 只认她自己那几个子工具。");
     }
   };
 }

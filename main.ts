@@ -4813,6 +4813,9 @@ function buildFocusToolRunner(
       await writeMemoryForAutonomy({ topic, content, reason }),
     writeArchive: async ({ kind, title, content, reason }) =>
       await writeArchiveForAutonomy({ kind, title, content, reason }),
+    observeWorld: async (topic) =>
+      await observeWorldForAutonomy({ topic, reason: "她自己想去看看" }, { broadcast: false }),
+    worldTopics: () => autonomyConfig.worldTopics,
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
       renderConversationRecent(id, focusModeConfig.recentTurnsPerConversation),
@@ -6142,8 +6145,17 @@ async function judgeWorldObservationSearchResults(
   }
 }
 
+/**
+ * 去看一眼某个话题。
+ *
+ * broadcast 决定看完是否走那套自动播报（日期闸、去重、冷场闸、多群、只读试运行）。autonomy
+ * 这条老路径传 true，保持原样；她自己调 observe_world 工具时传 false——看完要不要说给谁听，
+ * 由她看过内容之后自己决定，再调 send_message。这正是把「选动作 + 引擎执行」换成「她拿到
+ * 东西、自己决定下一步」的那一步。
+ */
 async function observeWorldForAutonomy(
   request: AutonomyWorldObservationRequest,
+  options: { broadcast?: boolean } = {},
 ): Promise<ProactiveWorldObservation | null> {
   if (!browserAgentConfig.enabled) return null;
   if (!searchConfig.enabled) {
@@ -6208,6 +6220,17 @@ async function observeWorldForAutonomy(
     pushMonitorEntry("error", "Qdrant World Observation Store Error", detail);
     console.error("Failed to store world observation:", error);
   }
+  if (options.broadcast === false) {
+    // 她自己去看的那一次：不替她发。话题近况仍然记一笔——下次判断「这个话题刚看过」靠它。
+    recordWorldTopicOutcome(request.topic, now, "她自己去看的，还没说给谁听");
+    pushMonitorEntry(
+      "status",
+      "Browser Agent Observed",
+      `topic=${request.topic}\nquery=${worldObservation.query}\nsources=${worldObservation.urls.length}`,
+    );
+    return worldObservation;
+  }
+
   try {
     const outcome = await maybeBroadcastWorldObservation(request.topic, worldObservation, observedAtIso, observed.pages);
     recordWorldTopicOutcome(request.topic, now, outcome);

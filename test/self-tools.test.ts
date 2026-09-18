@@ -7,15 +7,18 @@ import type { LlmToolUseBlock } from "../llm-client.js";
 function harness(overrides: Partial<SelfToolDeps> = {}) {
   const memories: Array<{ topic: string; content: string }> = [];
   const archives: Array<{ kind: string; title: string; content: string }> = [];
+  const observed: string[] = [];
   const deps: SelfToolDeps = {
     writeMemory: async ({ topic, content }) => { memories.push({ topic, content }); },
     writeArchive: async ({ kind, title, content }) => { archives.push({ kind, title, content }); },
+    observeWorld: async (topic) => { observed.push(topic); return { summary: `[${topic}] 最近有这些` }; },
+    worldTopics: () => ["人工智能", "天文学"],
     ...overrides,
   };
   const run = createSelfToolRunner(deps);
   const call = (name: string, input: Record<string, unknown> = {}) =>
     run({ type: "tool_use", id: "tu_1", name, input } as LlmToolUseBlock).then((raw) => JSON.parse(raw));
-  return { call, memories, archives };
+  return { call, memories, archives, observed };
 }
 
 test("记一件事", async () => {
@@ -61,6 +64,40 @@ test("落盘失败会抛出去，不假装写成了", async () => {
   await assert.rejects(() => call("write_memory", { topic: "t", content: "c" }), /disk full/);
 });
 
-test("名单就是这两个", () => {
-  assert.deepEqual([...SELF_SUBTOOL_NAMES], ["write_memory", "write_archive"]);
+test("看一眼世界，拿回摘要", async () => {
+  const { call, observed } = harness();
+  const result = await call("observe_world", { topic: "天文学" });
+  assert.equal(result.ok, true);
+  assert.match(result.summary, /天文学/);
+  assert.deepEqual(observed, ["天文学"]);
+});
+
+// 这个工具只负责看。以前观察完会自动走一整套播报判断替她决定发不发；现在东西回到她手上，
+// 说不说是她自己的事——返回里的提示就是在说这件事。
+test("看完不替她发，提示她自己决定", async () => {
+  const { call } = harness();
+  const result = await call("observe_world", { topic: "天文学" });
+  assert.match(result.note, /send_message/);
+  assert.match(result.note, /不值得说就放着/);
+});
+
+// 话题按原文逐字匹配配置：每个话题的固定来源页是按名字配的，编一个名字就没有来源可读。
+test("话题不在配置里就挡下，并给出能看的名单", async () => {
+  const { call, observed } = harness();
+  const result = await call("observe_world", { topic: "股市" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /人工智能/);
+  assert.match(result.note, /天文学/);
+  assert.deepEqual(observed, [], "挡下就不该真去看");
+});
+
+test("什么都没看到时说清楚，不编一段摘要", async () => {
+  const { call } = harness({ observeWorld: async () => null });
+  const result = await call("observe_world", { topic: "天文学" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /没看到/);
+});
+
+test("名单就是这三个", () => {
+  assert.deepEqual([...SELF_SUBTOOL_NAMES], ["write_memory", "write_archive", "observe_world"]);
 });
