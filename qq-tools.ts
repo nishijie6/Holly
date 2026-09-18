@@ -48,7 +48,9 @@ export type QqToolDeps = {
   canSend: () => { allowed: boolean; reason: string };
   /**
    * 唤起这一轮的会话 id——前台被找的、或后台通知来自的那个会话。send_message 靠它
-   * 识别过期焦点，见文件头。null 表示这一轮不是被某个会话唤起的，不做这项检查。
+   * 识别过期焦点，见文件头。null 表示这一轮不是被某个会话唤起的（她自己冒念头的那种），
+   * 此时 send_message 不做这项检查——那是她明确要说的话；但动手前的吆喝改为要求她这一轮
+   * 真的打开过会话，见 sayBeforeWorking。
    */
   roundConversationId: string | null;
   /**
@@ -214,7 +216,11 @@ function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) => Promis
     if (noticeSentThisRound) return false;
     const focus = deps.getFocus();
     const round = deps.roundConversationId;
-    const focusIsThisRound = focus !== null && (!round || focus === round || openedThisRound);
+    // 没有本轮会话（她自己冒念头那种轮次）时，只有她这一轮真的打开过某个会话才吆喝。原来这里
+    // 是 !round 直接放行，于是自主轮里那句「我搜一下，稍等」会发进焦点碰巧停着的群——可能是
+    // 几小时前的对话，没有人在等。send_message 那项检查照旧不适用，那是她明确要说的话。
+    const focusIsThisRound = focus !== null
+      && (round ? (focus === round || openedThisRound) : openedThisRound);
     if (!focus || !focusIsThisRound || !deps.canSend().allowed) return false;
     const saying = typeof raw === "string" ? raw.trim() : "";
     try {

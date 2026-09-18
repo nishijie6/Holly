@@ -86,16 +86,6 @@ export type AutonomyConfig = {
   memoryReflectionBroadcastLullMs: number;
   archiveWritingEnabled: boolean;
   archiveWritingRetryMs: number;
-  /**
-   * 归档写作一天最多几次。
-   *
-   * 不是节奏闸——什么时候想写由她自己判断。这是防跑飞的兜底：模型抽了风连着挑二十次
-   * 归档写作，得有个东西拦住。以前这个位置是 240 分钟的固定间隔，它顺带兜住了这件事；
-   * 间隔一撤，兜底就得自己站出来。
-   */
-  archiveWritingDailyCap: number;
-  /** 世界观察一天最多几次。同样是防跑飞，不是节奏闸——见 archiveWritingDailyCap。 */
-  worldObservationDailyCap: number;
 };
 
 // ---------- 世界观察播报的目标群 ----------
@@ -154,9 +144,6 @@ export type RecentAutonomyAction = {
   title: string;
 };
 
-/** 往回看几条。够看出「最近一直在绕着同一件事打转」，又不至于让判断提示词变长。 */
-export const RECENT_AUTONOMY_ACTION_LIMIT = 6;
-
 /**
  * 判断调用连着失败多少次才开始缓一缓。
  *
@@ -214,26 +201,11 @@ export type AutonomyMemoryWriteRequest = {
   observation?: ProactiveWorldObservation | null;
 };
 
-export type AutonomyMemoryReflectionRequest = {
-  reason: string;
-  nowIso: string;
-};
-
-export type AutonomyArchiveComposeRequest = {
-  reason: string;
-  nowIso: string;
-};
-
 export type AutonomyArchiveWriteRequest = {
   kind: ArchiveWorkKind;
   title: string;
   content: string;
   reason: string;
-};
-
-export type AutonomyJudgmentCandidate = {
-  eligible: boolean;
-  note: string;
 };
 
 // 每个世界观察话题的近况，交给每轮判断去决定去不去、看哪个。只放事实，不替模型下结论。
@@ -244,28 +216,6 @@ export type WorldTopicStatus = {
   // 那一次的结局，一句中文，比如「发到了群里」「页面上没有最近 24 小时的新内容」；空串表示不清楚。
   outcome: string;
 };
-
-export type AutonomyJudgmentRequest = {
-  nowIso: string;
-  worldObservation: AutonomyJudgmentCandidate;
-  // 只在世界观察可选时才有内容：不可选时模型本来就不能选它，列出来只是白花 token。
-  worldTopics: WorldTopicStatus[];
-  memoryReflection: AutonomyJudgmentCandidate;
-  archiveWriting: AutonomyJudgmentCandidate;
-  groupProactiveNote: string;
-  pendingReplyGroupCount: number;
-  lastActionSummary: string;
-  // 最近写过的题目，给判断层用来避开刚写过的东西。空数组表示还没写过，或是老存档刚升上来。
-  recentActions: RecentAutonomyAction[];
-};
-
-export type AutonomyJudgmentDecision =
-  | { action: "do_nothing"; reason: string }
-  // topic 是模型挑的话题。没给、或给了配置里没有的，引擎退回轮转。
-  | { action: "world_observation"; reason: string; topic?: string }
-  | { action: "memory_reflection"; reason: string }
-  | { action: "archive_writing"; reason: string }
-  | { action: "group_proactive"; reason: string };
 
 export type AutonomyDeps = {
   now: () => number;
@@ -288,14 +238,9 @@ export type AutonomyDeps = {
   lastFocusActivityAt: () => number;
   /** 触发门控的参数，测试用；不给就用默认。 */
   idlePolicy?: AutonomyIdlePolicy;
-  // 各话题的近况，只在世界观察可选的那一轮取。确定性、无副作用。
-  worldTopicStatuses: () => WorldTopicStatus[];
-  // 主动发言这条线此刻有没有事可做。确定性、无副作用，用来在三个定时候选都没到期时
-  // 省掉那次判断调用——见下面 runAutonomyLoop 里的短路。
+  // 主动发言这条线此刻有没有事可做。确定性、无副作用：先问一句，没事可做才轮到冒念头。
   hasProactiveWork: () => boolean;
-  pendingReplyGroupCount: () => number;
   log: (kind: "status" | "error", title: string, body: string) => void;
-  recordWorldObservation: (record: Record<string, unknown>) => void;
 };
 
 export type AutonomyLoopResult = {
@@ -310,7 +255,7 @@ function localDateKey(date = new Date()): string {
   return `${y}-${m}-${d}`;
 }
 
-function rollAutonomyDaily(state: AutonomyLoopState, now: number): void {
+export function rollAutonomyDaily(state: AutonomyLoopState, now: number): void {
   const today = localDateKey(new Date(now));
   if (state.worldObservationDailyDate !== today) {
     state.worldObservationDailyDate = today;
@@ -326,160 +271,12 @@ function rollAutonomyDaily(state: AutonomyLoopState, now: number): void {
   }
 }
 
-function pickWorldTopic(state: AutonomyLoopState, topics: readonly string[]): string | null {
-  if (topics.length === 0) return null;
-  const index = Math.abs(Math.floor(state.nextWorldTopicIndex)) % topics.length;
-  state.nextWorldTopicIndex = (index + 1) % topics.length;
-  return topics[index];
-}
-
-// 最近一次尝试没拿到观察、还在重试间隔里时，返回可以再试的时间；否则 null。尝试时间比成功时间新，
-// 就说明最近那次失败了——成功的那次，两个时间是同一刻。
-function worldObservationRetryAt(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): number | null {
-  const attemptAt = state.lastWorldObservationAttemptAt;
-  if (attemptAt <= 0 || attemptAt <= state.lastWorldObservationAt) return null;
-  const retryAt = attemptAt + cfg.worldObservationRetryMs;
-  return retryAt > now ? retryAt : null;
-}
-
-// 判断调用还在退避里吗——连续失败到阈值之后才开始算，单次失败不挡路。
-// 形状照抄 worldObservationRetryAt：不存「退避到什么时候」，用「上次失败时刻 + 间隔」现算，
-// 少一个会和 streak 不同步的状态字段。
+// 冒念头还在退避里吗——连续失败到阈值之后才开始算，单次失败不挡路。
+// 不存「退避到什么时候」，用「上次失败时刻 + 间隔」现算：少一个会和 streak 不同步的状态字段。
 function judgmentBackoffUntil(state: AutonomyLoopState, now: number): number | null {
   if ((state.judgmentFailureStreak ?? 0) < JUDGMENT_FAILURE_BACKOFF_THRESHOLD) return null;
   const until = (state.lastJudgmentFailureAt ?? 0) + JUDGMENT_FAILURE_BACKOFF_MS;
   return until > now ? until : null;
-}
-
-// 以前这里还有一道「距上次成功满 60 分钟」的闸，2026-09-15 取消：什么时候想去看看由 Holly 自己判断，
-// 不按钟点排班。刚看完紧接着再去也放行——挡住无谓重复的是判断时看到的话题近况，不是时钟。
-// 重试间隔只在失败后生效：成功之后不用等，失败之后才要缓一缓。
-function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
-  if (!cfg.worldObservationEnabled) return false;
-  if (cfg.worldTopics.length === 0) return false;
-  // 日上限是 2026-09-15 撤掉固定间隔时留下的洞：dailyCount 一直在加，却没有一处读它，
-  // 于是那之后世界观察其实没有任何频率兜底。补上——它拦的是跑飞，不是节奏。
-  if (state.worldObservationDailyCount >= cfg.worldObservationDailyCap) return false;
-  return worldObservationRetryAt(cfg, state, now) === null;
-}
-
-// 世界观察没有配置间隔，不套 scheduledCheckWhenNotDue：没到期只可能是关着、没配话题，或者失败后在等重试。
-function worldObservationCheckWhenNotDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): AutonomyCheck {
-  if (!cfg.worldObservationEnabled || cfg.worldTopics.length === 0) {
-    return {
-      name: "world_observation",
-      status: "disabled",
-      reason: cfg.worldObservationEnabled ? "没有配置世界观察主题" : "世界观察已关闭",
-      nextEligibleAt: null,
-    };
-  }
-  return {
-    name: "world_observation",
-    status: "waiting",
-    reason: "上次观察没拿到可用内容，还在重试间隔里",
-    nextEligibleAt: worldObservationRetryAt(cfg, state, now),
-  };
-}
-
-function memoryReflectionDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
-  if (!cfg.memoryReflectionEnabled) return false;
-  if (state.lastMemoryReflectionAt > 0 && now - state.lastMemoryReflectionAt < cfg.memoryReflectionIntervalMs) {
-    return false;
-  }
-  if (
-    state.lastMemoryReflectionAttemptAt > 0 &&
-    now - state.lastMemoryReflectionAttemptAt < cfg.memoryReflectionRetryMs
-  ) {
-    return false;
-  }
-  return true;
-}
-
-// 固定间隔在这里撤掉了，理由和世界观察 2026-09-15 那次一样：什么时候想写点东西由她自己
-// 判断，不按钟点排班。人不会掐着表写诗。
-//
-// 撤得起，是因为这一条的间隔本来就不为缓存服务——归档写作永远读不回自己的 KV 缓存（见
-// 「Reflect every 50 minutes」那次的实测），而缓存写入不额外收费，所以什么时候写在账单上
-// 没有分别。记忆反思的 50 分钟是另一回事：它卡着一小时的 cache TTL，撤了命中率会从七成掉到
-// 半成，所以那一条原样留着。
-//
-// 挡住无谓重复的，从此是判断时看到的事实——最近写过哪几个题目（recentActions）、上次是多久
-// 以前——而不是时钟。retry 间隔照旧只在失败后生效。
-function archiveWritingDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
-  if (!cfg.archiveWritingEnabled) return false;
-  if (state.archiveWritingDailyCount >= cfg.archiveWritingDailyCap) return false;
-  if (
-    state.lastArchiveWritingAttemptAt > 0 &&
-    now - state.lastArchiveWritingAttemptAt < cfg.archiveWritingRetryMs
-  ) {
-    return false;
-  }
-  return true;
-}
-
-// 归档写作没有配置间隔了，不套 scheduledCheckWhenNotDue：没到期只可能是关着、今天写够了，
-// 或者失败后在等重试。三个原因各自报实话，不写成「距上次尚未达到配置间隔」——那个间隔已经
-// 不存在，那样写会让 trace 撒谎。
-function archiveWritingCheckWhenNotDue(
-  cfg: AutonomyConfig,
-  state: AutonomyLoopState,
-  now: number,
-): AutonomyCheck {
-  if (!cfg.archiveWritingEnabled) {
-    return { name: "archive_writing", status: "disabled", reason: "归档写作已关闭", nextEligibleAt: null };
-  }
-  if (state.archiveWritingDailyCount >= cfg.archiveWritingDailyCap) {
-    return {
-      name: "archive_writing",
-      status: "waiting",
-      reason: `今天已经写了 ${state.archiveWritingDailyCount} 篇，到上限了`,
-      nextEligibleAt: null,
-    };
-  }
-  return {
-    name: "archive_writing",
-    status: "waiting",
-    reason: "上次没写成，还在重试间隔里",
-    nextEligibleAt: state.lastArchiveWritingAttemptAt + cfg.archiveWritingRetryMs,
-  };
-}
-
-function scheduledCheckWhenNotDue(input: {
-  name: AutonomyCheckName;
-  enabled: boolean;
-  disabledReason: string;
-  lastCompletedAt: number;
-  intervalMs: number;
-  lastAttemptAt: number;
-  retryMs: number;
-  now: number;
-}): AutonomyCheck {
-  if (!input.enabled) {
-    return {
-      name: input.name,
-      status: "disabled",
-      reason: input.disabledReason,
-      nextEligibleAt: null,
-    };
-  }
-
-  const intervalReadyAt = input.lastCompletedAt > 0
-    ? input.lastCompletedAt + input.intervalMs
-    : 0;
-  const retryReadyAt = input.lastAttemptAt > 0
-    ? input.lastAttemptAt + input.retryMs
-    : 0;
-  const nextEligibleAt = Math.max(intervalReadyAt, retryReadyAt);
-  const reason = retryReadyAt > intervalReadyAt && retryReadyAt > input.now
-    ? "仍在等待上次尝试后的重试间隔"
-    : "距离上次完成尚未达到配置间隔";
-
-  return {
-    name: input.name,
-    status: "waiting",
-    reason,
-    nextEligibleAt: nextEligibleAt > input.now ? nextEligibleAt : null,
-  };
 }
 
 function deferredChecks(
@@ -494,46 +291,13 @@ function deferredChecks(
   }));
 }
 
-function freshnessNote(lastAt: number, now: number): string {
-  if (lastAt <= 0) return "从未执行过";
-  const minutes = Math.max(0, Math.round((now - lastAt) / 60_000));
-  return `距上次已 ${minutes} 分钟`;
-}
-
-// 就地追加并裁到上限。调用点都在「写入成功」之后——没写成的那次不算数，她下一轮该
-// 重新考虑这个题目，而不是以为自己已经写过了。
-function rememberAutonomyAction(
-  state: AutonomyLoopState,
-  entry: RecentAutonomyAction,
-): void {
-  const title = entry.title.trim();
-  if (!title) return;
-  const list = state.recentActions ?? (state.recentActions = []);
-  list.push({ ...entry, title });
-  if (list.length > RECENT_AUTONOMY_ACTION_LIMIT) {
-    list.splice(0, list.length - RECENT_AUTONOMY_ACTION_LIMIT);
-  }
-}
-
-function lastAutonomyActionSummary(state: AutonomyLoopState, now: number): string {
-  const candidates: Array<{ at: number; label: string }> = [
-    { at: state.lastWorldObservationAt, label: "world_observation" },
-    { at: state.lastMemoryReflectionAt, label: "memory_reflection" },
-    { at: state.lastArchiveWritingAt, label: "archive_writing" },
-  ].filter((candidate) => candidate.at > 0);
-  if (candidates.length === 0) return "尚未行动过";
-  const latest = candidates.reduce((a, b) => (b.at > a.at ? b : a));
-  const minutes = Math.max(0, Math.round((now - latest.at) / 60_000));
-  return `${minutes} 分钟前：${latest.label}`;
-}
-
 export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopResult> {
   const cfg = deps.config;
   if (!cfg.enabled) {
     return {
       action: { type: "do_nothing", reason: "autonomy disabled" },
       checks: deferredChecks(
-        ["world_observation", "memory_reflection", "archive_writing", "group_proactive"],
+        ["inner_voice", "group_proactive"],
         "自主循环已关闭",
       ).map((check) => ({ ...check, status: "disabled" })),
     };
@@ -598,6 +362,15 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
 
   // 主动开口优先。它有自己一整套规则闸（冷场时长、兴趣话题、冷却、限流、影子模式），
   // 那是单独设计过的安全边界，不该因为这里换了形状就被绕开。有活就让它去做，这一轮到此为止。
+  //
+  // 闸压根没过，和闸过了、跑了一轮却没产出动作，是两回事：前者是「还没轮到她说话」，后者是
+  // 「轮到了，但没什么可说」。合并成一句「规则闸未通过」，看监控的人就分不出来了。
+  let proactiveCheck: AutonomyCheck = {
+    name: "group_proactive",
+    status: "deferred",
+    reason: "群聊规则闸未通过（冷场时长/冷却/限流）",
+    nextEligibleAt: null,
+  };
   if (deps.hasProactiveWork()) {
     const groupResult = await deps.runGroupProactiveAction();
     if (groupResult.actions.length > 0) {
@@ -621,6 +394,12 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
         ],
       };
     }
+    proactiveCheck = {
+      name: "group_proactive",
+      status: "no_action",
+      reason: "规则闸过了，但这一轮没有群产生可发的动作",
+      nextEligibleAt: null,
+    };
   }
 
   // 没有别的事，就冒一个念头交给她。
@@ -637,7 +416,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       action: { type: "inner_thought", reason: "闲下来了，冒个念头" },
       checks: [
         { name: "inner_voice", status: "acted", reason: "冒了个念头，接下来看她自己", nextEligibleAt: null },
-        ...deferredChecks(["group_proactive"], "群聊规则闸未通过（冷场时长/冷却/限流）"),
+        proactiveCheck,
       ],
     };
   } catch (error) {
@@ -655,7 +434,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     await deps.saveState();
     return {
       action: { type: "do_nothing", reason: `冒念头失败：${detail}` },
-      checks: deferredChecks(["inner_voice", "group_proactive"], `冒念头失败：${detail}`),
+      checks: [...deferredChecks(["inner_voice"], `冒念头失败：${detail}`), proactiveCheck],
     };
   }
 }

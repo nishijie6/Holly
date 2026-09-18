@@ -1811,7 +1811,7 @@ createApp({
       var labels = {
         reply: '选择回复', silent: '保持沉默', suppressed: '话没出去', active: '主动接入', observe: '仅观察', offline: '离线',
         memory_written: '写入记忆', no_memory: '未写记忆', idle: '未行动', disabled: '已关闭',
-        world_observed: '完成观察', world_empty: '观察无结果', archive_written: '完成创作',
+        world_observed: '完成观察', world_empty: '观察无结果', archive_written: '完成创作', inner_thought: '冒了个念头',
         proactive_shadow: '影子动作', proactive_live: '主动发言', failed: '检查失败'
       };
       return labels[outcome] || outcome;

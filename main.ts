@@ -61,7 +61,7 @@ import {
   type PromptCachePurposeStat,
   type PromptCacheSeriesPoint,
 } from "./token-usage.js";
-import { describeCachePrefixDrift, StablePrefixLedger } from "./cache-prefix.js";
+import { describeCachePrefixDrift } from "./cache-prefix.js";
 import { renderMonitorPage } from "./monitor-page.js";
 import { loadPromptText, renderPromptText } from "./prompt-text.js";
 import { RouteQueue } from "./route-queue.js";
@@ -95,16 +95,12 @@ import {
   resolveWorldObservationBroadcastGroupIds,
   runAutonomyLoop,
   worldObservationBroadcastGroupIds,
+  rollAutonomyDaily,
   type ArchiveWorkKind,
-  type AutonomyArchiveComposeRequest,
   type AutonomyArchiveWriteRequest,
   type AutonomyConfig,
-  type AutonomyJudgmentDecision,
-  type AutonomyJudgmentRequest,
-  type AutonomyMemoryReflectionRequest,
   type AutonomyMemoryWriteRequest,
   type AutonomyWorldObservationRequest,
-  type WorldTopicStatus,
 } from "./autonomy-engine.js";
 import { buildAutonomyTickThought } from "./autonomy-tick-thought.js";
 import {
@@ -771,10 +767,6 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   memoryReflectionBroadcastLullMs: 3 * 60 * 60 * 1000,
   archiveWritingEnabled: false,
   archiveWritingRetryMs: 60 * 60 * 1000,
-  // 防跑飞的兜底，不是节奏闸。按撤掉的 240 分钟间隔折算，一天最多六篇左右。
-  archiveWritingDailyCap: 6,
-  // 同上。世界观察 2026-09-15 撤间隔后一直没有兜底，这里补上。
-  worldObservationDailyCap: 24,
 };
 
 let sessionLogPath: string | null = null;
@@ -1203,11 +1195,6 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
     archiveWritingRetryMs: readProactiveMinutesMs(
       a.archive_writing_retry_minutes,
       base.archiveWritingRetryMs,
-    ),
-    archiveWritingDailyCap: readProactiveCount(a.archive_writing_daily_cap, base.archiveWritingDailyCap),
-    worldObservationDailyCap: readProactiveCount(
-      a.world_observation_daily_cap,
-      base.worldObservationDailyCap,
     ),
   };
 }
@@ -5170,111 +5157,129 @@ const focusLoopQueue = new RouteQueue();
 /** 念头的码点上限，纯安全网：只拦跑题成小作文，不替她决定说多长。 */
 const MAX_INNER_THOUGHT_CODE_POINTS = 300;
 
+// 产念头那一步不该真的动手——动手是下一步她自己那一轮的事。但工具定义必须照样带着：它排在
+// system 前面，是缓存前缀的一部分，少一个前缀就对不上（和 LEDGER_COMPACTION_TOOL_REFUSAL
+// 同一个道理）。模型真去调，就收到这一句。
+const INNER_VOICE_TOOL_REFUSAL = JSON.stringify({
+  ok: false,
+  error: "inner_voice_only",
+  note: "这会儿只是在想「接下来去动哪个」，工具都还不能用。先把念头写出来，动手是下一轮的事。",
+});
+
+// 正常一轮就写完；留两轮余量，给模型先调一次工具、被拒之后再写的情况。
+const INNER_VOICE_MAX_ROUNDS = 3;
+
 /**
  * 冒一个念头，然后让她自己去处理它。
  *
  * 这是 kagami 那套的形状：不问她「要不要做 A、B、C、D」再由引擎去执行，而是给她一个念头，
  * 接下来做什么、做不做，是她在自己的轮次里拿工具决定的。
  *
- * 两步都在 focus 队列的同一条路由上，而且在同一个任务里：账本只有一本，念头产出时读到的
+ * 三步都在 focus 队列的同一条路由上，而且在同一个任务里：账本只有一本，念头产出时读到的
  * 上下文，必须就是她随后动手时的那一份。
  *
- * 产出这一步复用焦点前缀——同一份 system、同一本账本，只在尾部追一条指令。那些 token 上一轮
- * 刚被焦点循环写进缓存，读回来只要一成的价。以前那个每分钟一次的判断调用做不到这一点：它有
- * 自己的 system prompt 和自己拼的上下文，短到够不着最小可缓存长度，每次全价重付。
+ * 压缩排在最前面，不跟着动手那一步走。整本账本这一轮要发两次，压缩要是留在产念头之后，账本
+ * 一旦涨过窗口，先抛错的就是产念头那一次——而压缩正接在它后面，于是再也走不到。空闲时这会
+ * 一直卡到下一条群消息进来才解开。
+ *
+ * 出错一律往外抛，不在这里咽回去。引擎那边靠「抛没抛」记连败、算退避（见 autonomy-engine
+ * 的 judgmentBackoffUntil）；在这里吞掉，凭证过期这种故障就会被记成一次「成功的空念头」，
+ * 退避永远不启动，每隔一个不应期原样再烧一次。
  */
 async function runInnerVoiceOnFocusQueue(): Promise<void> {
   await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, async () => {
-    const thought = await requestInnerThought();
+    const client = getDecisionLlmClient();
+    const compaction = await compactLedgerIfNeeded(client);
+    const thought = await requestInnerThought(client, compaction !== "not-needed");
     if (!thought) {
       pushMonitorEntry("status", "Inner Voice Empty", "这次没冒出什么念头。");
       return;
     }
-    await runInnerThoughtRound(thought);
+    await runInnerThoughtRound(client, thought);
   });
 }
 
-async function requestInnerThought(): Promise<string> {
-  const client = getActiveLlmClient();
-  if (!client) return "";
-  try {
-    const reply = await client.generateText({
-      purpose: "inner-voice",
-      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
-      // 账本原样照发 + 尾部一条指令：字节相等才命中焦点那条路由的缓存。
-      messages: [
-        ...conversationLedger.snapshot(),
-        { role: "user", content: loadPromptText("inner-voice") },
-      ],
-      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
-    });
-    broadcastLatestLlmUsage(client);
-    // 按码点截断，绝不劈开代理对。空回复就是「这次没什么想做的」，合法。
-    const trimmed = reply.trim();
-    const points = Array.from(trimmed);
-    return points.length <= MAX_INNER_THOUGHT_CODE_POINTS
-      ? trimmed
-      : points.slice(0, MAX_INNER_THOUGHT_CODE_POINTS).join("");
-  } catch (error) {
-    pushMonitorEntry(
-      "error",
-      "Inner Voice Failed",
-      error instanceof Error ? error.message : String(error),
-    );
-    return "";
-  }
+/**
+ * 问她一句「接下来去动哪个」，只要一句话。
+ *
+ * 复用焦点前缀：同一个 decision profile、同一份 system、同一套工具定义，整本账本原样照发，
+ * 只在尾部追一条指令，所以账本几乎全是缓存读取。这三样少一样都不行——缓存条目是按模型分的
+ * （llm-client 里前缀按 `${model}|${route}` 记账），工具定义又排在 system 之前参与前缀，所以
+ * 换个 profile、或者图省事走不带工具的 generateText，前缀一个字节都对不上，整本账本全价重付。
+ * 不带工具还有更硬的一条：账本里全是 tool_use / tool_result 块，没有 tools 的请求会被直接打回。
+ */
+async function requestInnerThought(client: LlmClient, expectRebuild: boolean): Promise<string> {
+  const result = await client.runToolLoop({
+    expectRebuild,
+    messages: [
+      ...conversationLedger.snapshot(),
+      { role: "user", content: loadPromptText("inner-voice") },
+    ],
+    tools: [...FOCUS_TOOL_DEFINITIONS],
+    runTool: async () => INNER_VOICE_TOOL_REFUSAL,
+    purpose: "inner-voice",
+    cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+    systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+    maxRounds: INNER_VOICE_MAX_ROUNDS,
+  });
+  broadcastLatestLlmUsage(client);
+  // 刻意不挂 onAssistantTurn / onToolResults：尾部那条指令本来就不在账本里，把它引出来的
+  // 对话也记进去，账本里就会多一段没有来由的自言自语。
+  //
+  // 按码点截断，绝不劈开代理对。空回复就是「这次没什么想做的」，合法。
+  const trimmed = result.text.trim();
+  const points = Array.from(trimmed);
+  return points.length <= MAX_INNER_THOUGHT_CODE_POINTS
+    ? trimmed
+    : points.slice(0, MAX_INNER_THOUGHT_CODE_POINTS).join("");
 }
 
 /**
  * 念头进账本，她自己跑一轮。
  *
- * 和群消息那一轮走同一条路:同一本账本、同一套工具、同一个前缀。区别只在注入内容,以及
- * roundConversationId 传 null——这一轮不是被某个会话唤起的,焦点纪律那项检查不适用
- * （见 qq-tools.ts 的 QqToolDeps.roundConversationId）。
+ * 和群消息那一轮走同一条路：同一本账本、同一套工具、同一个前缀。区别只在注入内容，以及
+ * roundConversationId 传 null——这一轮不是被某个会话唤起的，「焦点还停在上一轮的会话上」
+ * 那项检查没有对照物（见 qq-tools.ts 的 QqToolDeps.roundConversationId）。
+ *
+ * expectRebuild 恒为 true：产念头那一步刚在同一条路由上发过一次「账本 + 另一条尾部指令」，
+ * 这一轮的尾部换成了念头注入，前缀必然在那个位置岔开。这是预期内的，不是漂移。
  */
-async function runInnerThoughtRound(thought: string): Promise<void> {
-  const client = getDecisionLlmClient();
-  if (!client) {
-    pushMonitorEntry("error", "Inner Thought Round Skipped", "No decision LLM client is available.");
-    return;
-  }
-
+async function runInnerThoughtRound(client: LlmClient, thought: string): Promise<void> {
   conversationLedger.appendUserText(renderPromptText("inner-thought-injection", { thought }));
-  const compaction = await compactLedgerIfNeeded(client);
 
   const startedAt = Date.now();
+  // 本轮真正进了群的话；以及她伸手发了、话却没进群的理由。两个都空，这一轮才是她自己选择
+  // 不说话——理由见 buildFocusToolRunner 上面那段。
   const sentMessages: string[] = [];
-  try {
-    const result = await client.runToolLoop({
-      expectRebuild: compaction !== "not-needed",
-      messages: [...conversationLedger.snapshot()],
-      tools: [...FOCUS_TOOL_DEFINITIONS],
-      runTool: buildFocusToolRunner(null, (_conversationId, message) => sentMessages.push(message)),
-      purpose: "inner-thought",
-      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
-      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
-      maxRounds: focusModeConfig.maxRounds,
-      onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
-      onToolResults: (results) => conversationLedger.appendToolResults(results),
-    });
-    broadcastLatestLlmUsage(client);
-    pushMonitorEntry(
-      result.exhausted ? "error" : "status",
-      `Inner Thought Round ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
-      [
-        thought,
-        `rounds=${result.rounds} ledger=${conversationLedger.size} sent=${sentMessages.length}`,
-        result.text.slice(0, 300),
-      ].filter(Boolean).join("\n"),
-      client.model,
-    );
-  } catch (error) {
-    pushMonitorEntry(
-      "error",
-      "Inner Thought Round Failed",
-      error instanceof Error ? error.message : String(error),
-    );
-  }
+  const suppressedReasons: string[] = [];
+  const result = await client.runToolLoop({
+    expectRebuild: true,
+    messages: [...conversationLedger.snapshot()],
+    tools: [...FOCUS_TOOL_DEFINITIONS],
+    runTool: buildFocusToolRunner(
+      null,
+      (_conversationId, message) => sentMessages.push(message),
+      (reason) => suppressedReasons.push(reason),
+    ),
+    purpose: "inner-thought",
+    cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+    systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+    maxRounds: focusModeConfig.maxRounds,
+    onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
+    onToolResults: (results) => conversationLedger.appendToolResults(results),
+  });
+  broadcastLatestLlmUsage(client);
+  pushMonitorEntry(
+    result.exhausted ? "error" : "status",
+    `Inner Thought Round ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
+    [
+      thought,
+      `rounds=${result.rounds} ledger=${conversationLedger.size} sent=${sentMessages.length}`,
+      suppressedReasons[0] ?? "",
+      result.text.slice(0, 300),
+    ].filter(Boolean).join("\n"),
+    client.model,
+  );
 }
 
 async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
@@ -5859,18 +5864,6 @@ const WORLD_OBSERVATION_MEMORY_LIMIT = 128;
 const MEMORY_REFLECTION_INTERNAL_LIMIT = 6;
 const MEMORY_REFLECTION_TURN_LIMIT = 16;
 
-const MEMORY_REFLECTION_JSON_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["should_write", "topic", "memory", "reason"],
-  properties: {
-    should_write: { type: "boolean" },
-    topic: { type: "string" },
-    memory: { type: "string" },
-    reason: { type: "string" },
-  },
-};
-
 function isoFromMs(ms: number): string | null {
   return Number.isFinite(ms) && ms > 0 ? new Date(ms).toISOString() : null;
 }
@@ -5930,6 +5923,37 @@ function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
 
 function appendWorldObservationLog(record: Record<string, unknown>): void {
   worldObservationLog.append(record);
+}
+
+/**
+ * 记下「她刚做完一件自己的事」。
+ *
+ * 这几笔账原先记在 autonomy 引擎的 observe_world / memory_reflection / archive_writing 三个
+ * 分支里。那些分支随判断层一起退役之后就没人记了，于是监控侧栏的次数和「last …」从此定在
+ * 原地，看着像她整天什么都没做过。记账得挂在动作真正发生的地方——她现在是从子工具做这三件
+ * 事的，这里就是那个地方。
+ *
+ * 只记账，不设闸：日上限已经撤掉（理由见 autonomy-engine 里那段说明），这几个数字只给人看。
+ */
+function recordAutonomyActivity(
+  kind: "world_observation" | "memory_reflection" | "archive_writing",
+): void {
+  const state = hollyStateStore?.getAutonomyState();
+  if (!state) return;
+  const now = Date.now();
+  // 自主循环关着的时候没人替这几个计数翻页，所以这里自己翻一次，免得昨天的数攒到今天。
+  rollAutonomyDaily(state, now);
+  if (kind === "world_observation") {
+    state.lastWorldObservationAt = now;
+    state.worldObservationDailyCount += 1;
+  } else if (kind === "memory_reflection") {
+    state.lastMemoryReflectionAt = now;
+    state.memoryReflectionDailyCount += 1;
+  } else {
+    state.lastArchiveWritingAt = now;
+    state.archiveWritingDailyCount += 1;
+  }
+  void hollyStateStore?.save();
 }
 
 function appendHollyMemoryLog(record: Record<string, unknown>): void {
@@ -6025,9 +6049,7 @@ async function loadHollyMemorySidebarRecords(): Promise<void> {
 // 最容易失败的一段（外网、反爬、超时、页面是空的）。什么时候去、看哪个话题由
 // Holly 每轮自己判断，没有固定间隔；她选了就真去看，不拿旧结果充数——以前按查询
 // 缓存一小时的结果，在取消固定间隔之后会变成「每个话题一小时只能真看一次」，而且
-// 复用旧结果也算一次成功观察，她以为看过了，其实什么都没发生。唯一的节流是失败后
-// 的重试间隔，见 autonomy-engine.ts 的 worldObservationDue（失败通常意味着这个
-// 主题当前就是抓不动，立刻重试只会连着失败）。
+// 复用旧结果也算一次成功观察，她以为看过了，其实什么都没发生。
 
 function compactBrowserQueryText(text: string): string {
   return text
@@ -6071,24 +6093,13 @@ function rememberWorldObservation(topic: string, observedAtMs: number, observati
 
 // 每个话题最近一次观察的结局，让每轮自主判断知道「这个话题上次看完怎样了」。只记在进程里：重启后
 // 话题上次观察成功的时间还能从恢复出来的观察记忆里拿到，结局就不知道了——判断照样做得了，不值得落盘。
+// 每个话题最近一次观察的结局。判断层退役后它暂时没有读取方了——原先是喂给「这一轮去看哪个
+// 话题」的判断。留着是因为这份近况本身没有过时：她现在用 observe_world 子工具自己挑话题，
+// 把它接到那里去是个产品决定，不该顺手在一次清理里替她做掉。
 const worldTopicOutcomes = new Map<string, { atMs: number; outcome: string }>();
 
 function recordWorldTopicOutcome(topic: string, atMs: number, outcome: string): void {
   worldTopicOutcomes.set(topic, { atMs, outcome });
-}
-
-// 「上次」取观察记忆和结局表里较新的那个：抓取失败的尝试不进观察记忆，只记在结局表里。
-function worldTopicStatusesForJudgment(): WorldTopicStatus[] {
-  return autonomyConfig.worldTopics.map((topic) => {
-    let lastObservedAt = 0;
-    for (const item of worldObservationMemory) {
-      if (item.topic === topic && item.observedAtMs > lastObservedAt) lastObservedAt = item.observedAtMs;
-    }
-    const latest = worldTopicOutcomes.get(topic);
-    return latest && latest.atMs >= lastObservedAt
-      ? { topic, lastAt: latest.atMs, outcome: latest.outcome }
-      : { topic, lastAt: lastObservedAt, outcome: "" };
-  });
 }
 
 function toWorldObservationMemoryFromStoredRecord(
@@ -6307,6 +6318,19 @@ async function observeWorldForAutonomy(
 
   const worldObservation = toProactiveWorldObservation(observed);
   rememberWorldObservation(request.topic, now, worldObservation);
+  // 落盘这一笔以前也在引擎的 observe_world 分支里。它是 loadWorldObservationMemory 在 Qdrant
+  // 读不回来时唯一的兜底，断了不会有人立刻发现——重启之后她才会突然想不起最近看过什么。
+  appendWorldObservationLog({
+    ts: new Date(now).toISOString(),
+    action: "observe_world",
+    topic: request.topic,
+    ok: true,
+    query: worldObservation.query,
+    urls: worldObservation.urls,
+    page_errors: worldObservation.pageErrors ?? [],
+    summary: worldObservation.summary,
+  });
+  recordAutonomyActivity("world_observation");
   broadcastAutonomySidebar();
   const observedAtIso = new Date(now).toISOString();
   try {
@@ -6859,8 +6883,8 @@ async function decideWorldObservationShare(input: {
 // 顺序是有讲究的：先判便宜的本地条件，再做要花模型的去重与改写，Holly 的判断排在最后——前面几道
 // 回答「能不能发」，她回答「想不想发」，只有对着一份能发的成稿问才有意义。
 //
-// 返回这一轮的结局，一句中文。它会作为这个话题的近况出现在之后的自主判断里（见
-// worldTopicStatusesForJudgment），所以是写给模型看的，不是写给运维看的——细节都在监控日志里。
+// 返回这一轮的结局，一句中文，写给模型看的口吻——细节都在监控日志里。它现在只进
+// worldTopicOutcomes，而那张表暂时没有读取方，原因见那里。
 async function maybeBroadcastWorldObservation(
   topic: string,
   observation: ProactiveWorldObservation,
@@ -7220,13 +7244,6 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
   );
 }
 
-// The autonomy routes cache a rolling world-observation window, so their prefix
-// legitimately rebuilds whenever the window's start moves. Unannounced, each of
-// those would reach the monitor as an error telling someone to hunt for a
-// volatile value that broke the prefix.
-// 新观察到达不再算重建：稳定段按块发，新观察只是在后面多一块（见 StablePrefixLedger.changed）。
-const autonomyStablePrefixes = new StablePrefixLedger();
-
 // 窗口起点。进程内活着就行——重启后从 0 起算，第一次反思重建一次前缀，之后照常滞后。
 // 落盘反而要处理「盘上的起点指向一条已被 24h 规则淘汰的观察」，不值那个复杂度。
 let worldObservationWindowFromMs = 0;
@@ -7234,10 +7251,8 @@ let worldObservationWindowFromMs = 0;
 // 不再接 nowMs：按当前时间重新过滤正是旧版让前缀凭空漂移的原因，见
 // world-observation-window.ts。24h 过期和 128 条上限归 rememberWorldObservation 管。
 //
-// 记忆反思、归档写作、启动定向三条路线共用这一个窗口，是沿用原来的有意设计——它们读
-// 同一批世界观察，共用窗口才能让三边的断点落在同一处。窗口推进时哪条路线该报重建，由
-// 各自的 autonomyStablePrefixes.changed(route, stable) 分别判断，所以这里不必也不该
-// 返回一个「谁先调用谁消费掉」的 compacted 标志。
+// 窗口是共用的：读同一批世界观察的几条路线共用它，断点才会落在同一处。所以这里不返回
+// 「谁先调用谁消费掉」的 compacted 标志——那样第二个调用方就看不见窗口动过了。
 function formatWorldObservationsForReflection(): string[] {
   const selection = selectObservationWindow(worldObservationMemory, worldObservationWindowFromMs);
   worldObservationWindowFromMs = selection.fromMs;
@@ -7302,50 +7317,40 @@ function formatRecentTurnsForReflection(): string[] {
   ];
 }
 
-function parseMemoryReflection(raw: string): { topic: string; content: string; reason: string } | null {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(unwrapJsonBlock(raw)) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-
-  if (parsed.should_write !== true) return null;
-  const topic = typeof parsed.topic === "string" ? parsed.topic.trim() : "";
-  const content = typeof parsed.memory === "string" ? parsed.memory.trim() : "";
-  const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : "";
-  if (!topic || !content) return null;
-  return {
-    topic: compactReflectionText(topic, 120),
-    content: compactReflectionText(content, 1600),
-    reason: compactReflectionText(reason || "scheduled memory reflection", 240),
-  };
-}
-
 // ---------- 记忆反思：Holly 自己回头看 ----------
 //
 // 素材分成「稳定」和「易变」两段传给模型，不是为了好看：generateText 只把最后
 // 一条消息标记为易变，缓存断点就落在两段之间。合成一条的话前面没有任何稳定内容
 // 可供缓存，每次反思那一万多 token 都要按全价重读一遍。
 
+// 题目和正文在这里收口裁剪，而不是在调用方。这两个上限原先长在 parseMemoryReflection 里——
+// 那一步是「反思调用回一段 JSON，解析时顺手裁掉」；改成她自己用子工具写之后，解析这一步没有
+// 了，上限也就跟着没了。裁剪要待在写盘这一侧：往日志、向量库里塞多长的东西，不该由填参数的
+// 那一方说了算。
+const MEMORY_TOPIC_MAX_CHARS = 120;
+const MEMORY_CONTENT_MAX_CHARS = 1600;
+
 async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Promise<void> {
   const now = new Date().toISOString();
+  const topic = compactReflectionText(request.topic, MEMORY_TOPIC_MAX_CHARS);
+  const content = compactReflectionText(request.content, MEMORY_CONTENT_MAX_CHARS);
   const record = {
     ts: now,
     action: "write_memory",
-    topic: request.topic,
+    topic,
     reason: request.reason,
-    content: request.content,
+    content,
     query: request.observation?.query ?? "",
     urls: request.observation?.urls ?? [],
   };
   appendHollyMemoryLog(record);
   rememberHollyMemoryForSidebar(record);
+  recordAutonomyActivity("memory_reflection");
   broadcastAutonomySidebar();
   await persistInternalMemory({
     receivedAt: now,
-    content: request.content,
-    topic: request.topic,
+    content,
+    topic,
     reason: request.reason,
     urls: request.observation?.urls ?? [],
   });
@@ -7677,19 +7682,6 @@ const ARCHIVE_MEMORY_LIMIT = 400;
 const ARCHIVE_TITLE_MAX_CHARS = 120;
 const ARCHIVE_CONTENT_MAX_CHARS = 12000;
 
-const ARCHIVE_COMPOSE_JSON_SCHEMA = {
-  type: "object",
-  additionalProperties: false,
-  required: ["should_write", "kind", "title", "content", "reason"],
-  properties: {
-    should_write: { type: "boolean" },
-    kind: { type: "string", enum: ["article", "poem"] },
-    title: { type: "string" },
-    content: { type: "string" },
-    reason: { type: "string" },
-  },
-};
-
 // Unlike compactReflectionText this keeps line breaks — a poem's shape is part
 // of the work.
 function clampArchiveText(text: string, maxChars: number): string {
@@ -7896,29 +7888,6 @@ async function loadArchiveWorks(): Promise<void> {
   archiveWorks = works.slice(-ARCHIVE_MEMORY_LIMIT);
 }
 
-function parseArchiveComposition(raw: string): AutonomyArchiveWriteRequest | null {
-  let parsed: Record<string, unknown>;
-  try {
-    parsed = JSON.parse(unwrapJsonBlock(raw)) as Record<string, unknown>;
-  } catch {
-    return null;
-  }
-
-  if (parsed.should_write !== true) return null;
-  const kind: ArchiveWorkKind = parsed.kind === "poem" ? "poem" : "article";
-  const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
-  const content = typeof parsed.content === "string" ? parsed.content.trim() : "";
-  const reason = typeof parsed.reason === "string" ? parsed.reason.trim() : "";
-  if (!title || !content) return null;
-  return {
-    kind,
-    title: compactReflectionText(title, ARCHIVE_TITLE_MAX_CHARS),
-    content: clampArchiveText(content, ARCHIVE_CONTENT_MAX_CHARS),
-    reason: compactReflectionText(reason || "scheduled archive writing", 240),
-  };
-}
-
-
 function appendArchiveWorkLog(record: ArchiveWorkRecord, html: string): Promise<void> {
   archiveWriteQueue = archiveWriteQueue
     .catch(() => {
@@ -7944,12 +7913,14 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
     String(now.getSeconds()).padStart(2, "0"),
   ].join("");
   const id = `${stamp}-${request.kind}`;
+  // 同 writeMemoryForAutonomy：这两个上限原先长在 parseArchiveComposition 里，那一步随子工具
+  // 上线一起没了。正文用 clampArchiveText 而不是 compactReflectionText——诗的断行是作品的一部分。
   const record: ArchiveWorkRecord = {
     id,
     ts: now.toISOString(),
     kind: request.kind,
-    title: request.title,
-    content: request.content,
+    title: compactReflectionText(request.title, ARCHIVE_TITLE_MAX_CHARS),
+    content: clampArchiveText(request.content, ARCHIVE_CONTENT_MAX_CHARS),
     reason: request.reason,
     file: `${id}.html`,
   };
@@ -7957,6 +7928,7 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
   await appendArchiveWorkLog(record, renderArchiveWorkHtml(record));
   archiveWorks.push(record);
   archiveWorks = archiveWorks.slice(-ARCHIVE_MEMORY_LIMIT);
+  recordAutonomyActivity("archive_writing");
   broadcastMonitorEvent({ type: "archive", work: record });
   pushMonitorEntry(
     "status",
@@ -8128,22 +8100,6 @@ function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
   });
 }
 
-// do_nothing 和 group_proactive 始终可选（见
-// AutonomyJudgmentRequest.groupProactiveNote）；另外三个定时候选项只有在周期/重试闸门
-// 真正放行后才会出现。这是「模型不能选择当前不可执行动作」的硬性保障，由 schema
-// 直接约束，而不是要求模型读一段说明后自行遵守；runAutonomyLoop 仍会做防御性复查。
-// 每轮由模型自己判断该做什么（而不是按固定优先级轮询）。schema 里的候选动作
-// 是动态生成的：只把「此刻真的可做」的动作列进去，这样模型不会选中一个
-// 因为冷却期或开关而根本执行不了的动作。
-
-const AUTONOMY_JUDGMENT_ACTIONS = [
-  "do_nothing",
-  "world_observation",
-  "memory_reflection",
-  "archive_writing",
-  "group_proactive",
-] as const;
-
 
 
 // ---------- 自主轮次：每分钟问一次「现在该做点什么吗」 ----------
@@ -8165,19 +8121,16 @@ function buildAutonomyDeps() {
     emitInnerThought: runInnerVoiceOnFocusQueue,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
     lastFocusActivityAt: () => lastFocusActivityAt,
-    worldTopicStatuses: worldTopicStatusesForJudgment,
-    // 让 autonomy 在三个定时候选都没到期时能先问一句「主动发言有事做吗」，没有就整轮
-    // 跳过判断调用。闸门复用 proactive 自己那套，见 proactive-engine.hasProactiveWork。
+    // 先问一句「主动发言有事做吗」，没有才轮到冒念头。闸门复用 proactive 自己那套，
+    // 见 proactive-engine.hasProactiveWork。
     hasProactiveWork: () => {
       if (!isQqParticipationEnabled()) return false;
       const proactiveDeps = buildProactiveDeps();
       return proactiveDeps !== null && hasProactiveWork(proactiveDeps);
     },
-    pendingReplyGroupCount: () => unreadModelMessagesByGroup.size,
     log: (kind: "status" | "error", title: string, body: string) => {
       pushMonitorEntry(kind, title, body);
     },
-    recordWorldObservation: appendWorldObservationLog,
   };
 }
 
@@ -8217,7 +8170,7 @@ function dispatchAutonomyTickDue(): void {
         await recordMonitorThought({
           kind: "autonomy",
           title: "每分钟自主检查",
-          summary: `检查内容：世界观察、记忆反思、归档写作、群聊主动开口。\n本轮结果：检查失败。\n失败原因：${detail}`,
+          summary: `检查内容：群聊主动开口、冒念头。\n本轮结果：检查失败。\n失败原因：${detail}`,
           groupId: null,
           outcome: "failed",
           finalAnswer: "",
@@ -8839,7 +8792,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_daily_cap=${autonomyConfig.archiveWritingDailyCap} world_daily_cap=${autonomyConfig.worldObservationDailyCap} topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic).join("+") || "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic).join("+") || "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",

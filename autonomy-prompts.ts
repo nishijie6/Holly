@@ -4,7 +4,6 @@
 // for the same reason as decision-prompt.ts: one place to read and edit what
 // actually reaches the model, without hunting through main.ts's business logic.
 import { type ProactiveWorldObservation } from "./proactive-engine.js";
-import { type AutonomyJudgmentRequest, type RecentAutonomyAction, type WorldTopicStatus } from "./autonomy-engine.js";
 import { type BroadcastSourceKind } from "./world-observation-freshness.js";
 
 export const WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT =
@@ -279,7 +278,7 @@ const ARCHIVE_COMPOSITION_INSTRUCTIONS = [
 
 // 世界观察可选时，逐个话题列出上次什么时候看的、看完怎样了。判断「要不要去、看哪个」要的就是这几条
 // 事实：刚看过又发了的话题不急，上次页面上没新东西的可以缓缓，很久没看的才可能攒了新动态。分钟数
-// 跟 autonomy-engine.ts 的 freshnessNote 一样取整分钟，同一段提示词里不混两种写法。
+// 取整分钟，同一段提示词里不混两种写法。
 
 // 最近已经写过的题目。世界观察有 worldTopicLines 逐话题报近况，记忆反思和归档写作以前
 // 什么都没有——判断层看到的只是「可选」，看不见她上一轮刚写完什么，于是同一件事能连着

@@ -350,6 +350,30 @@ test("焦点还停在上一轮的会话上时,那句话不会误发过去,搜索
   assert.deepEqual(searched, ["长沙 天气"]);
 });
 
+// 她自己冒念头的那种轮次没有「本轮会话」，焦点却可能还停在几小时前的对话上。那里没有人在
+// 等，一句「我搜一下，稍等」发过去就是对着空屋子说话。
+test("自主轮次里没打开过会话就不吆喝,搜索照做", async () => {
+  const { call, nextRound, sent, searched } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound(null);
+  const result = await round("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.ok, true);
+  assert.equal(result.noticeSent, false);
+  assert.deepEqual(sent, []);
+  assert.deepEqual(searched, ["长沙 天气"]);
+});
+
+// 反过来，她这一轮自己打开了某个会话，那就是她正待着的地方，照常吆喝。
+test("自主轮次里她自己打开了会话,那句话照发", async () => {
+  const { call, nextRound, sent } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  const round = nextRound(null);
+  await round("open_conversation", { id: "qq_group:200" });
+  const result = await round("search_web", { query: "长沙 天气", saying: "我搜一下" });
+  assert.equal(result.noticeSent, true);
+  assert.deepEqual(sent, [{ id: "qq_group:200", message: "我搜一下" }]);
+});
+
 test("发送被抑制时不发那句话,但搜索照样做完", async () => {
   const { call, sent, searched } = harness({
     canSend: () => ({ allowed: false, reason: "QQ 处于观察模式，不发送。" }),

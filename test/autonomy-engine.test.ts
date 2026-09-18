@@ -38,8 +38,6 @@ function baseConfig(overrides: Partial<AutonomyConfig> = {}): AutonomyConfig {
     memoryReflectionBroadcastLullMs: 180 * MIN,
     archiveWritingEnabled: false,
     archiveWritingRetryMs: 60 * MIN,
-    archiveWritingDailyCap: 6,
-    worldObservationDailyCap: 24,
     worldTopicQuerySuffixOverrides: {},
     worldTopicBroadcastGroupOverrides: {},
     worldTopicSourceUrls: {},
@@ -86,11 +84,8 @@ function baseDeps(
     runGroupProactiveAction: async () => EMPTY_PROACTIVE,
     // 0 = 本次启动以来群里没动静 = 她闲着，触发门控放行。要测「正忙着」的用例自己覆盖它。
     lastFocusActivityAt: () => 0,
-    worldTopicStatuses: () => [],
     hasProactiveWork: () => false,
-    pendingReplyGroupCount: () => 0,
     log: () => {},
-    recordWorldObservation: () => {},
     ...overrides,
   };
 }
@@ -145,6 +140,27 @@ test("主动开口最后没发出东西，还是回到冒念头", async () => {
   assert.equal(result.action.type, "inner_thought");
 });
 
+// 闸没过，和闸过了、跑了一轮却没产出动作，是两回事：前者是还没轮到她说话，后者是轮到了、
+// 但没什么可说。合成一句「规则闸未通过」，看监控的人就分不出来了。
+test("主动开口跑过一轮却没产出，trace 要说实话", async () => {
+  const result = await runAutonomyLoop(baseDeps({
+    hasProactiveWork: () => true,
+    runGroupProactiveAction: async () => EMPTY_PROACTIVE,
+  }));
+
+  const check = result.checks.find((item) => item.name === "group_proactive");
+  assert.equal(check?.status, "no_action");
+  assert.match(check?.reason ?? "", /规则闸过了/);
+});
+
+test("规则闸压根没过时，报的才是闸没过", async () => {
+  const result = await runAutonomyLoop(baseDeps({ hasProactiveWork: () => false }));
+
+  const check = result.checks.find((item) => item.name === "group_proactive");
+  assert.equal(check?.status, "deferred");
+  assert.match(check?.reason ?? "", /规则闸未通过/);
+});
+
 test("关掉自主循环就什么都不做", async () => {
   let emitted = 0;
   const result = await runAutonomyLoop(baseDeps({
@@ -154,6 +170,15 @@ test("关掉自主循环就什么都不做", async () => {
 
   assert.equal(emitted, 0);
   assert.equal(result.action.type, "do_nothing");
+});
+
+// 关掉时报的必须是这个循环现在真会做的两件事。报那三个已经退役的名字，面板上就会出现三行
+// 「已关闭」的幽灵检查，而真正被关掉的那一项反倒不见了。
+test("关掉时报的是现在这两项检查", async () => {
+  const result = await runAutonomyLoop(baseDeps({ config: baseConfig({ enabled: false }) }));
+
+  assert.deepEqual(result.checks.map((check) => check.name), ["inner_voice", "group_proactive"]);
+  assert.deepEqual([...new Set(result.checks.map((check) => check.status))], ["disabled"]);
 });
 
 // ---------- 闲下来才问，别每分钟都问一次 ----------
@@ -199,8 +224,6 @@ test("她的念头不被那些已退役的间隔挡住", async () => {
       lastArchiveWritingAttemptAt: NOW - 1 * MIN,
       lastMemoryReflectionAt: NOW - 1 * MIN,
       lastWorldObservationAttemptAt: NOW - 1 * MIN,
-      archiveWritingDailyCount: 99,
-      worldObservationDailyCount: 99,
     }),
     config: baseConfig({ archiveWritingEnabled: true }),
     emitInnerThought: async () => { emitted += 1; },
