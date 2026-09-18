@@ -9733,9 +9733,11 @@ const UNIFIED_PAGE = `<!DOCTYPE html>
       </li>
       <li class="nav-item" :class="{active: tab === 'broadcast'}" @click="tab = 'broadcast'; loadWorldBroadcast()">
         <svg fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-          <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v12"/>
-          <path stroke-linecap="round" stroke-linejoin="round" d="M5 11a7 7 0 0114 0"/>
-          <path stroke-linecap="round" stroke-linejoin="round" d="M8.5 13a3.5 3.5 0 017 0"/>
+          <circle cx="12" cy="12" r="1.5" fill="currentColor" stroke="none"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M8.1 8.1a5.5 5.5 0 000 7.8"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M15.9 15.9a5.5 5.5 0 000-7.8"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M5.3 5.3a9.5 9.5 0 000 13.4"/>
+          <path stroke-linecap="round" stroke-linejoin="round" d="M18.7 18.7a9.5 9.5 0 000-13.4"/>
         </svg>
         <span class="nav-label">Broadcast</span>
       </li>
