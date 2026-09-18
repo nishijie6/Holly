@@ -20,9 +20,7 @@ import type { FocusDecision } from "./focus-policy.js";
 // 但它确实会随注入文本进模型视野,所以在这里翻成模型能读懂的一句话,而不是让
 // "at-mention" 这种字样直接出现在中文上下文里。
 const FOCUS_REASON_TEXT: Record<FocusDecision["reason"], string> = {
-  "private-chat": "这是私聊,对方是直接来找你的",
   "at-mention": "有人在群里 @ 了你",
-  "admin-forced": "管理员发的消息,必须回",
   ambient: "只是群里有动静,没人直接找你",
 };
 

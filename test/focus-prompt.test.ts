@@ -114,9 +114,9 @@ test("前台注入带上焦点原因、最近消息和本轮元数据", () => {
 });
 
 test("焦点原因翻成中文,英文枚举不进模型视野", () => {
-  const text = buildFocusForegroundInjection({ ...baseInput, reason: "private-chat" });
-  assert.equal(text.includes("private-chat"), false);
-  assert.match(text, /这是私聊/u);
+  const text = buildFocusForegroundInjection({ ...baseInput, reason: "at-mention" });
+  assert.equal(text.includes("at-mention"), false);
+  assert.match(text, /@ 了你/u);
 });
 
 test("后台通知带真实消息内容,不只是元数据", () => {
@@ -169,23 +169,25 @@ test("空白消息不占通知的位置", () => {
 });
 
 test("管理员消息在元数据里点名,并说清不许假装做完", () => {
-  const text = buildFocusForegroundInjection({
+  const text = buildFocusNotificationInjection({
     ...baseInput,
-    reason: "admin-forced",
+    reason: "ambient",
     adminUserIds: ["10000001", "10000001"],
     batch: [{ senderLabel: "[主人(10000001)]", text: "重启一下" }],
   });
   assert.match(text, /管理员消息,发送人 user_id: 10000001/u);
-  // 去重:同一个人发三条不该在元数据里出现三次。
-  assert.equal(text.split("10000001").length - 1, 1);
+  // 去重:同一个人发三条不该在元数据里出现三次。通知路径的批次预览里本来就会带一次他的号,
+  // 所以只数元数据那一行。
+  const metaLine = text.split("\n").find((line) => line.includes("管理员消息,发送人 user_id")) ?? "";
+  assert.equal(metaLine.split("10000001").length - 1, 1);
   assert.match(FOCUS_LOOP_PROMPT, /管理员的消息必须给出一个明确答复/u);
   assert.match(FOCUS_LOOP_PROMPT, /不要假装已经做了/u);
 });
 
 test("受理了的改进代码命令带 job_id,并禁止说已经跑完", () => {
-  const text = buildFocusForegroundInjection({
+  const text = buildFocusNotificationInjection({
     ...baseInput,
-    reason: "admin-forced",
+    reason: "ambient",
     adminUserIds: ["10000001"],
     codeJobId: "job-42",
     batch: [{ senderLabel: "[主人(10000001)]", text: "/改进代码 修个 bug" }],
@@ -195,9 +197,9 @@ test("受理了的改进代码命令带 job_id,并禁止说已经跑完", () => 
 });
 
 test("没启动起来的改进代码命令把原因原样交给模型", () => {
-  const text = buildFocusForegroundInjection({
+  const text = buildFocusNotificationInjection({
     ...baseInput,
-    reason: "admin-forced",
+    reason: "ambient",
     adminUserIds: ["10000001"],
     codeJobNote: "工作区不干净",
     batch: [{ senderLabel: "[主人(10000001)]", text: "/改进代码 改点东西" }],

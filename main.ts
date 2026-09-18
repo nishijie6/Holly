@@ -5300,14 +5300,10 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     return;
   }
 
-  const decision = decideFocus({
-    rawMessage: latest.context.rawMessage,
-    replyTargetType: latest.context.replyTargetType,
-    adminForcedReply: latest.context.isAdmin === true && shouldForceAdminReply({
-      userId: latest.context.userId,
-      messageType: latest.context.replyTargetType,
-    }, adminPolicyConfig),
-  }, privateChatConfig.botUserId);
+  // 只剩 @ 这一条能夺焦。私聊和管理员照样进来，只是走通知路径，开不开由她自己判断——
+  // 理由见 focus-policy.ts 开头。下面的 adminMessages 与此无关，它管的是本轮元数据里
+  // 要不要点出管理员身份和改进代码命令的受理结果，那两项在通知路径上照常注入。
+  const decision = decideFocus({ rawMessage: latest.context.rawMessage }, privateChatConfig.botUserId);
 
   // 注入文本的渲染全在 focus-prompt.ts;这里只把素材凑齐。老管线的
   // formatUnreadMessagesForModel 不能复用:它按「消息内容已经在缓存前缀的时间线上」
