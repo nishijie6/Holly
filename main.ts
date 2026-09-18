@@ -187,7 +187,7 @@ import {
   type FocusInjectionInput,
 } from "./focus-prompt.js";
 import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
-import { QQ_TOOL_DEFINITIONS, createQqToolRunner, type ConversationSummary } from "./qq-tools.js";
+import { FOCUS_TOOL_DEFINITIONS, createFocusToolRunner, type ConversationSummary } from "./qq-tools.js";
 import {
   ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
   AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
@@ -4793,7 +4793,7 @@ function buildFocusToolRunner(
   onSent?: (conversationId: string, message: string) => void,
   onSuppressed?: (reason: string) => void,
 ): (call: LlmToolUseBlock) => Promise<string> {
-  return createQqToolRunner({
+  return createFocusToolRunner({
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
       renderConversationRecent(id, focusModeConfig.recentTurnsPerConversation),
@@ -5025,7 +5025,7 @@ async function summarizeStaleLedger(transcript: readonly LlmMessage[], archivedT
     client = getDecisionLlmClient();
     const result = await client.runToolLoop({
       messages: buildStaleLedgerSummaryMessages(transcript),
-      tools: [...QQ_TOOL_DEFINITIONS],
+      tools: [...FOCUS_TOOL_DEFINITIONS],
       runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
       purpose: "ledger-compaction",
       cacheRoute: "ledger-stale-summary",
@@ -5094,7 +5094,7 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<LedgerCompactio
     // 确实是在焦点前缀上往后接，哪天有人改坏了，监控里会出现 focus-loop 以外的 Prefix Drift。
     const result = await client.runToolLoop({
       messages: buildLedgerCompactionMessages(ledger, plan),
-      tools: [...QQ_TOOL_DEFINITIONS],
+      tools: [...FOCUS_TOOL_DEFINITIONS],
       runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
       purpose: "ledger-compaction",
       cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
@@ -5238,7 +5238,7 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
       // 在监控里留下一条假的 Prefix Drift。豁免只作用于这次循环的第一轮，见 llm-client 的 runToolLoop。
       expectRebuild: compaction !== "not-needed",
       messages: [...conversationLedger.snapshot()],
-      tools: [...QQ_TOOL_DEFINITIONS],
+      tools: [...FOCUS_TOOL_DEFINITIONS],
       runTool: buildFocusToolRunner(
         groupKey,
         (_conversationId, message) => sentMessages.push(message),

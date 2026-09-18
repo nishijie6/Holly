@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { QQ_TOOL_DEFINITIONS, createQqToolRunner } from "../qq-tools.js";
+import { FOCUS_TOOL_DEFINITIONS, QQ_SUBTOOL_NAMES, createFocusToolRunner } from "../qq-tools.js";
 import type { ConversationSummary, QqToolDeps } from "../qq-tools.js";
 import type { LlmToolUseBlock } from "../llm-client.js";
 
@@ -43,28 +43,79 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
     },
     ...overrides,
   };
-  const bind = (run: ReturnType<typeof createQqToolRunner>) =>
+  // 子工具一律经 invoke 壳进去，和生产路径一致；下面每个用例写的还是子工具名。
+  const bind = (run: ReturnType<typeof createFocusToolRunner>) =>
     (name: string, input: Record<string, unknown> = {}) =>
-      run({ type: "tool_use", id: "tu_1", name, input } as LlmToolUseBlock).then((raw) => JSON.parse(raw));
-  const call = bind(createQqToolRunner(deps));
+      run({ type: "tool_use", id: "tu_1", name: "invoke", input: { tool: name, args: input } } as LlmToolUseBlock)
+        .then((raw) => JSON.parse(raw));
+  // 顶层原样调用，用来测壳本身（help、调错名字、漏参数）。
+  const callTop = (name: string, input: Record<string, unknown> = {}) =>
+    createFocusToolRunner(deps)({ type: "tool_use", id: "tu_1", name, input } as LlmToolUseBlock)
+      .then((raw) => JSON.parse(raw));
+  const call = bind(createFocusToolRunner(deps));
   // 下一轮：焦点和发送记录沿用，runner 新建一个——main.ts 每轮就是这么做的。
   const nextRound = (roundConversationId: string | null) =>
-    bind(createQqToolRunner({ ...deps, roundConversationId }));
-  return { call, nextRound, sent, searched, read, sourceReads, focus: () => focus };
+    bind(createFocusToolRunner({ ...deps, roundConversationId }));
+  return { call, callTop, nextRound, sent, searched, read, sourceReads, focus: () => focus };
 }
 
-test("the six tools are declared with closed schemas", () => {
-  assert.deepEqual(QQ_TOOL_DEFINITIONS.map((t) => t.name), [
-    "list_conversations",
-    "open_conversation",
-    "send_message",
-    "search_web",
-    "read_page",
-    "read_source",
-  ]);
-  for (const tool of QQ_TOOL_DEFINITIONS) {
+// 这个数组是稳定前缀的一部分，多一个条目就作废一次所有在飞会话的缓存。加子工具不该碰它——
+// 这条测试就是那道闸。
+test("顶层只有 invoke 和 help", () => {
+  assert.deepEqual(FOCUS_TOOL_DEFINITIONS.map((t) => t.name), ["help", "invoke"]);
+  for (const tool of FOCUS_TOOL_DEFINITIONS) {
     assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} should reject extra args`);
   }
+});
+
+// 子工具名单一旦写进 invoke 的说明，就等于搬回了前缀，这个壳也就白套了。
+test("子工具名单不出现在顶层工具的说明里", () => {
+  const described = FOCUS_TOOL_DEFINITIONS.map((tool) => `${tool.description} ${JSON.stringify(tool.inputSchema)}`).join(" ");
+  for (const name of QQ_SUBTOOL_NAMES) {
+    assert.ok(!described.includes(name), `${name} 不该出现在顶层工具的 description/schema 里`);
+  }
+});
+
+test("help 给出子工具清单", async () => {
+  const { callTop } = harness();
+  const result = await callTop("help");
+  assert.equal(result.ok, true);
+  for (const name of QQ_SUBTOOL_NAMES) {
+    assert.match(result.tools, new RegExp(name));
+  }
+});
+
+// 她可能不先 help 就直接猜一个名字。与其让她对着「未知工具」反复重试，不如当场把名单给她；
+// 这段文字落在工具结果里，不进前缀，带全名单是免费的。
+test("调错子工具名时，错误里直接给出名单", async () => {
+  const { callTop } = harness();
+  const result = await callTop("invoke", { tool: "send_qq_message", args: {} });
+  assert.equal(result.ok, false);
+  for (const name of QQ_SUBTOOL_NAMES) {
+    assert.match(result.note, new RegExp(name));
+  }
+});
+
+test("invoke 漏了 tool 参数也给名单", async () => {
+  const { callTop } = harness();
+  const result = await callTop("invoke", {});
+  assert.equal(result.ok, false);
+  assert.match(result.note, /list_conversations/);
+});
+
+// 不要参数的子工具不该逼她写一个空壳出来。
+test("args 省略等同空对象", async () => {
+  const { callTop } = harness();
+  const result = await callTop("invoke", { tool: "list_conversations" });
+  assert.equal(result.ok, true);
+  assert.equal(result.conversations.length, 2);
+});
+
+test("顶层认不出的名字被挡回去", async () => {
+  const { callTop } = harness();
+  const result = await callTop("send_message", { message: "在的" });
+  assert.equal(result.ok, false);
+  assert.match(result.note, /invoke/);
 });
 
 // --- list_conversations ----------------------------------------------------
@@ -211,11 +262,13 @@ test("打开失败不算本轮打开过", async () => {
   assert.deepEqual(sent, []);
 });
 
+// 套壳之后这一拦发生得更早：壳按名单挡住，下一层的 default 分支够不到了。守的性质没变——
+// 认不出的名字回来的是一条她能读的拒绝，不是一个异常。
 test("an unknown tool name is refused rather than throwing", async () => {
   const { call } = harness();
   const result = await call("delete_everything", {});
   assert.equal(result.ok, false);
-  assert.match(result.error, /unknown tool/);
+  assert.match(result.error, /unknown subtool/);
 });
 
 // --- search_web ------------------------------------------------------------

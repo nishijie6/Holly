@@ -9,6 +9,8 @@ import {
   type FocusInjectionInput,
 } from "../focus-prompt.js";
 import { MODEL_DECISION_PROMPT } from "../decision-prompt.js";
+import { QQ_SUBTOOL_NAMES } from "../qq-tools.js";
+import { loadPromptText } from "../prompt-text.js";
 
 // 这里钉住的是两条不能再犯的错。
 //
@@ -47,10 +49,37 @@ test("focus 协议和决策协议是两份不同的东西", () => {
   assert.equal(FOCUS_LOOP_PROMPT.includes("Return JSON only"), false);
 });
 
-test("协议交代了六个工具、以及不调工具就是不做事", () => {
-  for (const tool of ["list_conversations", "open_conversation", "send_message", "search_web", "read_page", "read_source"]) {
-    assert.ok(FOCUS_LOOP_PROMPT.includes(tool), `协议里该讲清 ${tool}`);
+// 协议是 system prompt，和工具定义一样按字节计入稳定前缀。清单搬去 help 就是为了让「加一个
+// 子工具」不再碰前缀，所以这里守一份白名单。
+//
+// 名单上这三个不是清单的残留，是行为规则：发送只有 send_message 这一条路、open_conversation
+// 会改变 send_message 的目标、拿不准的事实去 search_web 查而不是编。这些讲的是她该怎么行事，
+// 本来就该在协议里，而且加第七个子工具不会动它们。
+//
+// 反过来，哪天这条测试因为一个新名字失败了，那不一定是写错了——它在说「你正在往稳定前缀里
+// 加东西」。确认那条规则真的非在协议里不可，再把名字加进这份白名单。
+const SUBTOOLS_ALLOWED_IN_PROMPT = new Set(["send_message", "open_conversation", "search_web"]);
+
+test("协议只保留带行为规则的子工具名，清单本身指向 help", () => {
+  for (const name of QQ_SUBTOOL_NAMES) {
+    if (SUBTOOLS_ALLOWED_IN_PROMPT.has(name)) continue;
+    assert.ok(!FOCUS_LOOP_PROMPT.includes(name), `协议里不该再出现 ${name}——它只是清单的一项`);
   }
+  // 枚举块整体消失：留着它，等于清单从没搬走。
+  assert.ok(!FOCUS_LOOP_PROMPT.includes("你有六个工具"));
+  assert.match(FOCUS_LOOP_PROMPT, /help/u);
+  assert.match(FOCUS_LOOP_PROMPT, /invoke/u);
+});
+
+// 清单搬走了，但「有哪些工具」这件事总得有地方写清楚，否则她 help 完还是不知道能干什么。
+test("六个子工具在 help 文档里交代清楚", () => {
+  const help = loadPromptText("qq-tools-help");
+  for (const name of QQ_SUBTOOL_NAMES) {
+    assert.ok(help.includes(name), `help 里该讲清 ${name}`);
+  }
+});
+
+test("协议交代了不调工具就是不做事", () => {
   assert.match(FOCUS_LOOP_PROMPT, /不调任何工具就结束这一轮/u);
 });
 
@@ -59,8 +88,9 @@ test("协议交代了六个工具、以及不调工具就是不做事", () => {
 test("协议让她去搜,而不是声称自己不能联网", () => {
   assert.equal(FOCUS_LOOP_PROMPT.includes("没有联网搜索工具"), false);
   assert.equal(FOCUS_LOOP_PROMPT.includes("你搜不了"), false);
-  // 搜索期间先说一句话是这个工具的一半价值,协议里必须交代 saying 怎么用。
-  assert.match(FOCUS_LOOP_PROMPT, /saying/u);
+  // 搜索期间先说一句话是这个工具的一半价值。这句怎么用随子工具清单一起搬去了 help，
+  // 但它必须还在某处写着——否则她会默默开搜，让等的人干看十几秒。
+  assert.match(loadPromptText("qq-tools-help"), /saying/u);
 });
 
 test("system prompt 是 persona 接协议,persona 在前", () => {

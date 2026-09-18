@@ -13,7 +13,7 @@ import {
 import { ConversationLedger } from "../conversation-ledger.js";
 import { buildClaudeRequestBody, digestClaudeCachedPrefix, type LlmMessage } from "../llm-client.js";
 import { CachePrefixTracker } from "../cache-prefix.js";
-import { QQ_TOOL_DEFINITIONS } from "../qq-tools.js";
+import { FOCUS_TOOL_DEFINITIONS } from "../qq-tools.js";
 import { buildFocusSystemPrompt } from "../focus-prompt.js";
 
 // Where to cut a transcript. The failure that matters is not "summarized too
@@ -176,7 +176,7 @@ test("the compaction request extends the focus loop's request byte for byte", ()
   const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
   assert.ok(plan);
   const system = buildFocusSystemPrompt("你是 Holly。").trim();
-  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...QQ_TOOL_DEFINITIONS] };
+  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...FOCUS_TOOL_DEFINITIONS] };
   const focus = buildClaudeRequestBody("claude-sonnet-4-6", system, LEDGER, options);
   const compaction = buildClaudeRequestBody("claude-sonnet-4-6", system, buildLedgerCompactionMessages(LEDGER, plan), options);
 
@@ -199,7 +199,7 @@ test("after a compaction request, the next focus request inspects as rebuilt eve
   const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
   assert.ok(plan);
   const system = buildFocusSystemPrompt("你是 Holly。").trim();
-  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...QQ_TOOL_DEFINITIONS] };
+  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...FOCUS_TOOL_DEFINITIONS] };
   const tracker = new CachePrefixTracker();
   const inspect = (messages: LlmMessage[]) => tracker.inspect(
     "claude-sonnet-4-6|focus-ledger",
