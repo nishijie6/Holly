@@ -79,3 +79,38 @@ export class AgentEventQueue {
     return this.history.slice(Math.max(0, this.history.length - limit));
   }
 }
+
+/** 一次取空之后，这一轮到底要做哪些事。 */
+export type CoalescedAgentEvents = {
+  /** 需要去看的会话，按首次出现的顺序。 */
+  groupKeys: string[];
+  /** 这一批里有没有自主轮次到期。多个只算一次。 */
+  tickDue: boolean;
+};
+
+/**
+ * 把一次取到的事件折叠成「这一轮要做什么」。
+ *
+ * 同一个群的多个事件说的是同一句「去看看」——内容不在事件里，取的时候才从缓冲区读（见文件
+ * 开头），所以合并掉不会丢任何一条消息，反而让那个群的消息以一个更完整的批次被看见。
+ *
+ * 自主 tick 同理：消费者忙了五分钟之后攒下五个 tick，连着跑五次判断没有意义——第一次之后
+ * 全都会撞在不应期上，白跑五轮闸门判断。
+ *
+ * 顺序保留首次出现的次序，不去重排。谁先说话谁先被注入，这是她读到的「此刻」的一部分。
+ */
+export function coalesceAgentEvents(events: readonly AgentEvent[]): CoalescedAgentEvents {
+  const groupKeys: string[] = [];
+  const seen = new Set<string>();
+  let tickDue = false;
+  for (const event of events) {
+    if (event.type === "autonomy_tick_due") {
+      tickDue = true;
+      continue;
+    }
+    if (seen.has(event.groupKey)) continue;
+    seen.add(event.groupKey);
+    groupKeys.push(event.groupKey);
+  }
+  return { groupKeys, tickDue };
+}

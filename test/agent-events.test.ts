@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { AgentEventQueue } from "../agent-events.js";
+import { AgentEventQueue, coalesceAgentEvents } from "../agent-events.js";
 
 // 队列的性质，不是分发器的性质：push 只入队并唤醒，取和执行全归消费循环。
 // 下面钉的三件事——按序、一次取干净、唤醒不丢——是那个循环能成立的全部前提。
@@ -106,4 +106,56 @@ test("recent() timestamps come from the injected clock", () => {
   const [first, second] = queue.recent();
   assert.equal(first?.at, 1_000);
   assert.equal(second?.at, 2_000);
+});
+
+// ---------- 合并：一轮到底要做哪些事 ----------
+
+test("同一个群的多个事件合成一个", () => {
+  const result = coalesceAgentEvents([
+    { type: "message_batch_ready", groupKey: "A" },
+    { type: "message_batch_ready", groupKey: "A" },
+    { type: "message_batch_ready", groupKey: "A" },
+  ]);
+  assert.deepEqual(result.groupKeys, ["A"]);
+});
+
+// 谁先说话谁先被注入，那是她读到的「此刻」的一部分，不该被去重打乱。
+test("保留首次出现的顺序", () => {
+  const result = coalesceAgentEvents([
+    { type: "message_batch_ready", groupKey: "B" },
+    { type: "message_batch_ready", groupKey: "A" },
+    { type: "message_batch_ready", groupKey: "B" },
+    { type: "message_batch_ready", groupKey: "C" },
+  ]);
+  assert.deepEqual(result.groupKeys, ["B", "A", "C"]);
+});
+
+test("攒下的多个自主 tick 只算一次", () => {
+  const result = coalesceAgentEvents([
+    { type: "autonomy_tick_due" },
+    { type: "autonomy_tick_due" },
+    { type: "autonomy_tick_due" },
+  ]);
+  assert.equal(result.tickDue, true);
+  assert.deepEqual(result.groupKeys, []);
+});
+
+test("消息和 tick 各归各的，互不吞掉", () => {
+  const result = coalesceAgentEvents([
+    { type: "autonomy_tick_due" },
+    { type: "message_batch_ready", groupKey: "A" },
+    { type: "autonomy_tick_due" },
+    { type: "message_batch_ready", groupKey: "B" },
+  ]);
+  assert.deepEqual(result.groupKeys, ["A", "B"]);
+  assert.equal(result.tickDue, true);
+});
+
+test("没有 tick 就是没有", () => {
+  const result = coalesceAgentEvents([{ type: "message_batch_ready", groupKey: "A" }]);
+  assert.equal(result.tickDue, false);
+});
+
+test("空输入不炸", () => {
+  assert.deepEqual(coalesceAgentEvents([]), { groupKeys: [], tickDue: false });
 });

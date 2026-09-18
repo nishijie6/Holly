@@ -65,7 +65,7 @@ import { describeCachePrefixDrift } from "./cache-prefix.js";
 import { renderMonitorPage } from "./monitor-page.js";
 import { loadPromptText, renderPromptText } from "./prompt-text.js";
 import { RouteQueue } from "./route-queue.js";
-import { AgentEventQueue, type AgentEvent } from "./agent-events.js";
+import { AgentEventQueue, coalesceAgentEvents, type AgentEvent } from "./agent-events.js";
 import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
 import {
   createIncomingMessageStore,
@@ -176,7 +176,7 @@ import {
   planLedgerCompaction,
   renderLedgerSummaryTurn,
 } from "./ledger-compaction.js";
-import { decideFocus } from "./focus-policy.js";
+import { decideFocus, type FocusDecision } from "./focus-policy.js";
 import {
   buildFocusForegroundInjection,
   buildFocusNotificationInjection,
@@ -3891,6 +3891,29 @@ function formatConversationTurnForModel(turn: ConversationTurn): LlmMessage {
   };
 }
 
+// 攒得太久的消息在这里剔掉：她隔了十几分钟才回一句「今天好冷」，比不回更怪。管理员的不设
+// 保质期——主人问话不因为她忙了一会儿就作废。
+//
+// 这一步在消费循环里做，而不是在下游某条管线里：一轮可能同时装着好几个群的批次，谁新谁旧
+// 得在决定「这一轮有什么可看」的时候就算清楚。
+function dropStaleMessages(pendingMessages: readonly PendingModelMessage[]): PendingModelMessage[] {
+  return pendingMessages
+    .map((item) => ({
+      ...item,
+      context: {
+        ...item.context,
+        messageLagMs: getCurrentMessageLagMs(item.context),
+      },
+    }))
+    .filter((item) => (
+      (item.context.isAdmin === true && shouldForceAdminReply({
+        userId: item.context.userId,
+        messageType: item.context.replyTargetType,
+      }, adminPolicyConfig))
+      || (item.context.messageLagMs ?? 0) <= MESSAGE_REPLY_MAX_AGE_MS
+    ));
+}
+
 function getCurrentMessageLagMs(context: ModelRequestContext): number {
   const receivedAtMs = parseIsoTimestamp(context.receivedAt) ?? Date.now();
   const queuedMs = Math.max(0, Date.now() - receivedAtMs);
@@ -5282,22 +5305,35 @@ async function runInnerThoughtRound(client: LlmClient, thought: string): Promise
   );
 }
 
-async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
-  await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, () => runFocusLoopForBatch(messages));
+// 一次提交若干个群的批次，跑成一轮。攒在一起的消息在同一份上下文里被一起看见，而不是
+// 铺成同样多轮——后者的代价不只是慢：她在第一轮里读到的「现在是什么情况」会漏掉另外几个
+// 群刚发生的事，而那几个群的轮次又各自漏掉前面的，谁都拿不到完整的此刻。
+async function forwardBatchesViaFocusLoop(
+  batches: readonly (readonly PendingModelMessage[])[],
+): Promise<void> {
+  await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, () => runFocusRoundForBatches(batches));
 }
 
-async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): Promise<void> {
-  const client = getDecisionLlmClient();
-  if (!client) {
-    pushMonitorEntry("error", "Focus Loop Skipped", "No decision LLM client is available.");
-    return;
-  }
+// 一个批次在本轮里的位置。注入那一步产出它，随后那一轮拿它定 roundConversationId 和写监控。
+type FocusInjectionOutcome = {
+  groupKey: string;
+  decision: FocusDecision;
+  unreadCount: number;
+  isPrivate: boolean;
+};
 
+// 把一个群的批次渲染成注入、追加进账本；前台那条顺带把焦点切过去。
+//
+// 注入和跑轮拆开，是为了让一轮能装下多个群。拿不到会话 id 就返回 null：那批消息没有可归属
+// 的会话，注进去模型也不知道它在说哪儿。
+function appendFocusInjectionForBatch(
+  messages: readonly PendingModelMessage[],
+): FocusInjectionOutcome | null {
   const latest = messages[messages.length - 1];
   const groupKey = normalizeConversationGroupKey(latest.context.groupId);
   if (!groupKey) {
-    pushMonitorEntry("error", "Focus Loop Skipped", "Batch has no resolvable conversation key.");
-    return;
+    pushMonitorEntry("error", "Focus Injection Skipped", "Batch has no resolvable conversation key.");
+    return null;
   }
 
   // 只剩 @ 这一条能夺焦。私聊和管理员照样进来，只是走通知路径，开不开由她自己判断——
@@ -5321,6 +5357,9 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     .find((item) => item.context.adminCodeJobId || item.context.adminCodeJobNote);
   // 前台路径下一步就会把焦点切到 groupKey，所以直接记它；后台通知不动焦点，记的是
   // 焦点此刻实际停在哪。模型据此分清「消息来自哪」和「send_message 会发到哪」。
+  //
+  // 一轮里注入多个群时，这一项是逐批算的：排在后面的批次看到的「当前打开」已经包含了前面
+  // 那批可能造成的焦点移动。次序即事实，不必也不该统一成同一个值。
   const openConversationId = decision.foreground ? groupKey : focusConversationId();
   const injection: FocusInjectionInput = {
     conversationLabel: formatConversationKey(groupKey),
@@ -5341,10 +5380,6 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     codeJobNote: latestCodeJob?.context.adminCodeJobNote ?? null,
   };
 
-  // 前台后台都算：有人直接找她是动静，群里只是有人说话也是动静——两种情况下她都在读群里的
-  // 内容，都不是发呆。
-  lastFocusActivityAt = Date.now();
-
   if (decision.foreground) {
     // Being addressed is not something the model gets to overlook: take the
     // focus and put the content in front of it, no tool call required.
@@ -5355,6 +5390,37 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     // opening is the model's call — that is the whole point of the model.
     conversationLedger.appendUserText(buildFocusNotificationInjection(injection));
   }
+
+  return {
+    groupKey,
+    decision,
+    unreadCount: messages.length,
+    isPrivate: latest.context.replyTargetType === "private",
+  };
+}
+
+// 注入完这一轮的全部批次，再跑一次工具循环。
+async function runFocusRoundForBatches(
+  batches: readonly (readonly PendingModelMessage[])[],
+): Promise<void> {
+  const client = getDecisionLlmClient();
+
+  const injected: FocusInjectionOutcome[] = [];
+  for (const batch of batches) {
+    const outcome = appendFocusInjectionForBatch(batch);
+    if (outcome) injected.push(outcome);
+  }
+  if (injected.length === 0) return;
+
+  // 前台后台都算：有人直接找她是动静，群里只是有人说话也是动静——两种情况下她都在读群里的
+  // 内容，都不是发呆。
+  lastFocusActivityAt = Date.now();
+
+  // 本轮的会话：优先取系统替她切过去的那个（被 @ 的那批），没有就取最后注进来的那批。
+  // 只有一个批次时两种取法都等于那唯一一个群，所以口径和以前一字不差；多个批次时这是
+  // 唯一说得通的答案——焦点纪律要对照的就是「系统把她放在哪」。
+  const seizedFocus = [...injected].reverse().find((item) => item.decision.foreground);
+  const roundConversation = seizedFocus ?? injected[injected.length - 1];
 
   const compaction = await compactLedgerIfNeeded(client);
 
@@ -5372,7 +5438,7 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
       messages: [...conversationLedger.snapshot()],
       tools: [...FOCUS_TOOL_DEFINITIONS],
       runTool: buildFocusToolRunner(
-        groupKey,
+        roundConversation.groupKey,
         (_conversationId, message) => sentMessages.push(message),
         (reason) => suppressedReasons.push(reason),
       ),
@@ -5394,11 +5460,17 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
         ? "suppressed"
         : "silent";
 
+    const unreadTotal = injected.reduce((sum, item) => sum + item.unreadCount, 0);
+    // 单批次那行保持原样：面板上绝大多数轮次仍是一个群，不该因为支持了多个而集体换个长相。
+    const conversationLine = injected.length === 1
+      ? `conversation=${injected[0].groupKey} focus=${injected[0].decision.reason}`
+      : `conversations=${injected.map((item) => `${item.groupKey}(${item.decision.reason}×${item.unreadCount})`).join(" ")}`;
+
     pushMonitorEntry(
       result.exhausted ? "error" : "status",
       `Focus Loop ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
       [
-        `conversation=${groupKey} focus=${decision.reason}`,
+        conversationLine,
         `rounds=${result.rounds} ledger=${conversationLedger.size}`,
         result.exhausted ? "Round ceiling hit with tool calls still pending; the answer is partial." : "",
         suppressedReasons[0] ?? "",
@@ -5414,9 +5486,11 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     // 判断这轮算不算「开口」的唯一凭据是有没有字真的进群。
     await recordMonitorThought({
       kind: "reactive",
-      title: `${latest.context.replyTargetType === "private" ? "私聊" : "群消息"}判断 · ${messages.length} 条未读`,
+      title: injected.length === 1
+        ? `${injected[0].isPrivate ? "私聊" : "群消息"}判断 · ${unreadTotal} 条未读`
+        : `${injected.length} 个会话一起判断 · ${unreadTotal} 条未读`,
       summary: result.text || "模型未提供思考摘要。",
-      groupId: groupKey,
+      groupId: roundConversation.groupKey,
       outcome: focusOutcome,
       finalAnswer: sentMessages.join("\n\n"),
       model: client.model,
@@ -5424,7 +5498,12 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
-    pushMonitorEntry("error", "Focus Loop Error", `conversation=${groupKey}\n${detail}`, client.model);
+    pushMonitorEntry(
+      "error",
+      "Focus Loop Error",
+      `conversation=${roundConversation.groupKey}\n${detail}`,
+      client.model,
+    );
   }
 }
 
@@ -5444,33 +5523,7 @@ async function runFocusLoopForBatch(messages: readonly PendingModelMessage[]): P
 // 关键设计：失败的批次原地重试，绝不放回未读队列。放回去会让同一批消息在后面
 // 每一轮扫描里反复出现、反复判断（历史上真出过这个 bug）。消息本身留在历史里，
 // 所以下一条新消息来时模型仍有机会重新看待它们。
-async function forwardUnreadMessagesToModel(pendingMessages: readonly PendingModelMessage[]): Promise<void> {
-  const messages = pendingMessages
-    .map((item) => ({
-      ...item,
-      context: {
-        ...item.context,
-        messageLagMs: getCurrentMessageLagMs(item.context),
-      },
-    }))
-    .filter((item) => (
-      (item.context.isAdmin === true && shouldForceAdminReply({
-        userId: item.context.userId,
-        messageType: item.context.replyTargetType,
-      }, adminPolicyConfig))
-      || (item.context.messageLagMs ?? 0) <= MESSAGE_REPLY_MAX_AGE_MS
-    ));
-
-  if (messages.length === 0) {
-    pushMonitorEntry("status", "Unread Batch Skipped", "All queued messages became stale before the scheduled model scan ran.");
-    return;
-  }
-
-  if (focusModeConfig.enabled) {
-    await forwardBatchViaFocusLoop(messages);
-    return;
-  }
-
+async function forwardUnreadMessagesToModel(messages: readonly PendingModelMessage[]): Promise<void> {
   const isAdminBatch = isForcedAdminBatch(messages);
   const decisionSchema = isAdminBatch
     ? ADMIN_MODEL_DECISION_JSON_SCHEMA
@@ -8301,17 +8354,48 @@ function flushUnreadMessagesToModel(): void {
 // 下游那几个 RouteQueue 暂时原样留着。它们现在只有一个调用方、而且调用方本就串行，
 // 已经是退化的；留着是为了这一步只改执行骨架、不动任何一条具体路径。
 async function handleAgentEvents(events: readonly AgentEvent[]): Promise<void> {
-  for (const event of events) {
-    switch (event.type) {
-      case "message_batch_ready": {
-        const messages = takeUnreadBatchForModel(event.groupKey);
-        if (messages) await runUnreadBatchForModel(messages);
-        break;
-      }
-      case "autonomy_tick_due":
-        await runAutonomyTick();
-        break;
+  const { groupKeys, tickDue } = coalesceAgentEvents(events);
+
+  const batches: PendingModelMessage[][] = [];
+  for (const groupKey of groupKeys) {
+    const taken = takeUnreadBatchForModel(groupKey);
+    if (!taken) continue;
+    const fresh = dropStaleMessages(taken);
+    if (fresh.length === 0) {
+      pushMonitorEntry(
+        "status",
+        "Unread Batch Skipped",
+        `conversation_id=${groupKey}\nAll queued messages became stale before the loop got to them.`,
+      );
+      continue;
     }
+    batches.push(fresh);
+  }
+
+  if (batches.length > 0) {
+    if (focusModeConfig.enabled) {
+      await runFocusBatchesFromLoop(batches);
+    } else {
+      // focus_mode 是回滚开关。关掉它就该退回原来的全部行为，包括原来一个群一轮的节奏——
+      // 老管线按群重建请求，把几个群塞进一轮它也接不住。
+      for (const batch of batches) await runUnreadBatchForModel(batch);
+    }
+  }
+
+  if (tickDue) await runAutonomyTick();
+}
+
+// 焦点管线的错误收口。runFocusRoundForBatches 内部已经接住了模型那一段，能漏到这里的是
+// 注入和压缩——账本追加抛错、摘要调用抛错。那种情况下这一轮的消息谁都没看见，管理员至少
+// 该收到一句，不然他只会觉得她不理人。
+async function runFocusBatchesFromLoop(batches: readonly PendingModelMessage[][]): Promise<void> {
+  try {
+    await forwardBatchesViaFocusLoop(batches);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    pushMonitorEntry("error", "Model Error", detail);
+    console.error("Focus round failed:", error);
+    await sendAdminFailureReply(batches.flat(), "处理消息时发生内部错误，无法可靠执行这条消息。");
   }
 }
 
