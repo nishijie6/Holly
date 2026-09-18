@@ -190,13 +190,7 @@ import {
 import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
 import { FOCUS_TOOL_DEFINITIONS, createFocusToolRunner, type ConversationSummary } from "./qq-tools.js";
 import {
-  ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
-  AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
-  MEMORY_REFLECTION_SYSTEM_PROMPT,
   WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
-  buildArchiveCompositionPrompt,
-  buildAutonomyJudgmentPrompt,
-  buildMemoryReflectionPrompt,
   buildSearchResultJudgePrompt,
   buildWorldObservationBroadcastPrompt,
   selectBroadcastItems,
@@ -7333,60 +7327,6 @@ function parseMemoryReflection(raw: string): { topic: string; content: string; r
 // 素材分成「稳定」和「易变」两段传给模型，不是为了好看：generateText 只把最后
 // 一条消息标记为易变，缓存断点就落在两段之间。合成一条的话前面没有任何稳定内容
 // 可供缓存，每次反思那一万多 token 都要按全价重读一遍。
-async function reflectMemoryForAutonomy(
-  request: AutonomyMemoryReflectionRequest,
-): Promise<AutonomyMemoryWriteRequest | null> {
-  const client = activeLlmClient;
-  if (!client) return null;
-
-  const worldBlocks = formatWorldObservationsForReflection();
-  const internalBlocks = await formatInternalMemoriesForReflection();
-  const conversationBlocks = formatRecentTurnsForReflection();
-  const stableMaterial = worldBlocks.filter(Boolean);
-  const volatileMaterial = [...internalBlocks, ...conversationBlocks].filter(Boolean);
-  if (stableMaterial.length === 0 && volatileMaterial.length === 0) return null;
-
-  // Two messages, not one: generateText marks only the last one volatile, so
-  // the breakpoint lands between the world-observation window and everything
-  // that changes per tick. As one message there was nothing stable for it to
-  // sit on and the whole 11k request was reread at full price.
-  // 稳定段再往下拆：指令一条、每条世界观察各一条（见 autonomy-prompts.ts 的 SplitPrompt）。
-  // 新观察只在后面追加一块，前面的块照样命中缓存。
-  const prompt = buildMemoryReflectionPrompt(
-    request.nowIso,
-    request.reason,
-    stableMaterial,
-    volatileMaterial,
-  );
-
-  let reply: string;
-  try {
-    reply = await client.generateText({
-      purpose: "memory-reflection",
-      systemPrompt: MEMORY_REFLECTION_SYSTEM_PROMPT,
-      messages: [
-        ...prompt.stable.map((content) => ({ role: "user" as const, content })),
-        { role: "user", content: prompt.volatile },
-      ],
-      jsonSchema: MEMORY_REFLECTION_JSON_SCHEMA,
-      cacheRoute: "memory-reflection",
-      expectRebuild: autonomyStablePrefixes.changed("memory-reflection", prompt.stable),
-    });
-  } catch (error) {
-    pushMonitorEntry("error", "Autonomy Reflection Model Error", error instanceof Error ? error.message : String(error));
-    return null;
-  }
-
-  broadcastLatestLlmUsage(client);
-
-  const reflected = parseMemoryReflection(reply);
-  if (!reflected) return null;
-  return {
-    topic: reflected.topic,
-    reason: reflected.reason,
-    content: reflected.content,
-  };
-}
 
 async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Promise<void> {
   const now = new Date().toISOString();
@@ -7978,52 +7918,6 @@ function parseArchiveComposition(raw: string): AutonomyArchiveWriteRequest | nul
   };
 }
 
-async function composeArchiveForAutonomy(
-  request: AutonomyArchiveComposeRequest,
-): Promise<AutonomyArchiveWriteRequest | null> {
-  const client = activeLlmClient;
-  if (!client) return null;
-
-  const worldBlocks = formatWorldObservationsForReflection();
-  const internalBlocks = await formatInternalMemoriesForReflection();
-  const conversationBlocks = formatRecentTurnsForReflection();
-  const recentTitles = archiveWorks.slice(-8).map((work) => `- [${work.kind}] ${work.title}`);
-  const stableMaterial = worldBlocks.filter(Boolean);
-  const volatileMaterial = [...internalBlocks, ...conversationBlocks].filter(Boolean);
-  if (stableMaterial.length === 0 && volatileMaterial.length === 0) return null;
-
-  // Same two-message split as memory reflection — both routes read the same
-  // world-observation window, so both get their breakpoint in the same place.
-  const prompt = buildArchiveCompositionPrompt(
-    request.nowIso,
-    request.reason,
-    recentTitles,
-    stableMaterial,
-    volatileMaterial,
-  );
-
-  let reply: string;
-  try {
-    reply = await client.generateText({
-      purpose: "archive-composition",
-      systemPrompt: ARCHIVE_COMPOSITION_SYSTEM_PROMPT,
-      messages: [
-        ...prompt.stable.map((content) => ({ role: "user" as const, content })),
-        { role: "user", content: prompt.volatile },
-      ],
-      jsonSchema: ARCHIVE_COMPOSE_JSON_SCHEMA,
-      cacheRoute: "archive-composition",
-      expectRebuild: autonomyStablePrefixes.changed("archive-composition", prompt.stable),
-    });
-  } catch (error) {
-    pushMonitorEntry("error", "Autonomy Archive Model Error", error instanceof Error ? error.message : String(error));
-    return null;
-  }
-
-  broadcastLatestLlmUsage(client);
-
-  return parseArchiveComposition(reply);
-}
 
 function appendArchiveWorkLog(record: ArchiveWorkRecord, html: string): Promise<void> {
   archiveWriteQueue = archiveWriteQueue
@@ -8241,23 +8135,6 @@ function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
 // 每轮由模型自己判断该做什么（而不是按固定优先级轮询）。schema 里的候选动作
 // 是动态生成的：只把「此刻真的可做」的动作列进去，这样模型不会选中一个
 // 因为冷却期或开关而根本执行不了的动作。
-function buildAutonomyJudgmentSchema(
-  eligibleActions: readonly string[],
-  worldTopics: readonly string[],
-): Record<string, unknown> {
-  return {
-    type: "object",
-    additionalProperties: false,
-    required: ["action", "topic", "reason"],
-    properties: {
-      action: { type: "string", enum: ["do_nothing", "group_proactive", ...eligibleActions] },
-      // 世界观察去看哪个话题，同样用枚举把模型限制在配置里真有的话题上。空串留给其他动作，也留给世界
-      // 观察不可选的那一轮——那时话题列表是空的，枚举里只剩空串。
-      topic: { type: "string", enum: [...new Set(["", ...worldTopics])] },
-      reason: { type: "string" },
-    },
-  };
-}
 
 const AUTONOMY_JUDGMENT_ACTIONS = [
   "do_nothing",
@@ -8267,65 +8144,7 @@ const AUTONOMY_JUDGMENT_ACTIONS = [
   "group_proactive",
 ] as const;
 
-function parseAutonomyJudgment(raw: string): AutonomyJudgmentDecision | null {
-  let value: unknown;
-  try {
-    value = JSON.parse(unwrapJsonBlock(raw));
-  } catch {
-    return null;
-  }
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
-  const record = value as Record<string, unknown>;
 
-  const action = AUTONOMY_JUDGMENT_ACTIONS.find((candidate) => candidate === record.action);
-  if (!action) return null;
-  const reason = typeof record.reason === "string" ? record.reason.trim() : "";
-  if (!reason) return null;
-
-  if (action === "world_observation") {
-    // 话题在不在配置里由引擎核对（见 runAutonomyLoop），这里原样带过去，不 trim：配置里的话题按原文逐字匹配。
-    const topic = typeof record.topic === "string" ? record.topic : "";
-    return topic ? { action, reason, topic } : { action, reason };
-  }
-  return { action, reason } as AutonomyJudgmentDecision;
-}
-
-async function requestAutonomyJudgment(request: AutonomyJudgmentRequest): Promise<AutonomyJudgmentDecision> {
-  const fallback: AutonomyJudgmentDecision = { action: "do_nothing", reason: "判断调用不可用，本轮跳过" };
-  // 使用判断配置而非回复配置：这里只选择标签，不生成内容，而且每小时运行 60 次。
-  // 将 reply-decision 放到更便宜、更快配置上的理由在这里更充分，因为其他自主调用
-  // （记忆、归档、世界观察、QQ 模式）每天最多几十次，不会每个轮次都触发。
-  const client = decisionLlmClient ?? activeLlmClient;
-  if (!client) return fallback;
-
-  const eligibleActions = [
-    request.worldObservation.eligible ? "world_observation" : null,
-    request.memoryReflection.eligible ? "memory_reflection" : null,
-    request.archiveWriting.eligible ? "archive_writing" : null,
-  ].filter((action): action is string => action !== null);
-
-  try {
-    const reply = await client.generateText({
-      purpose: "autonomy-judgment",
-      systemPrompt: AUTONOMY_JUDGMENT_SYSTEM_PROMPT,
-      messages: [{ role: "user", content: buildAutonomyJudgmentPrompt(request) }],
-      jsonSchema: buildAutonomyJudgmentSchema(eligibleActions, request.worldTopics.map((status) => status.topic)),
-      // 使用固定路由且预期命中率接近 0%：候选状态每轮都会变化，没有稳定前缀可缓存。
-      // token-usage.ts 的 uncacheableInputTokens 已按不可缓存如实统计，不会伪造为
-      // 0% 未命中。
-      cacheRoute: "autonomy-judgment",
-    });
-    broadcastLatestLlmUsage(client);
-    return parseAutonomyJudgment(reply) ?? { ...fallback, reason: "判断响应解析失败，本轮跳过" };
-  } catch (error) {
-    pushMonitorEntry(
-      "error",
-      "Autonomy Judgment Failed",
-      error instanceof Error ? error.message : String(error),
-    );
-    return fallback;
-  }
-}
 
 // ---------- 自主轮次：每分钟问一次「现在该做点什么吗」 ----------
 //

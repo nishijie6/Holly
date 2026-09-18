@@ -233,9 +233,6 @@ export function selectJudgedSearchResults<T>(raw: unknown, results: readonly T[]
   return selection;
 }
 
-export const MEMORY_REFLECTION_SYSTEM_PROMPT =
-  "You write Holly's private internal memory. Be concise, concrete, and do not roleplay a public chat reply.";
-
 // Split into the half that repeats between calls and the half that does not, so
 // the caller can put a cache breakpoint between them. The instructions and the
 // world observations are shared by consecutive ticks (a new observation only
@@ -259,26 +256,6 @@ const MEMORY_REFLECTION_INSTRUCTIONS = [
   "If nothing is worth remembering, set should_write=false and leave topic/memory empty.",
 ];
 
-export function buildMemoryReflectionPrompt(
-  nowIso: string,
-  reason: string,
-  stableMaterial: readonly string[],
-  volatileMaterial: readonly string[],
-): SplitPrompt {
-  return {
-    stable: [MEMORY_REFLECTION_INSTRUCTIONS.join("\n"), ...stableMaterial],
-    volatile: [
-      `now=${nowIso}`,
-      `reason=${reason}`,
-      "",
-      volatileMaterial.join("\n\n"),
-    ].join("\n").trimEnd(),
-  };
-}
-
-export const ARCHIVE_COMPOSITION_SYSTEM_PROMPT =
-  "You write Holly's private creative works. Be genuine and concrete; do not roleplay a public chat reply.";
-
 const ARCHIVE_COMPOSITION_INSTRUCTIONS = [
   "You are Holly's creative writing impulse.",
   "Decide whether Holly genuinely feels like writing a short article (文章) or a poem (诗) right now, inspired by the material below.",
@@ -293,48 +270,16 @@ const ARCHIVE_COMPOSITION_INSTRUCTIONS = [
 // Same split as memory reflection, and for the same reason — these two routes
 // read the same world-observation window, so they churn on the same clock.
 // recentTitles joins the volatile half: it grows every time Holly writes.
-export function buildArchiveCompositionPrompt(
-  nowIso: string,
-  reason: string,
-  recentTitles: readonly string[],
-  stableMaterial: readonly string[],
-  volatileMaterial: readonly string[],
-): SplitPrompt {
-  return {
-    stable: [ARCHIVE_COMPOSITION_INSTRUCTIONS.join("\n"), ...stableMaterial],
-    volatile: [
-      `now=${nowIso}`,
-      `reason=${reason}`,
-      "",
-      recentTitles.length > 0 ? ["Recent works (avoid repeating):", ...recentTitles, ""].join("\n") : "",
-      volatileMaterial.join("\n\n"),
-    ].filter(Boolean).join("\n").trimEnd(),
-  };
-}
-
-export const AUTONOMY_JUDGMENT_SYSTEM_PROMPT =
-  "You pick at most one thing for Holly to do this minute from a short, fixed candidate list. Return structured JSON only.";
 
 // Deliberately terse: no conversation content, no full material — this runs
 // every tick (60/hour) so it has to stay cheap. Each candidate line already
 // carries the only fact that matters (is it eligible, and why/why not); the
 // model's job is priority among what's actually offered, not re-deriving
 // eligibility from raw timestamps.
-function candidateLine(label: string, candidate: { eligible: boolean; note: string }): string {
-  return `- ${label}: ${candidate.eligible ? "可选" : "不可选"} — ${candidate.note}`;
-}
 
 // 世界观察可选时，逐个话题列出上次什么时候看的、看完怎样了。判断「要不要去、看哪个」要的就是这几条
 // 事实：刚看过又发了的话题不急，上次页面上没新东西的可以缓缓，很久没看的才可能攒了新动态。分钟数
 // 跟 autonomy-engine.ts 的 freshnessNote 一样取整分钟，同一段提示词里不混两种写法。
-function worldTopicLines(topics: readonly WorldTopicStatus[], nowMs: number): string[] {
-  return topics.map((status) => {
-    const when = status.lastAt > 0
-      ? `${Math.max(0, Math.round((nowMs - status.lastAt) / 60_000))} 分钟前看过`
-      : "最近没有看过的记录";
-    return `  · ${status.topic}：${when}${status.outcome ? `，${status.outcome}` : ""}`;
-  });
-}
 
 // 最近已经写过的题目。世界观察有 worldTopicLines 逐话题报近况，记忆反思和归档写作以前
 // 什么都没有——判断层看到的只是「可选」，看不见她上一轮刚写完什么，于是同一件事能连着
@@ -342,52 +287,6 @@ function worldTopicLines(topics: readonly WorldTopicStatus[], nowMs: number): st
 //
 // 末尾那句「是让你避开」不是客套。只给一份清单，模型会把它当成范例照着写，去重反而变成
 // 了复读机；必须说明白列出来是为了绕开。
-function recentActionLines(
-  actions: readonly RecentAutonomyAction[] | undefined,
-  nowMs: number,
-): string[] {
-  // 类型上这是必填的，但缺了它也只该少掉几行去重提示，不该让整条提示词构建抛出去——
-  // 那一轮判断调用会整个失败，她这一分钟什么都做不了。这份清单是锦上添花，不是必需品。
-  if (!actions || actions.length === 0) return [];
-  const label: Record<RecentAutonomyAction["kind"], string> = {
-    memory_reflection: "记忆",
-    archive_writing: "作品",
-  };
-  return [
-    "最近已经写过的（这次换点别的，列在这里是让你避开，不是给你参照写法）：",
-    // 最新的写在最前面：刚写完的那个最该避开，读到第一行就看见。
-    ...[...actions].reverse().map((action) => {
-      const when = action.at > 0
-        ? `${Math.max(0, Math.round((nowMs - action.at) / 60_000))} 分钟前`
-        : "时间不详";
-      return `  · ${when}｜${label[action.kind]}：${action.title}`;
-    }),
-  ];
-}
-
-export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): string {
-  return [
-    "现在是自主循环的一次 tick。下面是当前可以从中选择的候选，只列出真实状态，没有对话内容。",
-    "",
-    candidateLine("world_observation（浏览网页，产出一条世界观察）", request.worldObservation),
-    ...worldTopicLines(request.worldTopics, Date.parse(request.nowIso)),
-    candidateLine("memory_reflection（写一条内部记忆）", request.memoryReflection),
-    candidateLine("archive_writing（写一篇文章或一首诗）", request.archiveWriting),
-    `- group_proactive（主动在某个群里接话）: 可选 — ${request.groupProactiveNote}`,
-    "",
-    `当前有 ${request.pendingReplyGroupCount} 个群有未读消息在等待独立的回复判断——这条仅供感知，不需要你处理，不要选它作为理由去做别的事，也不要因为它而选 do_nothing。`,
-    `上次行动：${request.lastActionSummary}`,
-    ...recentActionLines(request.recentActions, Date.parse(request.nowIso)),
-    "",
-    "从「可选」的候选里挑一个最值得现在做的，或者选 do_nothing（这一轮什么都不做也完全正常，大多数 tick 应该如此）。",
-    "不可选的候选禁止选中——它们的 interval/重试窗口还没到。",
-    "world_observation 没有固定间隔，几乎一直可选，这不代表该去。只有真对某个话题起了兴趣、想看看它最近有什么新动态时才选它，并在 topic 里填那个话题的原文：挑现在最好奇、也最可能攒了新东西的。刚看过的话题（尤其几十分钟内看过的）、上次没看到新东西的话题，再去多半还是同样的内容。看完要不要发到群里，之后会单独判断，不用在这里考虑。",
-    "archive_writing 同样没有固定间隔。写不写、什么时候写由你自己定：有真想写下来的东西才写，没有就不写，这不是一件到点要交的功课。",
-    "选其他动作时 topic 填空串。",
-    "返回 JSON only，shape：",
-    '{"action": "do_nothing" | "world_observation" | "memory_reflection" | "archive_writing" | "group_proactive", "topic": "话题原文；不是 world_observation 时填空串", "reason": "一句简短中文，说明为什么选它（或为什么什么都不做）"}',
-  ].join("\n");
-}
 
 // ---------- 看完之后要不要发到群里 ----------
 //

@@ -2,9 +2,6 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
-  buildArchiveCompositionPrompt,
-  buildAutonomyJudgmentPrompt,
-  buildMemoryReflectionPrompt,
   buildSearchResultJudgePrompt,
   buildWorldObservationBroadcastPrompt,
   buildWorldObservationSharePrompt,
@@ -23,88 +20,6 @@ const churn = ["Internal memory 1:\n- content: 刚写下的记忆", "Recent conv
 // The whole point of the split: two ticks that see the same world-observation
 // window must produce byte-identical stable halves, or the cache entry the
 // breakpoint creates is dead on arrival.
-test("memory reflection's stable half is byte-identical across ticks", () => {
-  const first = buildMemoryReflectionPrompt("2026-09-06T13:00:00.000Z", "tick", worldBlocks, churn);
-  const second = buildMemoryReflectionPrompt(
-    "2026-09-06T13:33:00.000Z",
-    "another tick",
-    worldBlocks,
-    [...churn, "Internal memory 2:\n- content: 又一条"],
-  );
-
-  assert.deepEqual(first.stable, second.stable);
-  assert.notEqual(first.volatile, second.volatile);
-});
-
-// 窗口里多了一条观察，稳定段只是在后面多一块、前面的块原样不动：缓存按块比对前缀，这样才读得回来。
-test("a new world observation only appends a block to the stable half", () => {
-  const newer = [...worldBlocks, "World observation 3:\n- topic: 人工智能\n- summary: 新的一条"];
-  for (const build of [
-    (blocks: string[]) => buildMemoryReflectionPrompt("2026-09-06T13:00:00.000Z", "tick", blocks, churn),
-    (blocks: string[]) => buildArchiveCompositionPrompt("2026-09-06T13:00:00.000Z", "tick", [], blocks, churn),
-  ]) {
-    const before = build(worldBlocks);
-    const after = build(newer);
-    assert.equal(after.stable.length, before.stable.length + 1);
-    assert.deepEqual(after.stable.slice(0, before.stable.length), before.stable);
-  }
-});
-
-// now/reason used to sit ahead of the material. A timestamp anywhere in the
-// prefix invalidates everything after it, so this is the regression that would
-// silently undo the split while every test about content still passed.
-test("timestamps stay out of the cached half", () => {
-  const nowIso = "2026-09-06T13:00:00.000Z";
-  const memory = buildMemoryReflectionPrompt(nowIso, "tick", worldBlocks, churn);
-  assert.ok(!memory.stable.some((block) => block.includes(nowIso)), "now must not appear in the stable half");
-  assert.ok(!memory.stable.some((block) => block.includes("reason=")), "reason must not appear in the stable half");
-  assert.ok(memory.volatile.includes(nowIso));
-
-  const archive = buildArchiveCompositionPrompt(nowIso, "tick", ["- [poem] 旧作"], worldBlocks, churn);
-  assert.ok(!archive.stable.some((block) => block.includes(nowIso)), "now must not appear in the stable half");
-  assert.ok(archive.volatile.includes(nowIso));
-});
-
-// Recent titles grow every time Holly writes, so they belong with the churn.
-test("archive composition keeps recent titles in the volatile half", () => {
-  const withTitles = buildArchiveCompositionPrompt(
-    "2026-09-06T13:00:00.000Z", "tick", ["- [poem] 雨夜"], worldBlocks, churn,
-  );
-  const withoutTitles = buildArchiveCompositionPrompt(
-    "2026-09-06T13:00:00.000Z", "tick", [], worldBlocks, churn,
-  );
-
-  assert.deepEqual(withTitles.stable, withoutTitles.stable, "a new work must not disturb the prefix");
-  assert.ok(withTitles.volatile.includes("雨夜"));
-  assert.ok(!withoutTitles.volatile.includes("Recent works"));
-});
-
-// Both halves still have to carry the instructions and the material the model
-// needs — a split that drops content would cache beautifully and answer badly.
-test("the split preserves instructions and material", () => {
-  const { stable, volatile } = buildMemoryReflectionPrompt(
-    "2026-09-06T13:00:00.000Z", "tick", worldBlocks, churn,
-  );
-  assert.ok(stable[0].includes("Holly's private memory and reflection loop"));
-  assert.ok(stable[0].includes("should_write"));
-  // 每条观察各占一块，顺序不变。
-  assert.deepEqual(stable.slice(1), worldBlocks);
-  for (const block of churn) assert.ok(volatile.includes(block));
-});
-
-// An empty world-observation window is normal at boot and after a quiet day.
-test("an empty stable half degrades to instructions only", () => {
-  const { stable, volatile } = buildMemoryReflectionPrompt(
-    "2026-09-06T13:00:00.000Z", "tick", [], churn,
-  );
-  assert.equal(stable.length, 1);
-  assert.ok(stable[0].includes("Holly's private memory and reflection loop"));
-  assert.ok(!stable[0].endsWith("\n"), "no trailing blank line when there is no material");
-  for (const block of churn) assert.ok(volatile.includes(block));
-});
-
-// ---------- 播报条目的完整性检查 ----------
-
 // 2026-09-05 到 09-10 真实发进群里的截断条目，从监控日志原样摘出。每一条都停在句子中间。
 const TRUNCATED_BROADCAST_TEXTS = [
   "北京经开区推出",
@@ -309,73 +224,6 @@ test("selectJudgedSearchResults returns null when nothing in the reply is usable
   for (const raw of [undefined, null, "keep all", {}, { decisions: [] }, { decisions: [{ index: "1", keep: false }, { index: 1 }] }]) {
     assert.equal(selectJudgedSearchResults(raw, MATH_SEARCH_RESULTS), null, JSON.stringify(raw));
   }
-});
-
-test("世界观察可选时，判断提示词逐个话题列出上次什么时候看的、看完怎样了", () => {
-  const nowIso = "2026-09-14T12:00:00.000Z";
-  const nowMs = Date.parse(nowIso);
-  const prompt = buildAutonomyJudgmentPrompt({
-    nowIso,
-    worldObservation: { eligible: true, note: "距上次已 70 分钟" },
-    worldTopics: [
-      { topic: "人工智能", lastAt: nowMs - 52 * 60_000, outcome: "发到了群里" },
-      { topic: "天文学", lastAt: nowMs - 180 * 60_000, outcome: "" },
-      { topic: "数学", lastAt: 0, outcome: "" },
-    ],
-    memoryReflection: { eligible: false, note: "距离上次完成尚未达到配置间隔" },
-    archiveWriting: { eligible: false, note: "归档写作已关闭" },
-    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
-    pendingReplyGroupCount: 0,
-    lastActionSummary: "尚未行动过",
-    recentActions: [],
-  });
-
-  assert.match(prompt, /· 人工智能：52 分钟前看过，发到了群里\n/);
-  // 结局不清楚就不写，不留一个悬空的逗号。
-  assert.match(prompt, /· 天文学：180 分钟前看过\n/);
-  assert.match(prompt, /· 数学：最近没有看过的记录\n/);
-  assert.match(prompt, /"topic"/);
-});
-
-test("最近写过的题目进提示词，并且说明白是让她避开", () => {
-  const nowIso = "2026-09-14T12:00:00.000Z";
-  const nowMs = Date.parse(nowIso);
-  const prompt = buildAutonomyJudgmentPrompt({
-    nowIso,
-    worldObservation: { eligible: false, note: "世界观察已关闭" },
-    worldTopics: [],
-    memoryReflection: { eligible: true, note: "距上次已 250 分钟" },
-    archiveWriting: { eligible: true, note: "距上次已 250 分钟" },
-    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
-    pendingReplyGroupCount: 0,
-    lastActionSummary: "30 分钟前：archive_writing",
-    recentActions: [
-      { kind: "archive_writing", at: nowMs - 30 * 60_000, title: "星尘" },
-      { kind: "memory_reflection", at: nowMs - 5 * 60_000, title: "关于噪音" },
-    ],
-  });
-
-  // 最新的排在最前：刚写完的那个最该避开。
-  assert.match(prompt, /· 5 分钟前｜记忆：关于噪音\n/);
-  assert.match(prompt, /· 30 分钟前｜作品：星尘\n/);
-  // 只给清单，模型会照着写；必须说明列出来是为了绕开。
-  assert.match(prompt, /是让你避开/);
-});
-
-test("没写过东西就不占提示词的地方", () => {
-  const prompt = buildAutonomyJudgmentPrompt({
-    nowIso: "2026-09-14T12:00:00.000Z",
-    worldObservation: { eligible: false, note: "世界观察已关闭" },
-    worldTopics: [],
-    memoryReflection: { eligible: true, note: "距上次已 250 分钟" },
-    archiveWriting: { eligible: true, note: "距上次已 250 分钟" },
-    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
-    pendingReplyGroupCount: 0,
-    lastActionSummary: "尚未行动过",
-    recentActions: [],
-  });
-
-  assert.doesNotMatch(prompt, /最近已经写过的/);
 });
 
 test("发不发的提示词带着话题、群里最近的聊天、冷场时长，成稿原样放在最后", () => {

@@ -186,35 +186,32 @@ test("StablePrefixLedger is bounded and forgets the oldest route first", async (
   assert.equal(ledger.changed("a", ["y"]), false);
 });
 
-// 记忆反思和归档写作的稳定段按块发。窗口里多了一条世界观察，线上的缓存前缀应当是「延长」而不是
-// 「重建」——这条钉住的是 autonomy-prompts.ts 拆块的真正目的。旧写法把稳定段拼成一条消息，同样的
-// 变化就是重建，一并测出来作对照。
-test("a new world observation extends the reflection prefix once the stable half is sent as blocks", async () => {
-  const { buildMemoryReflectionPrompt } = await import("../autonomy-prompts.js");
-  const observations = [
-    "World observation:\n- topic: 天文学\n- summary: 一",
-    "World observation:\n- topic: 数学\n- summary: 二",
-  ];
-  const newer = [...observations, "World observation:\n- topic: 人工智能\n- summary: 三"];
-  const request = (blocks: string[], asOneMessage: boolean) => {
-    const prompt = buildMemoryReflectionPrompt("2026-09-11T05:00:00.000Z", "tick", blocks, ["Recent conversation:\n- 有人说了句话"]);
-    const stable = asOneMessage ? [prompt.stable.join("\n\n")] : prompt.stable;
+// 稳定段按块发，线上的缓存前缀才会是「延长」而不是「重建」。这一条守的是 CachePrefixTracker
+// 的判定本身，跟哪条管线在用它无关——记忆反思那个调用者已经退役（写记忆成了她手边的子工具），
+// 但结论对任何「稳定段会往后追加」的路径都一样成立，所以换成普通数据留下来。
+test("a growing stable half extends the prefix when sent as blocks, and rebuilds when joined", () => {
+  const blocks = ["第一块", "第二块"];
+  const grown = [...blocks, "第三块"];
+  const request = (stableBlocks: string[], asOneMessage: boolean) => {
+    const stable = asOneMessage ? [stableBlocks.join("\n\n")] : stableBlocks;
     return buildClaudeRequestBody(
       "claude-opus-4-7",
-      "You write Holly's private internal memory.",
+      "系统提示",
       [
         ...stable.map((content) => ({ role: "user" as const, content })),
-        { role: "user" as const, content: prompt.volatile },
+        { role: "user" as const, content: "这一条是易变尾部" },
       ],
       { cacheStablePrefix: true, volatileTailMessages: 1 },
     );
   };
 
+  // 按块发：多一块就是往后追加，断点之前逐块不变。
   const split = new CachePrefixTracker();
-  split.inspect("memory-reflection", digestClaudeCachedPrefix(request(observations, false)));
-  assert.equal(split.inspect("memory-reflection", digestClaudeCachedPrefix(request(newer, false))).status, "extended");
+  split.inspect("probe", digestClaudeCachedPrefix(request(blocks, false)));
+  assert.equal(split.inspect("probe", digestClaudeCachedPrefix(request(grown, false))).status, "extended");
 
+  // 拼成一条：同样的变化落在同一块里，那一块的摘要变了，整段前缀作废。
   const joined = new CachePrefixTracker();
-  joined.inspect("memory-reflection", digestClaudeCachedPrefix(request(observations, true)));
-  assert.equal(joined.inspect("memory-reflection", digestClaudeCachedPrefix(request(newer, true))).status, "rebuilt");
+  joined.inspect("probe", digestClaudeCachedPrefix(request(blocks, true)));
+  assert.equal(joined.inspect("probe", digestClaudeCachedPrefix(request(grown, true))).status, "rebuilt");
 });
