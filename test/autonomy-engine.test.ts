@@ -34,8 +34,9 @@ function baseConfig(overrides: Partial<AutonomyConfig> = {}): AutonomyConfig {
     memoryReflectionBroadcastGroupId: null,
     memoryReflectionBroadcastLullMs: 180 * MIN,
     archiveWritingEnabled: false,
-    archiveWritingIntervalMs: 240 * MIN,
     archiveWritingRetryMs: 60 * MIN,
+    archiveWritingDailyCap: 6,
+    worldObservationDailyCap: 24,
     ...overrides,
   };
 }
@@ -311,6 +312,82 @@ test("picking archive_writing runs only composeArchive+writeArchive", async () =
   assert.equal(writeCalls, 1);
   assert.equal(state.archiveWritingDailyCount, 1);
   assert.equal(state.lastArchiveWritingAt, NOW);
+});
+
+// ---------- 想写就写：归档写作不再按钟点排班 ----------
+
+// 撤掉 240 分钟间隔的核心断言：刚写完一篇，下一分钟她要是又想写，没有东西拦着。挡住无谓
+// 重复的是判断时看到的事实（最近写过哪些题目），不是时钟。
+test("刚写完也还能再写，不看钟点", async () => {
+  const state = baseState({ lastArchiveWritingAt: NOW - 60_000 });
+  let asked = false;
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async (request) => {
+      asked = true;
+      assert.equal(request.archiveWriting.eligible, true, "刚写完不该被挡");
+      return { action: "do_nothing", reason: "这会儿不想写" };
+    },
+  }));
+  assert.ok(asked);
+});
+
+// 兜底：不是节奏闸，是防模型抽风连选二十次。
+test("写够当天上限就不再可选", async () => {
+  const state = baseState({ archiveWritingDailyCount: 6 });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true, archiveWritingDailyCap: 6 }),
+    requestJudgment: async (request) => {
+      assert.equal(request.archiveWriting.eligible, false);
+      assert.match(request.archiveWriting.note, /上限/);
+      return { action: "do_nothing", reason: "写够了" };
+    },
+  }));
+});
+
+// 失败后缓一缓和按钟点排班是两回事，retry 照旧生效。
+test("写失败之后仍然要等重试间隔", async () => {
+  const state = baseState({
+    lastArchiveWritingAt: 0,
+    lastArchiveWritingAttemptAt: NOW - 10 * MIN,
+  });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true, archiveWritingRetryMs: 60 * MIN }),
+    requestJudgment: async (request) => {
+      assert.equal(request.archiveWriting.eligible, false);
+      return { action: "do_nothing", reason: "还在重试间隔里" };
+    },
+  }));
+});
+
+// 这个上限 2026-09-15 撤间隔时就该补而没补：dailyCount 一直在加，却没有一处读它。
+test("世界观察也有了真的日上限", async () => {
+  const state = baseState({ worldObservationDailyCount: 24 });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ worldObservationDailyCap: 24 }),
+    requestJudgment: async (request) => {
+      assert.equal(request.worldObservation.eligible, false);
+      return { action: "do_nothing", reason: "今天看够了" };
+    },
+  }));
+});
+
+// 记忆反思是这次唯一保留钟点的：它的 50 分钟卡着一小时的 KV 缓存 TTL，撤了命中率会从
+// 七成掉到半成。这条测试守住「没跟着一起改」。
+test("记忆反思仍然按间隔来", async () => {
+  const state = baseState({ lastMemoryReflectionAt: NOW - 10 * MIN });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ memoryReflectionEnabled: true, memoryReflectionIntervalMs: 30 * MIN }),
+    requestJudgment: async (request) => {
+      assert.equal(request.memoryReflection.eligible, false, "间隔没到就不该可选");
+      return { action: "do_nothing", reason: "还没到" };
+    },
+  }));
 });
 
 // ---------- 判断调用连着失败时别每分钟都去撞墙 ----------

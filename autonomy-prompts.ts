@@ -382,6 +382,7 @@ export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): s
     "从「可选」的候选里挑一个最值得现在做的，或者选 do_nothing（这一轮什么都不做也完全正常，大多数 tick 应该如此）。",
     "不可选的候选禁止选中——它们的 interval/重试窗口还没到。",
     "world_observation 没有固定间隔，几乎一直可选，这不代表该去。只有真对某个话题起了兴趣、想看看它最近有什么新动态时才选它，并在 topic 里填那个话题的原文：挑现在最好奇、也最可能攒了新东西的。刚看过的话题（尤其几十分钟内看过的）、上次没看到新东西的话题，再去多半还是同样的内容。看完要不要发到群里，之后会单独判断，不用在这里考虑。",
+    "archive_writing 同样没有固定间隔。写不写、什么时候写由你自己定：有真想写下来的东西才写，没有就不写，这不是一件到点要交的功课。",
     "选其他动作时 topic 填空串。",
     "返回 JSON only，shape：",
     '{"action": "do_nothing" | "world_observation" | "memory_reflection" | "archive_writing" | "group_proactive", "topic": "话题原文；不是 world_observation 时填空串", "reason": "一句简短中文，说明为什么选它（或为什么什么都不做）"}',

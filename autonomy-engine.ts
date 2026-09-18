@@ -75,8 +75,17 @@ export type AutonomyConfig = {
   memoryReflectionBroadcastGroupId: string | null;
   memoryReflectionBroadcastLullMs: number;
   archiveWritingEnabled: boolean;
-  archiveWritingIntervalMs: number;
   archiveWritingRetryMs: number;
+  /**
+   * 归档写作一天最多几次。
+   *
+   * 不是节奏闸——什么时候想写由她自己判断。这是防跑飞的兜底：模型抽了风连着挑二十次
+   * 归档写作，得有个东西拦住。以前这个位置是 240 分钟的固定间隔，它顺带兜住了这件事；
+   * 间隔一撤，兜底就得自己站出来。
+   */
+  archiveWritingDailyCap: number;
+  /** 世界观察一天最多几次。同样是防跑飞，不是节奏闸——见 archiveWritingDailyCap。 */
+  worldObservationDailyCap: number;
 };
 
 // ---------- 世界观察播报的目标群 ----------
@@ -327,6 +336,9 @@ function judgmentBackoffUntil(state: AutonomyLoopState, now: number): number | n
 function worldObservationDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
   if (!cfg.worldObservationEnabled) return false;
   if (cfg.worldTopics.length === 0) return false;
+  // 日上限是 2026-09-15 撤掉固定间隔时留下的洞：dailyCount 一直在加，却没有一处读它，
+  // 于是那之后世界观察其实没有任何频率兜底。补上——它拦的是跑飞，不是节奏。
+  if (state.worldObservationDailyCount >= cfg.worldObservationDailyCap) return false;
   return worldObservationRetryAt(cfg, state, now) === null;
 }
 
@@ -362,11 +374,19 @@ function memoryReflectionDue(cfg: AutonomyConfig, state: AutonomyLoopState, now:
   return true;
 }
 
+// 固定间隔在这里撤掉了，理由和世界观察 2026-09-15 那次一样：什么时候想写点东西由她自己
+// 判断，不按钟点排班。人不会掐着表写诗。
+//
+// 撤得起，是因为这一条的间隔本来就不为缓存服务——归档写作永远读不回自己的 KV 缓存（见
+// 「Reflect every 50 minutes」那次的实测），而缓存写入不额外收费，所以什么时候写在账单上
+// 没有分别。记忆反思的 50 分钟是另一回事：它卡着一小时的 cache TTL，撤了命中率会从七成掉到
+// 半成，所以那一条原样留着。
+//
+// 挡住无谓重复的，从此是判断时看到的事实——最近写过哪几个题目（recentActions）、上次是多久
+// 以前——而不是时钟。retry 间隔照旧只在失败后生效。
 function archiveWritingDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: number): boolean {
   if (!cfg.archiveWritingEnabled) return false;
-  if (state.lastArchiveWritingAt > 0 && now - state.lastArchiveWritingAt < cfg.archiveWritingIntervalMs) {
-    return false;
-  }
+  if (state.archiveWritingDailyCount >= cfg.archiveWritingDailyCap) return false;
   if (
     state.lastArchiveWritingAttemptAt > 0 &&
     now - state.lastArchiveWritingAttemptAt < cfg.archiveWritingRetryMs
@@ -374,6 +394,33 @@ function archiveWritingDue(cfg: AutonomyConfig, state: AutonomyLoopState, now: n
     return false;
   }
   return true;
+}
+
+// 归档写作没有配置间隔了，不套 scheduledCheckWhenNotDue：没到期只可能是关着、今天写够了，
+// 或者失败后在等重试。三个原因各自报实话，不写成「距上次尚未达到配置间隔」——那个间隔已经
+// 不存在，那样写会让 trace 撒谎。
+function archiveWritingCheckWhenNotDue(
+  cfg: AutonomyConfig,
+  state: AutonomyLoopState,
+  now: number,
+): AutonomyCheck {
+  if (!cfg.archiveWritingEnabled) {
+    return { name: "archive_writing", status: "disabled", reason: "归档写作已关闭", nextEligibleAt: null };
+  }
+  if (state.archiveWritingDailyCount >= cfg.archiveWritingDailyCap) {
+    return {
+      name: "archive_writing",
+      status: "waiting",
+      reason: `今天已经写了 ${state.archiveWritingDailyCount} 篇，到上限了`,
+      nextEligibleAt: null,
+    };
+  }
+  return {
+    name: "archive_writing",
+    status: "waiting",
+    reason: "上次没写成，还在重试间隔里",
+    nextEligibleAt: state.lastArchiveWritingAttemptAt + cfg.archiveWritingRetryMs,
+  };
 }
 
 function scheduledCheckWhenNotDue(input: {
@@ -498,16 +545,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     retryMs: cfg.memoryReflectionRetryMs,
     now,
   });
-  const archiveNotDueCheck = archiveEligible ? null : scheduledCheckWhenNotDue({
-    name: "archive_writing",
-    enabled: cfg.archiveWritingEnabled,
-    disabledReason: "归档写作已关闭",
-    lastCompletedAt: state.lastArchiveWritingAt,
-    intervalMs: cfg.archiveWritingIntervalMs,
-    lastAttemptAt: state.lastArchiveWritingAttemptAt,
-    retryMs: cfg.archiveWritingRetryMs,
-    now,
-  });
+  const archiveNotDueCheck = archiveEligible ? null : archiveWritingCheckWhenNotDue(cfg, state, now);
 
   // requestJudgment's own implementation (requestAutonomyJudgment in main.ts)
   // already catches its own LLM/parse failures and resolves to a do_nothing

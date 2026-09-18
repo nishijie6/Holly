@@ -775,8 +775,11 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   memoryReflectionBroadcastGroupId: null,
   memoryReflectionBroadcastLullMs: 3 * 60 * 60 * 1000,
   archiveWritingEnabled: false,
-  archiveWritingIntervalMs: 4 * 60 * 60 * 1000,
   archiveWritingRetryMs: 60 * 60 * 1000,
+  // 防跑飞的兜底，不是节奏闸。按撤掉的 240 分钟间隔折算，一天最多六篇左右。
+  archiveWritingDailyCap: 6,
+  // 同上。世界观察 2026-09-15 撤间隔后一直没有兜底，这里补上。
+  worldObservationDailyCap: 24,
 };
 
 let sessionLogPath: string | null = null;
@@ -1193,13 +1196,14 @@ async function loadAutonomyConfig(configPath: string): Promise<AutonomyConfig> {
       typeof a.archive_writing_enabled === "boolean"
         ? a.archive_writing_enabled
         : base.archiveWritingEnabled,
-    archiveWritingIntervalMs: readProactiveMinutesMs(
-      a.archive_writing_interval_minutes,
-      base.archiveWritingIntervalMs,
-    ),
     archiveWritingRetryMs: readProactiveMinutesMs(
       a.archive_writing_retry_minutes,
       base.archiveWritingRetryMs,
+    ),
+    archiveWritingDailyCap: readProactiveCount(a.archive_writing_daily_cap, base.archiveWritingDailyCap),
+    worldObservationDailyCap: readProactiveCount(
+      a.world_observation_daily_cap,
+      base.worldObservationDailyCap,
     ),
   };
 }
@@ -8868,7 +8872,7 @@ async function bootstrap(): Promise<void> {
   pushMonitorEntry(
     "status",
     "Autonomy Ready",
-    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_interval=${Math.round(autonomyConfig.archiveWritingIntervalMs / 60000)}min topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic).join("+") || "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
+    `enabled=${autonomyConfig.enabled} world_observation=${autonomyConfig.worldObservationEnabled} memory_reflection=${autonomyConfig.memoryReflectionEnabled} archive_writing=${autonomyConfig.archiveWritingEnabled}\nworld_retry=${Math.round(autonomyConfig.worldObservationRetryMs / 60000)}min reflection_interval=${Math.round(autonomyConfig.memoryReflectionIntervalMs / 60000)}min archive_daily_cap=${autonomyConfig.archiveWritingDailyCap} world_daily_cap=${autonomyConfig.worldObservationDailyCap} topics=${autonomyConfig.worldTopics.length}\nworld_broadcast_group=${autonomyConfig.worldObservationBroadcastGroupId ?? "off"} topic_groups=${autonomyConfig.worldTopics.map((topic) => `${topic}→${resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic).join("+") || "off"}`).join(",")}\nreflection_broadcast_group=${autonomyConfig.memoryReflectionBroadcastGroupId ?? "off"} lull=${Math.round(autonomyConfig.memoryReflectionBroadcastLullMs / 60000)}min`,
   );
   pushMonitorEntry(
     "status",
