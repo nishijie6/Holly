@@ -7,17 +7,23 @@ import {
   type AutonomyIdlePolicy,
 } from "./autonomy-idle.js";
 
+/**
+ * 这个循环一轮能有的结局。
+ *
+ * 观察世界、写记忆、写作品都不在这里了——它们是她手边的子工具，什么时候用由她自己那一轮
+ * 决定，这个循环看不见也不需要看见。剩下的两个是它仍然亲自发起的：按规则闸主动开口，
+ * 或者冒一个念头交给她。
+ */
 export type AutonomyAction =
   | { type: "do_nothing"; reason: string }
-  | { type: "observe_world"; topic: string; reason: string; observed: boolean }
   | { type: "send_group_message"; reason: string; actions: ProactiveTickResult["actions"] }
-  | { type: "write_memory"; topic: string; reason: string; content: string }
-  | { type: "write_archive"; kind: ArchiveWorkKind; title: string; reason: string };
+  | { type: "inner_thought"; reason: string };
 
 export type AutonomyCheckName =
   | "world_observation"
   | "memory_reflection"
   | "archive_writing"
+  | "inner_voice"
   | "group_proactive";
 
 export type AutonomyCheckStatus =
@@ -266,13 +272,15 @@ export type AutonomyDeps = {
   config: AutonomyConfig;
   getState: () => AutonomyLoopState;
   saveState: () => Promise<void>;
-  observeWorld: (request: AutonomyWorldObservationRequest) => Promise<ProactiveWorldObservation | null>;
-  reflectMemory: (request: AutonomyMemoryReflectionRequest) => Promise<AutonomyMemoryWriteRequest | null>;
-  writeMemory: (request: AutonomyMemoryWriteRequest) => Promise<void>;
-  composeArchive: (request: AutonomyArchiveComposeRequest) => Promise<AutonomyArchiveWriteRequest | null>;
-  writeArchive: (request: AutonomyArchiveWriteRequest) => Promise<void>;
+  /**
+   * 冒一个念头，然后让她自己去处理它。
+   *
+   * 这是这个循环现在唯一会发起的动作。以前它问模型「要不要做 A/B/C/D」、拿到答案再由引擎
+   * 去执行那一个；记忆、写作、看世界现在都是她手边的子工具，所以这里不必再替她选——把念头
+   * 递过去就够了，做什么、做不做是她自己那一轮的事。
+   */
+  emitInnerThought: () => Promise<void>;
   runGroupProactiveAction: () => Promise<ProactiveTickResult>;
-  requestJudgment: (request: AutonomyJudgmentRequest) => Promise<AutonomyJudgmentDecision>;
   /**
    * 上次群里有动静的时刻（本次启动以来）。喂给触发门控判断她闲不闲——她正跟人说着话的
    * 时候，不该被这个循环拉去想自己的事。0 表示启动以来一直没动静，按闲处理。
@@ -535,64 +543,15 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
   const state = deps.getState();
   rollAutonomyDaily(state, now);
 
-  // Eligibility is computed for all three timed candidates up front, every
-  // tick -- unlike the old cascade, a later candidate's Due() is no longer
-  // skipped just because an earlier one already "won". Nothing here executes
-  // anything yet; these are the ONLY facts the interval/retry gates ever
-  // produce, and the judgment call below can only pick from what's eligible.
-  const worldEligible = worldObservationDue(cfg, state, now);
-  const memoryEligible = memoryReflectionDue(cfg, state, now);
-  const archiveEligible = archiveWritingDue(cfg, state, now);
-
-  // Ineligible candidates get their real trace entry now -- nothing changes
-  // it between here and the end of the tick, since only the judge's pick
-  // (if any) ever runs.
-  const worldNotDueCheck = worldEligible ? null : worldObservationCheckWhenNotDue(cfg, state, now);
-  const memoryNotDueCheck = memoryEligible ? null : scheduledCheckWhenNotDue({
-    name: "memory_reflection",
-    enabled: cfg.memoryReflectionEnabled,
-    disabledReason: "记忆反思已关闭",
-    lastCompletedAt: state.lastMemoryReflectionAt,
-    intervalMs: cfg.memoryReflectionIntervalMs,
-    lastAttemptAt: state.lastMemoryReflectionAttemptAt,
-    retryMs: cfg.memoryReflectionRetryMs,
-    now,
-  });
-  const archiveNotDueCheck = archiveEligible ? null : archiveWritingCheckWhenNotDue(cfg, state, now);
-
-  // requestJudgment's own implementation (requestAutonomyJudgment in main.ts)
-  // already catches its own LLM/parse failures and resolves to a do_nothing
-  // decision -- this second, thinner guard is only for a bug in that contract
-  // itself (a dep implementation that throws instead of resolving). Either
-  // way, one bad tick degrades to do_nothing instead of propagating up to
-  // dispatchAutonomyTickDue's catch as a full tick failure.
-  // 什么都做不了的那一轮，不必花钱问模型该做什么。
+  // 这里曾经算三个定时候选的资格（间隔到没到、重试窗过没过、今天够没够），再据此决定要不要
+  // 花那次判断调用。那套东西没有消费者了：观察世界、写记忆、写作品都成了她手边的子工具，
+  // 什么时候用是她自己那一轮的判断，这个循环不再替她排班。
   //
-  // autonomy 每分钟醒一次，判断调用一天九百多次、每次七百来 token，而且短到够不着最小
-  // 可缓存长度——一个 token 的缓存都吃不上，那七百 token 每次都按未缓存全价重付。绝大
-  // 多数轮次三个定时候选都没到期、主动发言也在冷却里，那一轮无论模型答什么都只能落到
-  // do_nothing，这次调用纯属白花。
+  // 留着它反而是错的。归档写作还在重试间隔里，跟她此刻该不该冒个念头毫无关系——照旧短路的
+  // 话，她会因为一件她根本没打算做的事而被按住不动。节奏现在只由下面那道门控管。
   //
-  // 世界观察取消固定间隔（2026-09-15）之后几乎每轮都可选，这个短路只剩它关着、或者抓取失败在等
-  // 重试的时候才省得下来，判断调用基本回到每分钟一次。这是让 Holly 随时能起兴去看看的代价。
-  //
-  // 短路条件取得保守：只要还有任何一条线可能动，就照常问模型。尤其是主动发言，它的资格
-  // 由 proactive 那边的规则闸说了算（包括「有观察窗待结算」这种必须跑一趟的情况），所以
-  // 这里问的是 hasProactiveWork 而不是自己另写一套判断。判断权本身没有被拿走：模型仍然
-  // 是在「可做的事情」之间选，只是没有可选项时不再走一趟。
-  if (!worldEligible && !memoryEligible && !archiveEligible && !deps.hasProactiveWork()) {
-    return {
-      action: { type: "do_nothing", reason: "无候选到期，跳过判断调用" },
-      // 三个定时候选各自报自己真实的「为什么没到期」，主动发言报规则闸没过。都不写成
-      // 「模型本轮选择优先做别的」——模型这一轮压根没被问，那样写会让 trace 撒谎。
-      checks: [
-        worldNotDueCheck!,
-        memoryNotDueCheck!,
-        archiveNotDueCheck!,
-        ...deferredChecks(["group_proactive"], "群聊规则闸未通过（冷场时长/冷却/限流）"),
-      ],
-    };
-  }
+  // 防跑飞也不再靠日上限：念头由门控限流（醒着时最多每 judgmentCooldownMs 一次），一轮之内
+  // 她能调几次工具由 maxRounds 封顶，两头都有界。
 
   // 判断调用连着失败到阈值之后，缓一缓再问。单次失败不到这里——它照常降级成这一轮的
   // do_nothing，下一分钟接着问。挡住的是「凭证过期了，于是每分钟报同一个错烧同一笔钱，
@@ -604,7 +563,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     // 报成 waiting 而不是 deferred：这一轮不是模型挑了别的，是压根没问成。
     return {
       action: { type: "do_nothing", reason },
-      checks: (["world_observation", "memory_reflection", "archive_writing", "group_proactive"] as const)
+      checks: (["inner_voice", "group_proactive"] as const)
         .map((name) => ({ name, status: "waiting" as const, reason, nextEligibleAt: backoffUntil })),
     };
   }
@@ -623,7 +582,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     return {
       action: { type: "do_nothing", reason: verdict.reason },
       // 报 waiting：这一轮不是她挑了别的，是压根没问。和退避那条同一个口径。
-      checks: (["world_observation", "memory_reflection", "archive_writing", "group_proactive"] as const)
+      checks: (["inner_voice", "group_proactive"] as const)
         .map((name) => ({
           name,
           status: "waiting" as const,
@@ -633,243 +592,70 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     };
   }
 
-  // 记在发出之前：这一次问出去了就算数，哪怕它抛错。失败另有连败退避管，不该让一个每次
-  // 都失败的调用绕开不应期、退回每分钟一次。
+  // 这一轮真的要动了。先记下时刻——不应期从发起算，不从结果算。
   state.lastJudgmentAt = now;
+  await deps.saveState();
 
-  let rawDecision: AutonomyJudgmentDecision;
+  // 主动开口优先。它有自己一整套规则闸（冷场时长、兴趣话题、冷却、限流、影子模式），
+  // 那是单独设计过的安全边界，不该因为这里换了形状就被绕开。有活就让它去做，这一轮到此为止。
+  if (deps.hasProactiveWork()) {
+    const groupResult = await deps.runGroupProactiveAction();
+    if (groupResult.actions.length > 0) {
+      const modes = Array.from(
+        new Set(groupResult.actions.map((groupAction: ProactiveTickResult["actions"][number]) => groupAction.mode)),
+      ).join("/");
+      return {
+        action: {
+          type: "send_group_message",
+          reason: "group proactive policy produced an action",
+          actions: groupResult.actions,
+        },
+        checks: [
+          {
+            name: "group_proactive",
+            status: "acted",
+            reason: `产生 ${groupResult.actions.length} 个主动开口动作（${modes}）`,
+            nextEligibleAt: null,
+          },
+          ...deferredChecks(["inner_voice"], "这一轮先去主动开口了"),
+        ],
+      };
+    }
+  }
+
+  // 没有别的事，就冒一个念头交给她。
+  //
+  // 这里不再问「要不要做 A/B/C/D」：记忆、写作、看世界都是她手边的子工具了，选哪个、选不选
+  // 是她自己那一轮的判断。这个循环的职责缩到只剩「什么时候该冒念头」。
   try {
-    rawDecision = await deps.requestJudgment({
-      nowIso: new Date(now).toISOString(),
-      worldObservation: {
-        eligible: worldEligible,
-        note: worldNotDueCheck?.reason ?? freshnessNote(state.lastWorldObservationAt, now),
-      },
-      worldTopics: worldEligible ? deps.worldTopicStatuses() : [],
-      memoryReflection: {
-        eligible: memoryEligible,
-        note: memoryNotDueCheck?.reason ?? freshnessNote(state.lastMemoryReflectionAt, now),
-      },
-      archiveWriting: {
-        eligible: archiveEligible,
-        note: archiveNotDueCheck?.reason ?? freshnessNote(state.lastArchiveWritingAt, now),
-      },
-      groupProactiveNote: "资格由独立的群聊规则闸判断（冷场/兴趣话题/冷却/限流），这里始终可选",
-      pendingReplyGroupCount: deps.pendingReplyGroupCount(),
-      lastActionSummary: lastAutonomyActionSummary(state, now),
-      recentActions: [...(state.recentActions ?? [])],
-    });
-    // 成功一次就把连败清零：故障修好之后立刻回到每分钟一次，不用等退避自然到期。
+    await deps.emitInnerThought();
+    // 成功一次就把连败清零：故障修好之后立刻恢复常态，不用等退避窗自然到期。
     state.judgmentFailureStreak = 0;
     state.lastJudgmentFailureAt = 0;
+    await deps.saveState();
+    return {
+      action: { type: "inner_thought", reason: "闲下来了，冒个念头" },
+      checks: [
+        { name: "inner_voice", status: "acted", reason: "冒了个念头，接下来看她自己", nextEligibleAt: null },
+        ...deferredChecks(["group_proactive"], "群聊规则闸未通过（冷场时长/冷却/限流）"),
+      ],
+    };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
     state.judgmentFailureStreak = (state.judgmentFailureStreak ?? 0) + 1;
     state.lastJudgmentFailureAt = now;
     const streak = state.judgmentFailureStreak;
-    // 连败到阈值的那一条要能从一片单次失败里跳出来：后面跟着的是十分钟停摆，不是又一次抖动。
     deps.log(
       "error",
-      "Autonomy judgment call failed",
+      "Inner voice failed",
       streak >= JUDGMENT_FAILURE_BACKOFF_THRESHOLD
-        ? `连续第 ${streak} 次失败，接下来 ${Math.round(JUDGMENT_FAILURE_BACKOFF_MS / 60_000)} 分钟不再调用：${detail}`
+        ? `连续第 ${streak} 次失败，接下来 ${Math.round(JUDGMENT_FAILURE_BACKOFF_MS / 60_000)} 分钟不再尝试：${detail}`
         : detail,
     );
-    rawDecision = { action: "do_nothing", reason: `判断调用失败：${detail}` };
-  }
-  await deps.saveState();
-
-  // Defensive: the caller is expected to build a JSON schema whose enum only
-  // contains currently-eligible candidates (plus do_nothing/group_proactive,
-  // which are always offerable), so this should be unreachable. Never trust a
-  // model response to bypass an interval gate regardless.
-  const decision: AutonomyJudgmentDecision =
-    (rawDecision.action === "world_observation" && !worldEligible)
-    || (rawDecision.action === "memory_reflection" && !memoryEligible)
-    || (rawDecision.action === "archive_writing" && !archiveEligible)
-      ? { action: "do_nothing", reason: `判断选中了未到期的项，已忽略：${rawDecision.reason}` }
-      : rawDecision;
-
-  const checks: AutonomyCheck[] = [];
-  let action: AutonomyAction;
-  let executed: AutonomyCheckName | null = null;
-
-  if (decision.action === "world_observation") {
-    executed = "world_observation";
-    // 看哪个话题由判断自己挑。没挑、或挑了配置里没有的（schema 的枚举本该挡住，换成不认枚举的服务端
-    // 就不一定），才退回轮转：配置里没有的话题既没有固定来源也没有播报群，不能去。
-    // worldEligible guarantees cfg.worldTopics.length > 0 (see
-    // worldObservationDue), so pickWorldTopic never returns null here.
-    const chosenTopic = decision.topic && cfg.worldTopics.includes(decision.topic) ? decision.topic : null;
-    const topic = chosenTopic ?? pickWorldTopic(state, cfg.worldTopics)!;
-    const reason = decision.reason || "world observation";
-    state.lastWorldObservationAttemptAt = now;
-    state.worldObservationDailyCount += 1;
-    let observation: ProactiveWorldObservation | null = null;
-    let observationError = "";
-    try {
-      observation = await deps.observeWorld({ topic, reason });
-    } catch (error) {
-      observationError = error instanceof Error ? error.message : String(error);
-      deps.log("error", "Autonomy observe_world failed", observationError);
-    }
-    if (observation) {
-      state.lastWorldObservationAt = now;
-    }
     await deps.saveState();
-
-    if (observation) {
-      deps.recordWorldObservation({
-        ts: new Date(now).toISOString(),
-        action: "observe_world",
-        topic,
-        ok: true,
-        query: observation.query,
-        urls: observation.urls,
-        page_errors: observation.pageErrors ?? [],
-        summary: observation.summary,
-      });
-    }
-    deps.log(
-      "status",
-      observation ? "Autonomy observe_world" : "Autonomy observe_world empty",
-      `topic=${topic}\nquery=${observation?.query ?? ""}\nsources=${observation?.urls.length ?? 0}`,
-    );
-    checks.push({
-      name: "world_observation",
-      status: observation ? "acted" : "no_action",
-      reason: observation
-        ? `已完成“${topic}”世界观察，获得 ${observation.urls.length} 个来源`
-        : observationError
-          ? `“${topic}”世界观察失败：${observationError}`
-          : `已检查“${topic}”，但没有获得可用内容`,
-      nextEligibleAt: null,
-    });
-    action = { type: "observe_world", topic, reason, observed: observation !== null };
-  } else if (decision.action === "memory_reflection") {
-    executed = "memory_reflection";
-    const reason = "scheduled memory reflection";
-    state.lastMemoryReflectionAttemptAt = now;
-    state.memoryReflectionDailyCount += 1;
-    let memory: AutonomyMemoryWriteRequest | null = null;
-    let reflectionError = "";
-    try {
-      memory = await deps.reflectMemory({ reason, nowIso: new Date(now).toISOString() });
-    } catch (error) {
-      reflectionError = error instanceof Error ? error.message : String(error);
-      deps.log("error", "Autonomy memory reflection failed", reflectionError);
-    }
-
-    if (memory) {
-      try {
-        await deps.writeMemory(memory);
-        state.lastMemoryReflectionAt = now;
-        rememberAutonomyAction(state, { kind: "memory_reflection", at: now, title: memory.topic });
-        await deps.saveState();
-        deps.log("status", "Autonomy write_memory", `topic=${memory.topic}\nchars=${memory.content.length}`);
-        checks.push({
-          name: "memory_reflection",
-          status: "acted",
-          reason: `完成记忆反思并写入“${memory.topic}”`,
-          nextEligibleAt: null,
-        });
-        action = { type: "write_memory", topic: memory.topic, reason: memory.reason, content: memory.content };
-      } catch (error) {
-        const writeError = error instanceof Error ? error.message : String(error);
-        deps.log("error", "Autonomy write_memory failed", writeError);
-        const noActionReason = `反思内容未能写入：${writeError}`;
-        checks.push({ name: "memory_reflection", status: "no_action", reason: noActionReason, nextEligibleAt: null });
-        await deps.saveState();
-        action = { type: "do_nothing", reason: noActionReason };
-      }
-    } else {
-      const noActionReason = reflectionError
-        ? `记忆反思失败：${reflectionError}`
-        : "模型本轮未生成需要写入的记忆";
-      checks.push({ name: "memory_reflection", status: "no_action", reason: noActionReason, nextEligibleAt: null });
-      await deps.saveState();
-      action = { type: "do_nothing", reason: noActionReason };
-    }
-  } else if (decision.action === "archive_writing") {
-    executed = "archive_writing";
-    const reason = "scheduled archive writing";
-    state.lastArchiveWritingAttemptAt = now;
-    state.archiveWritingDailyCount += 1;
-    let work: AutonomyArchiveWriteRequest | null = null;
-    let compositionError = "";
-    try {
-      work = await deps.composeArchive({ reason, nowIso: new Date(now).toISOString() });
-    } catch (error) {
-      compositionError = error instanceof Error ? error.message : String(error);
-      deps.log("error", "Autonomy archive composition failed", compositionError);
-    }
-
-    if (work) {
-      try {
-        await deps.writeArchive(work);
-        state.lastArchiveWritingAt = now;
-        rememberAutonomyAction(state, { kind: "archive_writing", at: now, title: work.title });
-        await deps.saveState();
-        deps.log("status", "Autonomy write_archive", `kind=${work.kind}\ntitle=${work.title}\nchars=${work.content.length}`);
-        checks.push({
-          name: "archive_writing",
-          status: "acted",
-          reason: `完成${work.kind === "poem" ? "诗" : "文章"}“${work.title}”`,
-          nextEligibleAt: null,
-        });
-        action = { type: "write_archive", kind: work.kind, title: work.title, reason: work.reason };
-      } catch (error) {
-        const archiveWriteError = error instanceof Error ? error.message : String(error);
-        deps.log("error", "Autonomy write_archive failed", archiveWriteError);
-        const noActionReason = `归档作品未能写入：${archiveWriteError}`;
-        checks.push({ name: "archive_writing", status: "no_action", reason: noActionReason, nextEligibleAt: null });
-        await deps.saveState();
-        action = { type: "do_nothing", reason: noActionReason };
-      }
-    } else {
-      const noActionReason = compositionError
-        ? `归档创作失败：${compositionError}`
-        : "模型本轮没有生成归档作品";
-      checks.push({ name: "archive_writing", status: "no_action", reason: noActionReason, nextEligibleAt: null });
-      await deps.saveState();
-      action = { type: "do_nothing", reason: noActionReason };
-    }
-  } else if (decision.action === "group_proactive") {
-    executed = "group_proactive";
-    const groupResult = await deps.runGroupProactiveAction();
-    if (groupResult.actions.length > 0) {
-      const modes = Array.from(new Set(groupResult.actions.map((groupAction) => groupAction.mode))).join("/");
-      checks.push({
-        name: "group_proactive",
-        status: "acted",
-        reason: `产生 ${groupResult.actions.length} 个主动开口动作（${modes}）`,
-        nextEligibleAt: null,
-      });
-      action = { type: "send_group_message", reason: "group proactive policy produced an action", actions: groupResult.actions };
-    } else {
-      const noActionReason = "没有群聊同时通过冷场、兴趣话题、冷却和限流规则";
-      checks.push({ name: "group_proactive", status: "no_action", reason: noActionReason, nextEligibleAt: null });
-      action = { type: "do_nothing", reason: noActionReason };
-    }
-  } else {
-    action = { type: "do_nothing", reason: decision.reason || "no due autonomy action" };
+    return {
+      action: { type: "do_nothing", reason: `冒念头失败：${detail}` },
+      checks: deferredChecks(["inner_voice", "group_proactive"], `冒念头失败：${detail}`),
+    };
   }
-
-  // Trace entries for the three candidates that weren't executed this tick:
-  // either they were never eligible (the real reason, computed above), or
-  // they were eligible but the judge picked something else. "deferred" no
-  // longer means "a higher-priority check preempted me" (there is no more
-  // priority order) -- it now means "the judge had this option and passed".
-  const deferredEntry = (name: AutonomyCheckName): AutonomyCheck => ({
-    name,
-    status: "deferred",
-    reason: "模型本轮选择优先做别的",
-    nextEligibleAt: null,
-  });
-  if (executed !== "world_observation") checks.push(worldNotDueCheck ?? deferredEntry("world_observation"));
-  if (executed !== "memory_reflection") checks.push(memoryNotDueCheck ?? deferredEntry("memory_reflection"));
-  if (executed !== "archive_writing") checks.push(archiveNotDueCheck ?? deferredEntry("archive_writing"));
-  if (executed !== "group_proactive") checks.push(deferredEntry("group_proactive"));
-
-  return { action, checks };
 }

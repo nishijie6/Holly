@@ -63,6 +63,7 @@ import {
 } from "./token-usage.js";
 import { describeCachePrefixDrift, StablePrefixLedger } from "./cache-prefix.js";
 import { renderMonitorPage } from "./monitor-page.js";
+import { loadPromptText, renderPromptText } from "./prompt-text.js";
 import { RouteQueue } from "./route-queue.js";
 import { AgentEventQueue, type AgentEvent } from "./agent-events.js";
 import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
@@ -4802,7 +4803,7 @@ async function sendToConversationKey(groupKey: string, message: string): Promise
 // （observe / 离线 / 只读），或发送本身失败。它和 onSent 是一对：两个都没响过，
 // 这一轮才是模型自己选择不说话。
 function buildFocusToolRunner(
-  roundConversationId: string,
+  roundConversationId: string | null,
   onSent?: (conversationId: string, message: string) => void,
   onSuppressed?: (reason: string) => void,
 ): (call: LlmToolUseBlock) => Promise<string> {
@@ -5171,6 +5172,116 @@ async function compactLedgerIfNeeded(client: LlmClient): Promise<LedgerCompactio
 // 单独开一个队列，而不是在 modelRouteQueue 上多开一条路由：焦点循环本身就跑在 modelRouteQueue 的
 // 任务里，主动发言的 submitExclusive 要等所有路由排空，在同一个实例上嵌套提交会互相等死。
 const focusLoopQueue = new RouteQueue();
+
+/** 念头的码点上限，纯安全网：只拦跑题成小作文，不替她决定说多长。 */
+const MAX_INNER_THOUGHT_CODE_POINTS = 300;
+
+/**
+ * 冒一个念头，然后让她自己去处理它。
+ *
+ * 这是 kagami 那套的形状：不问她「要不要做 A、B、C、D」再由引擎去执行，而是给她一个念头，
+ * 接下来做什么、做不做，是她在自己的轮次里拿工具决定的。
+ *
+ * 两步都在 focus 队列的同一条路由上，而且在同一个任务里：账本只有一本，念头产出时读到的
+ * 上下文，必须就是她随后动手时的那一份。
+ *
+ * 产出这一步复用焦点前缀——同一份 system、同一本账本，只在尾部追一条指令。那些 token 上一轮
+ * 刚被焦点循环写进缓存，读回来只要一成的价。以前那个每分钟一次的判断调用做不到这一点：它有
+ * 自己的 system prompt 和自己拼的上下文，短到够不着最小可缓存长度，每次全价重付。
+ */
+async function runInnerVoiceOnFocusQueue(): Promise<void> {
+  await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, async () => {
+    const thought = await requestInnerThought();
+    if (!thought) {
+      pushMonitorEntry("status", "Inner Voice Empty", "这次没冒出什么念头。");
+      return;
+    }
+    await runInnerThoughtRound(thought);
+  });
+}
+
+async function requestInnerThought(): Promise<string> {
+  const client = getActiveLlmClient();
+  if (!client) return "";
+  try {
+    const reply = await client.generateText({
+      purpose: "inner-voice",
+      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+      // 账本原样照发 + 尾部一条指令：字节相等才命中焦点那条路由的缓存。
+      messages: [
+        ...conversationLedger.snapshot(),
+        { role: "user", content: loadPromptText("inner-voice") },
+      ],
+      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+    });
+    broadcastLatestLlmUsage(client);
+    // 按码点截断，绝不劈开代理对。空回复就是「这次没什么想做的」，合法。
+    const trimmed = reply.trim();
+    const points = Array.from(trimmed);
+    return points.length <= MAX_INNER_THOUGHT_CODE_POINTS
+      ? trimmed
+      : points.slice(0, MAX_INNER_THOUGHT_CODE_POINTS).join("");
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Inner Voice Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+    return "";
+  }
+}
+
+/**
+ * 念头进账本，她自己跑一轮。
+ *
+ * 和群消息那一轮走同一条路:同一本账本、同一套工具、同一个前缀。区别只在注入内容,以及
+ * roundConversationId 传 null——这一轮不是被某个会话唤起的,焦点纪律那项检查不适用
+ * （见 qq-tools.ts 的 QqToolDeps.roundConversationId）。
+ */
+async function runInnerThoughtRound(thought: string): Promise<void> {
+  const client = getDecisionLlmClient();
+  if (!client) {
+    pushMonitorEntry("error", "Inner Thought Round Skipped", "No decision LLM client is available.");
+    return;
+  }
+
+  conversationLedger.appendUserText(renderPromptText("inner-thought-injection", { thought }));
+  const compaction = await compactLedgerIfNeeded(client);
+
+  const startedAt = Date.now();
+  const sentMessages: string[] = [];
+  try {
+    const result = await client.runToolLoop({
+      expectRebuild: compaction !== "not-needed",
+      messages: [...conversationLedger.snapshot()],
+      tools: [...FOCUS_TOOL_DEFINITIONS],
+      runTool: buildFocusToolRunner(null, (_conversationId, message) => sentMessages.push(message)),
+      purpose: "inner-thought",
+      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
+      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
+      maxRounds: focusModeConfig.maxRounds,
+      onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
+      onToolResults: (results) => conversationLedger.appendToolResults(results),
+    });
+    broadcastLatestLlmUsage(client);
+    pushMonitorEntry(
+      result.exhausted ? "error" : "status",
+      `Inner Thought Round ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
+      [
+        thought,
+        `rounds=${result.rounds} ledger=${conversationLedger.size} sent=${sentMessages.length}`,
+        result.text.slice(0, 300),
+      ].filter(Boolean).join("\n"),
+      client.model,
+    );
+  } catch (error) {
+    pushMonitorEntry(
+      "error",
+      "Inner Thought Round Failed",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+}
 
 async function forwardBatchViaFocusLoop(messages: readonly PendingModelMessage[]): Promise<void> {
   await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, () => runFocusLoopForBatch(messages));
@@ -8230,13 +8341,10 @@ function buildAutonomyDeps() {
     config: autonomyConfig,
     getState: () => store.getAutonomyState(),
     saveState: () => store.save(),
-    observeWorld: observeWorldForAutonomy,
-    reflectMemory: reflectMemoryForAutonomy,
-    writeMemory: writeMemoryForAutonomy,
-    composeArchive: composeArchiveForAutonomy,
-    writeArchive: writeArchiveForAutonomy,
+    // 这个循环现在只发起两件事：按规则闸主动开口，或者冒一个念头交给她。观察世界、写记忆、
+    // 写作品都成了她手边的子工具，什么时候用是她自己那一轮的判断。
+    emitInnerThought: runInnerVoiceOnFocusQueue,
     runGroupProactiveAction: runGroupProactiveOnModelQueue,
-    requestJudgment: requestAutonomyJudgment,
     lastFocusActivityAt: () => lastFocusActivityAt,
     worldTopicStatuses: worldTopicStatusesForJudgment,
     // 让 autonomy 在三个定时候选都没到期时能先问一句「主动发言有事做吗」，没有就整轮
@@ -8285,9 +8393,6 @@ function dispatchAutonomyTickDue(): void {
           model: "autonomy-loop",
           durationMs: Math.max(0, Date.now() - startedAt),
         });
-        if (result.action.type === "observe_world" || result.action.type === "write_memory") {
-          broadcastAutonomySidebar();
-        }
       } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         await recordMonitorThought({

@@ -81,21 +81,24 @@ test("autonomy tick thought exposes shadow proactive output", () => {
   assert.match(thought.summary, /影子模式 1/);
 });
 
-test("autonomy tick thought shows why the model chose to observe the world", () => {
+// observe_world 不再是这个循环的动作——它成了她手边的子工具，什么时候用是她自己那一轮的
+// 判断，这条记录里看不到。换成现在真会出现的那个：冒了个念头。
+test("autonomy tick thought reports a thought handed over, not an action taken", () => {
   const result: AutonomyLoopResult = {
-    action: { type: "observe_world", topic: "天文学", reason: "天文三个小时没看了", observed: true },
+    action: { type: "inner_thought", reason: "闲下来了，冒个念头" },
     checks: [{
-      name: "world_observation",
+      name: "inner_voice",
       status: "acted",
-      reason: "已完成“天文学”世界观察，获得 3 个来源",
+      reason: "冒了个念头，接下来看她自己",
       nextEligibleAt: null,
     }],
   };
 
   const thought = buildAutonomyTickThought(result, NOW);
-  assert.equal(thought.outcome, "world_observed");
-  assert.match(thought.summary, /主题为“天文学”/);
-  assert.match(thought.summary, /观察原因：天文三个小时没看了/);
+  assert.equal(thought.outcome, "inner_thought");
+  assert.match(thought.summary, /接下来做什么看她自己/);
+  // 念头原文进的是她的账本，不在这条运维记录里复述。
+  assert.match(thought.summary, /冒个念头/);
 });
 
 test("世界观察没被选中的那一行不进 Thoughts，其余明细照常列出", () => {

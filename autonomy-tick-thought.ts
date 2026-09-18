@@ -12,10 +12,13 @@ export type AutonomyTickThought = {
   finalAnswer: string;
 };
 
+// 前三个已经变成她手边的子工具，这个循环不再亲自发起它们；标签留着是因为历史记录里还有
+// 旧条目，读出来不该显示成一个裸的英文 key。
 const CHECK_LABELS: Record<AutonomyCheckName, string> = {
   world_observation: "世界观察",
   memory_reflection: "记忆反思",
   archive_writing: "归档写作",
+  inner_voice: "冒个念头",
   group_proactive: "群聊主动开口",
 };
 
@@ -85,7 +88,7 @@ export function buildAutonomyTickThought(
   tickAt = Date.now(),
 ): AutonomyTickThought {
   const action = result.action;
-  const lines = ["检查内容：世界观察、记忆反思、归档写作、群聊主动开口。"];
+  const lines = ["检查内容：群聊主动开口、冒念头。"];
   let outcome = "idle";
 
   switch (action.type) {
@@ -96,27 +99,10 @@ export function buildAutonomyTickThought(
       );
       outcome = action.reason === "autonomy disabled" ? "disabled" : "idle";
       break;
-    case "observe_world":
-      lines.push(action.observed
-        ? `本轮结果：已执行世界观察，主题为“${compact(action.topic, 160)}”。`
-        : `本轮结果：已尝试世界观察“${compact(action.topic, 160)}”，但没有获得可用内容。`);
-      // 去不去、看哪个话题现在是模型自己挑的，理由要在监控页上看得见，才看得出它挑得对不对。
-      if (action.reason) lines.push(`观察原因：${compact(action.reason, 600)}`);
-      outcome = action.observed ? "world_observed" : "world_empty";
-      break;
-    case "write_memory":
-      lines.push(
-        `本轮结果：已写入记忆“${compact(action.topic, 160)}”。`,
-        `记忆内容：${compact(action.content, 1200)}`,
-      );
-      outcome = "memory_written";
-      break;
-    case "write_archive":
-      lines.push(
-        `本轮结果：已完成${action.kind === "poem" ? "诗" : "文章"}“${compact(action.title, 160)}”。`,
-        `创作原因：${compact(action.reason, 600)}`,
-      );
-      outcome = "archive_written";
+    case "inner_thought":
+      // 念头本身进的是她的账本，不在这里复述——这条记录只说「冒了」，内容看她随后那一轮。
+      lines.push("本轮结果：冒了个念头，接下来做什么看她自己。");
+      outcome = "inner_thought";
       break;
     case "send_group_message": {
       const liveCount = action.actions.filter((item) => item.mode === "live").length;

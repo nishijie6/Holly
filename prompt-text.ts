@@ -48,3 +48,18 @@ export function loadPromptText(name: string): string {
   cache.set(name, text);
   return text;
 }
+
+/**
+ * 带占位符的 prompt：把 {{name}} 换成给定的值。
+ *
+ * 只做这一件事，不引模板引擎——目前全仓就一个占位符（念头注入里的 thought）。真需要条件和
+ * 循环的时候再说，那时候引什么都比现在猜得准。
+ *
+ * 值里出现 {{...}} 不会被再替换一轮：一次性扫过原文，替换只看模板里的占位符。她写的念头里
+ * 要是碰巧有两个花括号，不该被当成模板语法。
+ */
+export function renderPromptText(name: string, vars: Record<string, string>): string {
+  return loadPromptText(name).replace(/\{\{(\w+)\}\}/g, (whole, key: string) =>
+    Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : whole,
+  );
+}

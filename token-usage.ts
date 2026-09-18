@@ -17,6 +17,10 @@ export type LlmCallPurpose =
   | "autonomy-judgment"
   | "focus-loop"
   | "ledger-compaction"
+  // 她闲下来时冒念头，以及随后她自己动手的那一轮。两者都复用焦点前缀，所以缓存命中率
+  // 应当和 focus-loop 一个量级——掉下去就说明前缀被谁弄漂了。
+  | "inner-voice"
+  | "inner-thought"
   | "eval-script";
 
 export type TokenUsageBreakdown = {
