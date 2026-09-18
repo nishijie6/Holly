@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  RECENT_AUTONOMY_ACTION_LIMIT,
   resolveWorldObservationBroadcastGroupIds,
   runAutonomyLoop,
   worldObservationBroadcastGroupIds,
@@ -52,6 +53,7 @@ function baseState(overrides: Partial<AutonomyLoopState> = {}): AutonomyLoopStat
     lastArchiveWritingAttemptAt: 0,
     archiveWritingDailyDate: "2026-01-01",
     archiveWritingDailyCount: 0,
+    recentActions: [],
     ...overrides,
   };
 }
@@ -305,6 +307,87 @@ test("picking archive_writing runs only composeArchive+writeArchive", async () =
   assert.equal(writeCalls, 1);
   assert.equal(state.archiveWritingDailyCount, 1);
   assert.equal(state.lastArchiveWritingAt, NOW);
+});
+
+// ---------- 最近写过什么，判断层要看得见 ----------
+
+test("写成了就把题目记下来，交给下一轮判断去避开", async () => {
+  const state = baseState({ lastArchiveWritingAt: NOW - 245 * MIN });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: judgment("archive_writing"),
+    composeArchive: async () => ({ kind: "poem", title: "星尘", content: "第一行", reason: "sparked it" }),
+    writeArchive: async () => {},
+  }));
+
+  assert.deepEqual(state.recentActions, [{ kind: "archive_writing", at: NOW, title: "星尘" }]);
+});
+
+test("记忆反思写进去之后，题目同样留在最近写过的名单里", async () => {
+  const state = baseState({ lastMemoryReflectionAt: NOW - 245 * MIN });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ memoryReflectionEnabled: true }),
+    requestJudgment: judgment("memory_reflection"),
+    reflectMemory: async () => ({ topic: "关于噪音", reason: "r", content: "c" }),
+    writeMemory: async () => {},
+  }));
+
+  assert.deepEqual(state.recentActions, [{ kind: "memory_reflection", at: NOW, title: "关于噪音" }]);
+});
+
+// 写失败那次不该留下痕迹：她下一轮应该重新考虑这个题目，而不是以为自己已经写过了。
+test("写入失败的那次不算写过", async () => {
+  const state = baseState({ lastArchiveWritingAt: NOW - 245 * MIN });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: judgment("archive_writing"),
+    composeArchive: async () => ({ kind: "poem", title: "星尘", content: "第一行", reason: "sparked it" }),
+    writeArchive: async () => { throw new Error("disk full"); },
+  }));
+
+  assert.deepEqual(state.recentActions, []);
+});
+
+// 名单是给判断提示词用的，不能无限长——每分钟一次的调用，多一行就多付一行的钱。
+test("名单封顶，最早的那条被挤掉", async () => {
+  const older = Array.from({ length: RECENT_AUTONOMY_ACTION_LIMIT }, (_, index) => ({
+    kind: "archive_writing" as const,
+    at: NOW - (index + 1) * MIN,
+    title: `旧作 ${index}`,
+  }));
+  const state = baseState({ lastArchiveWritingAt: NOW - 245 * MIN, recentActions: [...older] });
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: judgment("archive_writing"),
+    composeArchive: async () => ({ kind: "poem", title: "新作", content: "第一行", reason: "sparked it" }),
+    writeArchive: async () => {},
+  }));
+
+  assert.equal(state.recentActions.length, RECENT_AUTONOMY_ACTION_LIMIT);
+  assert.equal(state.recentActions.at(-1)?.title, "新作");
+  assert.equal(state.recentActions[0].title, "旧作 1");
+});
+
+test("判断请求带上最近写过的题目", async () => {
+  const state = baseState({
+    lastArchiveWritingAt: NOW - 245 * MIN,
+    recentActions: [{ kind: "archive_writing", at: NOW - 30 * MIN, title: "星尘" }],
+  });
+  let seen: AutonomyJudgmentRequest | null = null;
+  await runAutonomyLoop(baseDeps({
+    state,
+    config: baseConfig({ archiveWritingEnabled: true }),
+    requestJudgment: async (request) => {
+      seen = request;
+      return { action: "do_nothing", reason: "不想写" };
+    },
+  }));
+
+  assert.deepEqual(seen!.recentActions, [{ kind: "archive_writing", at: NOW - 30 * MIN, title: "星尘" }]);
 });
 
 test("archive_writing with nothing composed falls back to do_nothing", async () => {

@@ -19,6 +19,14 @@ export type PendingObservation = {
   threadKey: string;
 };
 
+// 与 autonomy-engine.ts 的 AutonomyLoopState 逐字段对应：那边声明引擎要什么，这边负责
+// 存下来。两个类型靠结构对接，任何一边加了字段另一边不跟，getAutonomyState() 就赋不进去。
+export type HollyAutonomyRecentAction = {
+  kind: "memory_reflection" | "archive_writing";
+  at: number;
+  title: string;
+};
+
 export type HollyAutonomyState = {
   lastWorldObservationAt: number;
   lastWorldObservationAttemptAt: number;
@@ -33,6 +41,7 @@ export type HollyAutonomyState = {
   lastArchiveWritingAttemptAt: number;
   archiveWritingDailyDate: string;
   archiveWritingDailyCount: number;
+  recentActions: HollyAutonomyRecentAction[];
 };
 
 export type HollyLifecycleState = {
@@ -109,6 +118,7 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     lastArchiveWritingAttemptAt: 0,
     archiveWritingDailyDate: dateKey,
     archiveWritingDailyCount: 0,
+    recentActions: [],
   };
 }
 
@@ -169,7 +179,25 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
     archiveWritingDailyCount: isFiniteNumber(v.archiveWritingDailyCount)
       ? Math.max(0, Math.floor(v.archiveWritingDailyCount))
       : 0,
+    recentActions: coerceAutonomyRecentActions(v.recentActions),
   };
+}
+
+// 存档里读回最近写过的题目。这个字段是后加的，老存档里根本没有，所以缺失必须是「空数组」
+// 而不是报错——升级不该让她忘掉别的状态。坏掉的单条也只丢那一条：判断层少看见一个题目，
+// 顶多把它当成没写过，比整份 autonomy 状态回退到默认值轻得多。
+function coerceAutonomyRecentActions(value: unknown): HollyAutonomyRecentAction[] {
+  if (!Array.isArray(value)) return [];
+  const actions: HollyAutonomyRecentAction[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== "object") continue;
+    const item = raw as Record<string, unknown>;
+    const kind = item.kind === "memory_reflection" || item.kind === "archive_writing" ? item.kind : null;
+    const title = typeof item.title === "string" ? item.title.trim() : "";
+    if (!kind || !title) continue;
+    actions.push({ kind, at: isFiniteNumber(item.at) ? item.at : 0, title });
+  }
+  return actions;
 }
 
 function coerceQqMode(value: unknown): QqRuntimeMode {

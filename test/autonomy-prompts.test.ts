@@ -327,6 +327,7 @@ test("世界观察可选时，判断提示词逐个话题列出上次什么时�
     groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
     pendingReplyGroupCount: 0,
     lastActionSummary: "尚未行动过",
+    recentActions: [],
   });
 
   assert.match(prompt, /· 人工智能：52 分钟前看过，发到了群里\n/);
@@ -334,6 +335,47 @@ test("世界观察可选时，判断提示词逐个话题列出上次什么时�
   assert.match(prompt, /· 天文学：180 分钟前看过\n/);
   assert.match(prompt, /· 数学：最近没有看过的记录\n/);
   assert.match(prompt, /"topic"/);
+});
+
+test("最近写过的题目进提示词，并且说明白是让她避开", () => {
+  const nowIso = "2026-09-14T12:00:00.000Z";
+  const nowMs = Date.parse(nowIso);
+  const prompt = buildAutonomyJudgmentPrompt({
+    nowIso,
+    worldObservation: { eligible: false, note: "世界观察已关闭" },
+    worldTopics: [],
+    memoryReflection: { eligible: true, note: "距上次已 250 分钟" },
+    archiveWriting: { eligible: true, note: "距上次已 250 分钟" },
+    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
+    pendingReplyGroupCount: 0,
+    lastActionSummary: "30 分钟前：archive_writing",
+    recentActions: [
+      { kind: "archive_writing", at: nowMs - 30 * 60_000, title: "星尘" },
+      { kind: "memory_reflection", at: nowMs - 5 * 60_000, title: "关于噪音" },
+    ],
+  });
+
+  // 最新的排在最前：刚写完的那个最该避开。
+  assert.match(prompt, /· 5 分钟前｜记忆：关于噪音\n/);
+  assert.match(prompt, /· 30 分钟前｜作品：星尘\n/);
+  // 只给清单，模型会照着写；必须说明列出来是为了绕开。
+  assert.match(prompt, /是让你避开/);
+});
+
+test("没写过东西就不占提示词的地方", () => {
+  const prompt = buildAutonomyJudgmentPrompt({
+    nowIso: "2026-09-14T12:00:00.000Z",
+    worldObservation: { eligible: false, note: "世界观察已关闭" },
+    worldTopics: [],
+    memoryReflection: { eligible: true, note: "距上次已 250 分钟" },
+    archiveWriting: { eligible: true, note: "距上次已 250 分钟" },
+    groupProactiveNote: "资格由独立的群聊规则闸判断，这里始终可选",
+    pendingReplyGroupCount: 0,
+    lastActionSummary: "尚未行动过",
+    recentActions: [],
+  });
+
+  assert.doesNotMatch(prompt, /最近已经写过的/);
 });
 
 test("发不发的提示词带着话题、群里最近的聊天、冷场时长，成稿原样放在最后", () => {

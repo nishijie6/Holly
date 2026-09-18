@@ -4,7 +4,7 @@
 // for the same reason as decision-prompt.ts: one place to read and edit what
 // actually reaches the model, without hunting through main.ts's business logic.
 import { type ProactiveWorldObservation } from "./proactive-engine.js";
-import { type AutonomyJudgmentRequest, type WorldTopicStatus } from "./autonomy-engine.js";
+import { type AutonomyJudgmentRequest, type RecentAutonomyAction, type WorldTopicStatus } from "./autonomy-engine.js";
 import { type BroadcastSourceKind } from "./world-observation-freshness.js";
 
 export const WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT =
@@ -336,6 +336,35 @@ function worldTopicLines(topics: readonly WorldTopicStatus[], nowMs: number): st
   });
 }
 
+// 最近已经写过的题目。世界观察有 worldTopicLines 逐话题报近况，记忆反思和归档写作以前
+// 什么都没有——判断层看到的只是「可选」，看不见她上一轮刚写完什么，于是同一件事能连着
+// 写好几遍。
+//
+// 末尾那句「是让你避开」不是客套。只给一份清单，模型会把它当成范例照着写，去重反而变成
+// 了复读机；必须说明白列出来是为了绕开。
+function recentActionLines(
+  actions: readonly RecentAutonomyAction[] | undefined,
+  nowMs: number,
+): string[] {
+  // 类型上这是必填的，但缺了它也只该少掉几行去重提示，不该让整条提示词构建抛出去——
+  // 那一轮判断调用会整个失败，她这一分钟什么都做不了。这份清单是锦上添花，不是必需品。
+  if (!actions || actions.length === 0) return [];
+  const label: Record<RecentAutonomyAction["kind"], string> = {
+    memory_reflection: "记忆",
+    archive_writing: "作品",
+  };
+  return [
+    "最近已经写过的（这次换点别的，列在这里是让你避开，不是给你参照写法）：",
+    // 最新的写在最前面：刚写完的那个最该避开，读到第一行就看见。
+    ...[...actions].reverse().map((action) => {
+      const when = action.at > 0
+        ? `${Math.max(0, Math.round((nowMs - action.at) / 60_000))} 分钟前`
+        : "时间不详";
+      return `  · ${when}｜${label[action.kind]}：${action.title}`;
+    }),
+  ];
+}
+
 export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): string {
   return [
     "现在是自主循环的一次 tick。下面是当前可以从中选择的候选，只列出真实状态，没有对话内容。",
@@ -348,6 +377,7 @@ export function buildAutonomyJudgmentPrompt(request: AutonomyJudgmentRequest): s
     "",
     `当前有 ${request.pendingReplyGroupCount} 个群有未读消息在等待独立的回复判断——这条仅供感知，不需要你处理，不要选它作为理由去做别的事，也不要因为它而选 do_nothing。`,
     `上次行动：${request.lastActionSummary}`,
+    ...recentActionLines(request.recentActions, Date.parse(request.nowIso)),
     "",
     "从「可选」的候选里挑一个最值得现在做的，或者选 do_nothing（这一轮什么都不做也完全正常，大多数 tick 应该如此）。",
     "不可选的候选禁止选中——它们的 interval/重试窗口还没到。",

@@ -117,6 +117,27 @@ export function worldObservationBroadcastGroupIds(config: BroadcastRoutingConfig
   return [...new Set(ids.filter((id): id is string => typeof id === "string" && id.length > 0))];
 }
 
+/**
+ * 最近一次真的落到纸面上的自主动作，只记题目不记正文。
+ *
+ * 为什么只有记忆反思和归档写作：世界观察那条线已经有 worldTopicLines 逐话题报上次
+ * 看的时间和结果，主动开口由 proactive 那边自己的规则闸管着，只有这两个动作是「她挑
+ * 一个题目、写一段东西」，而判断层对写过什么一无所知——它看到的只有「archive_writing:
+ * 可选」。连着三轮写同一件事，从提示词里是看不出来的。
+ *
+ * 不记正文是有意的：判断调用每分钟一次、短到吃不上缓存，每个字都按全价重付。题目足够
+ * 回答「这个是不是刚写过」，正文只会把这次调用撑大。
+ */
+export type RecentAutonomyAction = {
+  kind: "memory_reflection" | "archive_writing";
+  at: number;
+  /** 那一次的题目：记忆的 topic、作品的 title。 */
+  title: string;
+};
+
+/** 往回看几条。够看出「最近一直在绕着同一件事打转」，又不至于让判断提示词变长。 */
+export const RECENT_AUTONOMY_ACTION_LIMIT = 6;
+
 export type AutonomyLoopState = {
   lastWorldObservationAt: number;
   lastWorldObservationAttemptAt: number;
@@ -131,6 +152,8 @@ export type AutonomyLoopState = {
   lastArchiveWritingAttemptAt: number;
   archiveWritingDailyDate: string;
   archiveWritingDailyCount: number;
+  /** 最近若干次写下的题目，最新的在最后。老存档没有这个字段，读出来是空数组。 */
+  recentActions: RecentAutonomyAction[];
 };
 
 export type AutonomyWorldObservationRequest = {
@@ -186,6 +209,8 @@ export type AutonomyJudgmentRequest = {
   groupProactiveNote: string;
   pendingReplyGroupCount: number;
   lastActionSummary: string;
+  // 最近写过的题目，给判断层用来避开刚写过的东西。空数组表示还没写过，或是老存档刚升上来。
+  recentActions: RecentAutonomyAction[];
 };
 
 export type AutonomyJudgmentDecision =
@@ -373,6 +398,21 @@ function freshnessNote(lastAt: number, now: number): string {
   return `距上次已 ${minutes} 分钟`;
 }
 
+// 就地追加并裁到上限。调用点都在「写入成功」之后——没写成的那次不算数，她下一轮该
+// 重新考虑这个题目，而不是以为自己已经写过了。
+function rememberAutonomyAction(
+  state: AutonomyLoopState,
+  entry: RecentAutonomyAction,
+): void {
+  const title = entry.title.trim();
+  if (!title) return;
+  const list = state.recentActions ?? (state.recentActions = []);
+  list.push({ ...entry, title });
+  if (list.length > RECENT_AUTONOMY_ACTION_LIMIT) {
+    list.splice(0, list.length - RECENT_AUTONOMY_ACTION_LIMIT);
+  }
+}
+
 function lastAutonomyActionSummary(state: AutonomyLoopState, now: number): string {
   const candidates: Array<{ at: number; label: string }> = [
     { at: state.lastWorldObservationAt, label: "world_observation" },
@@ -489,6 +529,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       groupProactiveNote: "资格由独立的群聊规则闸判断（冷场/兴趣话题/冷却/限流），这里始终可选",
       pendingReplyGroupCount: deps.pendingReplyGroupCount(),
       lastActionSummary: lastAutonomyActionSummary(state, now),
+      recentActions: [...(state.recentActions ?? [])],
     });
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -581,6 +622,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       try {
         await deps.writeMemory(memory);
         state.lastMemoryReflectionAt = now;
+        rememberAutonomyAction(state, { kind: "memory_reflection", at: now, title: memory.topic });
         await deps.saveState();
         deps.log("status", "Autonomy write_memory", `topic=${memory.topic}\nchars=${memory.content.length}`);
         checks.push({
@@ -624,6 +666,7 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
       try {
         await deps.writeArchive(work);
         state.lastArchiveWritingAt = now;
+        rememberAutonomyAction(state, { kind: "archive_writing", at: now, title: work.title });
         await deps.saveState();
         deps.log("status", "Autonomy write_archive", `kind=${work.kind}\ntitle=${work.title}\nchars=${work.content.length}`);
         checks.push({

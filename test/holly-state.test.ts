@@ -95,6 +95,68 @@ test("autonomy state: persists world observation cadence", async () => {
   await rm(path, { force: true });
 });
 
+test("autonomy state: 最近写过的题目存得住、读得回", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  store.getAutonomyState().recentActions.push(
+    { kind: "archive_writing", at: 1100, title: "星尘" },
+    { kind: "memory_reflection", at: 1200, title: "关于噪音" },
+  );
+  await store.save();
+
+  const reloaded = await HollyStateStore.load(path, TTL);
+  assert.deepEqual(reloaded.getAutonomyState().recentActions, [
+    { kind: "archive_writing", at: 1100, title: "星尘" },
+    { kind: "memory_reflection", at: 1200, title: "关于噪音" },
+  ]);
+  await rm(path, { force: true });
+});
+
+// 这个字段是后加的。升级时老存档里根本没有它，缺失必须平滑退成空数组——不能因为读不到
+// 就把整份 autonomy 状态退回默认值，那样她会连今天写过几次都忘掉。
+test("autonomy state: 老存档没有这个字段，升上来是空数组，别的状态原样保留", async () => {
+  const path = tmpPath();
+  await writeFile(
+    path,
+    JSON.stringify({ autonomy: { lastArchiveWritingAt: 1100, archiveWritingDailyCount: 2 } }),
+    "utf-8",
+  );
+
+  const store = await HollyStateStore.load(path, TTL);
+  const autonomy = store.getAutonomyState();
+  assert.deepEqual(autonomy.recentActions, []);
+  assert.equal(autonomy.lastArchiveWritingAt, 1100);
+  assert.equal(autonomy.archiveWritingDailyCount, 2);
+  await rm(path, { force: true });
+});
+
+// 坏掉的单条只丢那一条：判断层顶多把它当成没写过，比整份状态回退轻得多。
+test("autonomy state: 名单里坏掉的条目被丢掉，好的留下", async () => {
+  const path = tmpPath();
+  await writeFile(
+    path,
+    JSON.stringify({
+      autonomy: {
+        recentActions: [
+          { kind: "archive_writing", at: 1100, title: "星尘" },
+          { kind: "不认识的动作", at: 1150, title: "谁" },
+          { kind: "memory_reflection", at: 1200, title: "   " },
+          { kind: "memory_reflection", title: "没有时间戳" },
+          "整条不是对象",
+        ],
+      },
+    }),
+    "utf-8",
+  );
+
+  const store = await HollyStateStore.load(path, TTL);
+  assert.deepEqual(store.getAutonomyState().recentActions, [
+    { kind: "archive_writing", at: 1100, title: "星尘" },
+    { kind: "memory_reflection", at: 0, title: "没有时间戳" },
+  ]);
+  await rm(path, { force: true });
+});
+
 test("lifecycle state: persists boot thought and QQ mode decision", async () => {
   const path = tmpPath();
   const store = await HollyStateStore.load(path, TTL);
