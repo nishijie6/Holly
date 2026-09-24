@@ -5245,7 +5245,9 @@ async function requestInnerThought(client: LlmClient, expectRebuild: boolean): P
     expectRebuild,
     messages: [
       ...conversationLedger.snapshot(),
-      { role: "user", content: loadPromptText("inner-voice") },
+      // 念头这一路没有群消息带进来的 current_time：账本里最后一个时间可能是昨晚的，不告诉她
+      // 现在几点，第二天早上她还会接着说「睡了、明天」。
+      { role: "user", content: renderPromptText("inner-voice", { now: formatLocalDateTimeForModel() }) },
     ],
     tools: [...FOCUS_TOOL_DEFINITIONS],
     runTool: async () => INNER_VOICE_TOOL_REFUSAL,
@@ -5277,7 +5279,15 @@ async function requestInnerThought(client: LlmClient, expectRebuild: boolean): P
  * 这一轮的尾部换成了念头注入，前缀必然在那个位置岔开。这是预期内的，不是漂移。
  */
 async function runInnerThoughtRound(client: LlmClient, thought: string): Promise<void> {
-  conversationLedger.appendUserText(renderPromptText("inner-thought-injection", { thought }));
+  // 末行的本轮元数据和群消息注入同一个格式（focus-prompt.ts 的 renderRoundMetadata）：时间让她
+  // 知道现在几点；当前打开就是这一轮 send_message 的去向——压缩摘要约定不记它，靠每轮重新写明，
+  // 念头这一轮以前偏偏没写。它也让账本压缩能凭首尾两行认出这一条（见 quoteRoundStart）。
+  const openConversationId = focusConversationId();
+  conversationLedger.appendUserText(renderPromptText("inner-thought-injection", {
+    thought,
+    now: formatLocalDateTimeForModel(),
+    open: openConversationId ? formatConversationKey(openConversationId) : "无",
+  }));
 
   const startedAt = Date.now();
   // 本轮真正进了群的话；以及她伸手发了、话却没进群的理由。两个都空，这一轮才是她自己选择
