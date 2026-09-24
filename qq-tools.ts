@@ -65,10 +65,11 @@ export type QqToolDeps = {
    */
   readPage: (url: string) => Promise<{ ok: boolean; text: string }>;
   /**
-   * 读她自己的源码。path 是仓库里的相对路径，空字符串表示仓库根目录；白名单、拒绝清单和
-   * 长度上限都在 source-reader.ts，这里只管把路径递过去。
+   * 读她自己的源码。path 是仓库里的相对路径，空字符串表示仓库根目录；offset 是从第几个字符
+   * 读起，用来翻长文件的后半截。白名单、拒绝清单和单次长度上限都在 source-reader.ts，这里
+   * 只管把参数递过去。
    */
-  readSource: (path: string) => Promise<{ ok: boolean; text: string }>;
+  readSource: (path: string, offset: number) => Promise<{ ok: boolean; text: string }>;
 };
 
 /**
@@ -150,6 +151,16 @@ function ok(payload: Record<string, unknown>): string {
 // retrying the same broken call until the round ceiling cuts it off.
 function refuse(error: string, note: string): string {
   return JSON.stringify({ ok: false, error, note });
+}
+
+// offset 这里破例认字符串数字。这个 runner 别处的规矩是「typeof 不对就当没传」，因为壳去掉
+// 子工具 schema 之后，多给一个参数最多是被忽略，代价很小。offset 不一样：被忽略的后果是她
+// 又拿到一遍文件开头，白花一轮不说，那 8000 个字符还要第二次永久钉进上下文。模型把数字写成
+// "8000" 太常见，不值得为了一致性收这笔钱。填了看不懂的东西则归 0，交给 source-reader.ts
+// 去判断从头读还不还得通。
+function readOffset(raw: unknown): number {
+  const value = typeof raw === "number" ? raw : typeof raw === "string" ? Number(raw.trim()) : 0;
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
 }
 
 /**
@@ -357,7 +368,7 @@ function createQqToolRunner(
       // 读自己的源码不吆喝：它是本地读文件，快得没人会干等，说一句「我看看代码」反而多余。
       case "read_source": {
         const path = typeof call.input.path === "string" ? call.input.path.trim() : "";
-        const source = await deps.readSource(path);
+        const source = await deps.readSource(path, readOffset(call.input.offset));
         if (!source.ok) {
           return refuse("读不了这个路径", source.text);
         }

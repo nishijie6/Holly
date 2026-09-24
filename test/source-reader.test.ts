@@ -58,10 +58,47 @@ test("路径判断不碰磁盘，单独也站得住", () => {
   assert.equal(classifySourcePath("/etc/passwd").ok, false);
 });
 
-test("太长的文件只给开头一截，免得整份搬进上下文", async () => {
+test("太长的文件一次只给一段，免得整份搬进上下文", async () => {
   const result = await readSourceEntry(ROOT, "main.ts");
   assert.equal(result.ok, true);
   if (!result.ok) return;
-  assert.match(result.text, /只给了前/);
   assert.ok(result.text.length < 9000, "截断之后不该还是整份文件");
+  // 截断处必须把下一个 offset 算好给她。她不会去猜，而猜错一次的代价是白读一段重复的正文，
+  // 且那段重复永远留在上下文里。
+  assert.match(result.text, /接着读用 offset=8000/);
+});
+
+test("offset 翻到文件后面去，而不是每次都从头读", async () => {
+  const head = await readSourceEntry(ROOT, "main.ts");
+  const next = await readSourceEntry(ROOT, "main.ts", 8000);
+  assert.equal(head.ok, true);
+  assert.equal(next.ok, true);
+  if (!head.ok || !next.ok) return;
+  assert.notEqual(head.text, next.text);
+  // 从中间截出来的文本看上去跟文件开头没有区别，所以这一段得自报是哪一段。
+  assert.match(next.text, /第 8001–16000 个字符/);
+  assert.match(next.text, /接着读用 offset=16000/);
+});
+
+test("offset 越过结尾要明说：给一段空文本等于告诉她这里就是结尾", async () => {
+  const result = await readSourceEntry(ROOT, "source-reader.ts", 10_000_000);
+  assert.equal(result.ok, false);
+  if (result.ok) return;
+  assert.match(result.reason, /越过结尾/);
+});
+
+test("坏 offset 当从头读，不为难她重来一轮", async () => {
+  for (const offset of [-5, Number.NaN, 3.7]) {
+    const result = await readSourceEntry(ROOT, "qq-tools.ts", offset);
+    assert.equal(result.ok, true, `offset=${offset} 该退回从头读而不是报错`);
+  }
+});
+
+test("目录不认 offset：清单本来就是完整的，没有「后面还有」这回事", async () => {
+  const first = await readSourceEntry(ROOT, "test");
+  const withOffset = await readSourceEntry(ROOT, "test", 5000);
+  assert.equal(first.ok, true);
+  assert.equal(withOffset.ok, true);
+  if (!first.ok || !withOffset.ok) return;
+  assert.equal(first.text, withOffset.text);
 });

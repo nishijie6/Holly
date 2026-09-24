@@ -20,7 +20,7 @@ function harness(overrides: Partial<FocusToolDeps> = {}) {
   const sent: Array<{ id: string; message: string }> = [];
   const searched: string[] = [];
   const read: string[] = [];
-  const sourceReads: string[] = [];
+  const sourceReads: Array<{ path: string; offset: number }> = [];
   const shares: WorldObservationShare[] = [];
   const deps: FocusToolDeps = {
     listConversations: async () => CONVERSATIONS,
@@ -38,8 +38,8 @@ function harness(overrides: Partial<FocusToolDeps> = {}) {
       read.push(url);
       return { ok: true, text: `[网页正文] ${url}` };
     },
-    readSource: async (path) => {
-      sourceReads.push(path);
+    readSource: async (path, offset) => {
+      sourceReads.push({ path, offset });
       return { ok: true, text: `[源码] ${path || "."}` };
     },
     writeMemory: async () => {},
@@ -484,7 +484,7 @@ test("read_source 把路径原样递给实现方,正文交回模型", async () =
   const result = await call("read_source", { path: "qq-tools.ts" });
   assert.equal(result.ok, true);
   assert.match(result.content, /qq-tools\.ts/);
-  assert.deepEqual(sourceReads, ["qq-tools.ts"]);
+  assert.deepEqual(sourceReads, [{ path: "qq-tools.ts", offset: 0 }]);
   // 本地读文件是毫秒级的，没人会干等，所以这个工具不吆喝那一句。
   assert.deepEqual(sent, []);
 });
@@ -493,7 +493,19 @@ test("空 path 照样递过去——那是「列出仓库根目录」,不是漏�
   const { call, sourceReads } = harness();
   const result = await call("read_source", { path: "" });
   assert.equal(result.ok, true);
-  assert.deepEqual(sourceReads, [""]);
+  assert.deepEqual(sourceReads, [{ path: "", offset: 0 }]);
+});
+
+// offset 认字符串数字是有意破的例：别处「typeof 不对就当没传」代价很小，这里被忽略却意味着
+// 她又拿到一遍文件开头——白花一轮，那一段还要第二次永久留在上下文里。
+test("offset 递下去,写成字符串也认,看不懂的当从头读", async () => {
+  const { call, sourceReads } = harness();
+  await call("read_source", { path: "main.ts", offset: 8000 });
+  await call("read_source", { path: "main.ts", offset: "16000" });
+  await call("read_source", { path: "main.ts", offset: "从头" });
+  await call("read_source", { path: "main.ts", offset: -3 });
+  await call("read_source", { path: "main.ts" });
+  assert.deepEqual(sourceReads.map((r) => r.offset), [8000, 16000, 0, 0, 0]);
 });
 
 test("读不了的路径,原因原样交回模型", async () => {

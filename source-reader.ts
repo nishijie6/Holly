@@ -8,8 +8,14 @@ import { extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 // 是白名单而不是黑名单：只认源码和文档那几种扩展名，只在仓库根以内，点开头的一律不给。
 // config.yaml 也不给——它有 access_token 字段，现在是空的，以后未必。
 //
-// 读到的内容会进 ledger 并永久留在上下文里，所以单个文件有字符上限：她该读的是某一处究竟怎么
+// 读到的内容会进 ledger 并永久留在上下文里，所以单次读有字符上限：她该读的是某一处究竟怎么
 // 写的，不是把整份 main.ts 搬进脑子。
+//
+// 但这个上限管的是「一次给多少」，不该等于「总共能看到多少」。main.ts 有三十多万字符，只给
+// 开头那一截，等于这个工具对她最想弄明白的那个文件形同不存在。所以读文件带一个字符偏移量，
+// 截断处顺带告诉她文件多长、这次给的是哪一段、接着读该填什么 offset——她于是能带着问题往后
+// 翻，而每一轮注入的量还是那个上限。代价照旧由上下文承担：翻一段就多占一段，永远不会退回去，
+// 所以 prompts/qq-tools-help.md 里让她带着要找的东西翻，而不是从头翻到尾。
 
 export type SourceReadResult =
   | { ok: true; kind: "file" | "directory"; path: string; text: string }
@@ -30,6 +36,9 @@ const DENIED_DIRECTORIES = new Set([
 
 const DENIED_FILES = new Set(["config.yaml", "package-lock.json"]);
 
+// 一次最多给多少字符。按 context-budget.ts 的估算口径，8000 字符的源码约合 2800–4000
+// token，调大就是让她每读一次多占这么多永久上下文；调小则同一个文件要多翻几轮，每轮都得
+// 再过一遍工具调用。有了 offset 之后这个数只决定单次粒度，不再是她能看到的全部。
 const MAX_FILE_CHARS = 8000;
 const MAX_DIRECTORY_ENTRIES = 200;
 
@@ -71,11 +80,20 @@ function renderDirectory(relativePath: string, names: readonly string[]): string
   ].join("\n");
 }
 
-export async function readSourceEntry(root: string, rawPath: string): Promise<SourceReadResult> {
+export async function readSourceEntry(
+  root: string,
+  rawPath: string,
+  offset = 0,
+): Promise<SourceReadResult> {
   const classified = classifySourcePath(rawPath);
   if (!classified.ok) {
     return { ok: false, reason: classified.reason };
   }
+
+  // offset 填坏了（负数、小数、NaN）就当从头读：打回去只会让她再猜一轮，而从头读至少是
+  // 个有意义的结果。真正要打回的只有「已经越过文件结尾」，见下面——那种情况给一段空文本，
+  // 等于骗她说文件到此为止。
+  const start = Number.isFinite(offset) ? Math.max(0, Math.floor(offset)) : 0;
 
   // 走 realpath 再比一次：白名单挡的是路径长相，符号链接挡的是它真正指向哪里。
   const rootReal = await realpath(root).catch(() => resolve(root));
@@ -94,6 +112,9 @@ export async function readSourceEntry(root: string, rawPath: string): Promise<So
   }
 
   const info = await stat(targetReal);
+  // 目录不认 offset：清单在 MAX_DIRECTORY_ENTRIES 之内本来就是完整的，没有「后面还有」
+  // 这回事，而 offset 是字符偏移，对条目列表也切不出有意义的第二页。带着上一次的 offset
+  // 来列目录因此不算错，安静地当 0 处理就好。
   if (info.isDirectory()) {
     const entries = await readdir(targetReal, { withFileTypes: true });
     const names = entries
@@ -123,13 +144,27 @@ export async function readSourceEntry(root: string, rawPath: string): Promise<So
   }
 
   const raw = await readFile(targetReal, "utf-8");
-  const clipped = raw.length > MAX_FILE_CHARS
-    ? `${raw.slice(0, MAX_FILE_CHARS)}\n……（这个文件太长，只给了前 ${MAX_FILE_CHARS} 个字符）`
-    : raw;
+  if (start > 0 && start >= raw.length) {
+    return {
+      ok: false,
+      reason: `${classified.relativePath} 一共只有 ${raw.length} 个字符，offset=${start} 已经越过结尾了。`,
+    };
+  }
+
+  const end = Math.min(raw.length, start + MAX_FILE_CHARS);
+  // 头一行标明这是哪一段，是因为从中间截出来的文本看上去跟文件开头一模一样；整份都给得下
+  // 的时候不标，免得给每个短文件都加一句废话。末尾那句是翻页的唯一入口——她不会去猜下一个
+  // offset，得有人把它算好递过去。
+  const span = start === 0 && end === raw.length
+    ? ""
+    : `（第 ${start + 1}–${end} 个字符，共 ${raw.length}）`;
+  const more = end < raw.length
+    ? `\n……（后面还有 ${raw.length - end} 个字符，接着读用 offset=${end}）`
+    : "";
   return {
     ok: true,
     kind: "file",
     path: classified.relativePath,
-    text: `[源码] ${classified.relativePath}\n${clipped}`,
+    text: `[源码] ${classified.relativePath}${span}\n${raw.slice(start, end)}${more}`,
   };
 }
