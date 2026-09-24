@@ -102,7 +102,7 @@ import {
   type AutonomyMemoryWriteRequest,
   type AutonomyWorldObservationRequest,
 } from "./autonomy-engine.js";
-import { buildAutonomyTickThought } from "./autonomy-tick-thought.js";
+import { buildAutonomyTickThought, createAutonomyTickThoughtGate } from "./autonomy-tick-thought.js";
 import {
   buildFallbackBroadcastItem,
   containsChineseText,
@@ -8197,6 +8197,10 @@ function scheduleAutonomyTick(): void {
 // 在同一实例，submitExclusive 会等待自己尚未完成的队尾而自锁；完整理由见
 // autonomyTickQueue 的声明。"tick" 路由仍提供原 autonomyQueue 的保证：第 i+1 轮
 // 必须等第 i 轮彻底结束后才开始。
+// 被门挡住的 tick 只在原因变了的时候记一条，理由见 createAutonomyTickThoughtGate。整个进程共用
+// 这一个：它记的是「上一条记下的挡门原因」，分成多个就各记各的，重复又回来了。
+const shouldRecordAutonomyTickThought = createAutonomyTickThoughtGate();
+
 async function runAutonomyTick(): Promise<void> {
   const deps = buildAutonomyDeps();
   if (!deps) return;
@@ -8206,6 +8210,7 @@ async function runAutonomyTick(): Promise<void> {
       try {
         const result = await runAutonomyLoop(deps);
         const thought = buildAutonomyTickThought(result, startedAt);
+        if (!shouldRecordAutonomyTickThought(thought)) return;
         await recordMonitorThought({
           kind: "autonomy",
           title: "每分钟自主检查",
