@@ -317,3 +317,32 @@ test("lifecycle state: a state file written before focus existed loads with no f
   assert.equal(lifecycle.currentConversationOpenedAt, 0);
   await rm(path, { force: true });
 });
+
+// 转发计数是后加的字段：老存档里没有，读上来从 0 记起，别的状态照旧；记过的数存得住，跨天清零。
+test("autonomy state: 转发计数老存档缺了从 0 起，存得住，跨天清零", async () => {
+  const path = tmpPath();
+  await writeFile(
+    path,
+    JSON.stringify({ autonomy: { lastWorldObservationAt: 123, worldObservationDailyCount: 2 } }),
+    "utf-8",
+  );
+
+  const store = await HollyStateStore.load(path, TTL);
+  const autonomy = store.getAutonomyState();
+  assert.equal(autonomy.lastWorldObservationShareAt, 0);
+  assert.equal(autonomy.worldObservationShareDailyCount, 0);
+  assert.equal(autonomy.lastWorldObservationAt, 123);
+
+  autonomy.lastWorldObservationShareAt = 456;
+  autonomy.worldObservationShareDailyCount = 3;
+  await store.save();
+  const reloaded = await HollyStateStore.load(path, TTL);
+  assert.equal(reloaded.getAutonomyState().lastWorldObservationShareAt, 456);
+  assert.equal(reloaded.getAutonomyState().worldObservationShareDailyCount, 3);
+
+  reloaded.getAutonomyState().worldObservationShareDailyDate = "2000-01-01";
+  reloaded.rollDaily(Date.now());
+  assert.equal(reloaded.getAutonomyState().worldObservationShareDailyCount, 0);
+  assert.equal(reloaded.getAutonomyState().worldObservationShareDailyDate, localDateKey(new Date()));
+  await rm(path, { force: true });
+});

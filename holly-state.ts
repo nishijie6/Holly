@@ -41,6 +41,9 @@ export type HollyAutonomyState = {
   lastArchiveWritingAttemptAt: number;
   archiveWritingDailyDate: string;
   archiveWritingDailyCount: number;
+  lastWorldObservationShareAt: number;
+  worldObservationShareDailyDate: string;
+  worldObservationShareDailyCount: number;
   recentActions: HollyAutonomyRecentAction[];
   lastJudgmentAt: number;
   judgmentFailureStreak: number;
@@ -121,6 +124,9 @@ function freshAutonomyState(dateKey: string): HollyAutonomyState {
     lastArchiveWritingAttemptAt: 0,
     archiveWritingDailyDate: dateKey,
     archiveWritingDailyCount: 0,
+    lastWorldObservationShareAt: 0,
+    worldObservationShareDailyDate: dateKey,
+    worldObservationShareDailyCount: 0,
     recentActions: [],
     lastJudgmentAt: 0,
     judgmentFailureStreak: 0,
@@ -184,6 +190,13 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
       typeof v.archiveWritingDailyDate === "string" ? v.archiveWritingDailyDate : dateKey,
     archiveWritingDailyCount: isFiniteNumber(v.archiveWritingDailyCount)
       ? Math.max(0, Math.floor(v.archiveWritingDailyCount))
+      : 0,
+    // 转发计数是后加的，老存档里没有：缺了就从 0 记起，别的状态照旧。
+    lastWorldObservationShareAt: isFiniteNumber(v.lastWorldObservationShareAt) ? v.lastWorldObservationShareAt : 0,
+    worldObservationShareDailyDate:
+      typeof v.worldObservationShareDailyDate === "string" ? v.worldObservationShareDailyDate : dateKey,
+    worldObservationShareDailyCount: isFiniteNumber(v.worldObservationShareDailyCount)
+      ? Math.max(0, Math.floor(v.worldObservationShareDailyCount))
       : 0,
     recentActions: coerceAutonomyRecentActions(v.recentActions),
     // 不应期跨重启保留：反复重启不该变成绕开不应期、退回每分钟问一次的后门。
@@ -340,6 +353,10 @@ export class HollyStateStore {
     if (this.data.autonomy.archiveWritingDailyDate !== today) {
       this.data.autonomy.archiveWritingDailyDate = today;
       this.data.autonomy.archiveWritingDailyCount = 0;
+    }
+    if (this.data.autonomy.worldObservationShareDailyDate !== today) {
+      this.data.autonomy.worldObservationShareDailyDate = today;
+      this.data.autonomy.worldObservationShareDailyCount = 0;
     }
     for (const g of Object.values(this.data.groups)) {
       if (g.dailyDate !== today) {

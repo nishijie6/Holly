@@ -179,6 +179,13 @@ export type AutonomyLoopState = {
   lastArchiveWritingAttemptAt: number;
   archiveWritingDailyDate: string;
   archiveWritingDailyCount: number;
+  /**
+   * 她看过或读过东西之后，自己用 send_message 说给别人听的次数（记账见 qq-tools 的
+   * createFocusToolRunner）。只给监控看，不设闸。
+   */
+  lastWorldObservationShareAt: number;
+  worldObservationShareDailyDate: string;
+  worldObservationShareDailyCount: number;
   /** 最近若干次写下的题目，最新的在最后。老存档没有这个字段，读出来是空数组。 */
   recentActions: RecentAutonomyAction[];
   /** 上次真正发出判断调用的时刻，喂给触发门控算不应期。 */
@@ -268,6 +275,10 @@ export function rollAutonomyDaily(state: AutonomyLoopState, now: number): void {
   if (state.archiveWritingDailyDate !== today) {
     state.archiveWritingDailyDate = today;
     state.archiveWritingDailyCount = 0;
+  }
+  if (state.worldObservationShareDailyDate !== today) {
+    state.worldObservationShareDailyDate = today;
+    state.worldObservationShareDailyCount = 0;
   }
 }
 

@@ -1385,7 +1385,7 @@ export function renderMonitorPage(wsTargetUrl: string): string {
           <div class="reflect-stat llm">
             <span class="reflect-stat-label">World today</span>
             <b>{{ autonomySidebar.worldObservationDailyCount }}</b>
-            <small>last {{ autonomySidebar.lastWorldObservationAtIso ? fmtTime(autonomySidebar.lastWorldObservationAtIso) : '-' }}</small>
+            <small>last {{ autonomySidebar.lastWorldObservationAtIso ? fmtTime(autonomySidebar.lastWorldObservationAtIso) : '-' }} &middot; shared {{ autonomySidebar.worldObservationShareDailyCount || 0 }}</small>
           </div>
           <div class="reflect-stat signal">
             <span class="reflect-stat-label">Stored here</span>

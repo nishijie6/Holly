@@ -153,6 +153,26 @@ function refuse(error: string, note: string): string {
 }
 
 /**
+ * 这一轮她从外面带回来的一样东西：看过的话题、读过的页面。ref 是话题名或 URL。
+ */
+export type WorldShareSource = { kind: "observe_world" | "read_page"; ref: string };
+
+/** 她带回来东西之后，又用 send_message 说给了某个会话。只用来记账，见 createFocusToolRunner。 */
+export type WorldObservationShare = {
+  conversationId: string;
+  message: string;
+  sources: WorldShareSource[];
+};
+
+export type FocusToolDeps = QqToolDeps & SelfToolDeps & {
+  /**
+   * 这一轮带回来的东西被说给了某个会话。不设闸、不改变发送结果——消息此刻已经进群了，
+   * 这里只是让监控能数到。实现方不该抛错；真抛了也会被吞掉，见下面的说明。
+   */
+  onWorldObservationShared?: (share: WorldObservationShare) => void;
+};
+
+/**
  * 把顶层的 invoke / help 拆开，交给下面那个按子工具名分发的 runner。
  *
  * 分成两层是为了让壳只做壳的事：这一层认得 invoke 和 help，下一层还是原来那个 switch，
@@ -163,10 +183,64 @@ function refuse(error: string, note: string): string {
  * 不进缓存前缀，所以带全名单是免费的。
  */
 export function createFocusToolRunner(
-  deps: QqToolDeps & SelfToolDeps,
+  deps: FocusToolDeps,
 ): (call: LlmToolUseBlock) => Promise<string> {
-  const runQqSubtool = createQqToolRunner(deps);
-  const runSelfSubtool = createSelfToolRunner(deps);
+  // ---------- 转发记账 ----------
+  //
+  // 自动播报那条路退役以后，新闻进群只剩一种方式：她在某一轮里看了（observe_world）或读了
+  // （read_page），再自己 send_message。这些消息不经过播报流水线，监控上的「Broadcast Sent」
+  // 就一直是 0，看着像她再也没转过——其实 09-23、09-24 她自己转了好几条。
+  //
+  // 这里是唯一同时看得见两组子工具的地方，而 runner 的寿命恰好是一轮，所以关联就做在这里：
+  // 这一轮带回来过东西，之后又说给了某个会话，就记一笔。判据刻意只看同一轮——跨轮去猜「这句
+  // 话是不是在说昨天看的那条」没有可靠的信号，宁可漏记也不乱记。
+  //
+  // observe_world 在哪种轮次里都算：那个工具除了看新闻不做别的。read_page 只在她自己冒念头的
+  // 轮次（roundConversationId 为 null）里算：被人找上门的轮次里读页面，多半是在读对方贴的
+  // 链接、回答对方的问题，那是在聊天，不是转发。search_web 不算，搜出来的只是摘要片段，她
+  // 拿它查证，不拿它转发。
+  //
+  // 同一轮里对同一个会话，每样东西只记一次：看完一条新闻说了三句，是一次转发，不是三次。
+  // 仍然可能误记——同一轮里看完新闻，又在别的群回了句不相干的话。这是给人看的数，接受。
+  const broughtBack: WorldShareSource[] = [];
+  const sharedTo = new Map<string, Set<string>>();
+  const sourceKey = (source: WorldShareSource): string => `${source.kind}:${source.ref}`;
+  const bringBack = (source: WorldShareSource): void => {
+    if (!broughtBack.some((item) => sourceKey(item) === sourceKey(source))) broughtBack.push(source);
+  };
+  const noteMessageSent = (conversationId: string, message: string): void => {
+    const already = sharedTo.get(conversationId) ?? new Set<string>();
+    const fresh = broughtBack.filter((source) => !already.has(sourceKey(source)));
+    if (fresh.length === 0) return;
+    for (const source of fresh) already.add(sourceKey(source));
+    sharedTo.set(conversationId, already);
+    try {
+      deps.onWorldObservationShared?.({ conversationId, message, sources: fresh });
+    } catch {
+      // 消息已经发出去了。记账失败要是冒成 send_message 的异常，模型会以为没发成而再发一遍，
+      // 群里就多出一条重复的——为了一个计数不值得。记账那边自己负责留痕。
+    }
+  };
+
+  const runQqSubtool = createQqToolRunner(
+    {
+      ...deps,
+      readPage: async (url) => {
+        const page = await deps.readPage(url);
+        if (page.ok && deps.roundConversationId === null) bringBack({ kind: "read_page", ref: url });
+        return page;
+      },
+    },
+    { onMessageSent: noteMessageSent },
+  );
+  const runSelfSubtool = createSelfToolRunner({
+    ...deps,
+    observeWorld: async (topic) => {
+      const observed = await deps.observeWorld(topic);
+      if (observed) bringBack({ kind: "observe_world", ref: topic });
+      return observed;
+    },
+  });
   const runSubtool = (call: LlmToolUseBlock): Promise<string> =>
     (SELF_SUBTOOL_NAMES as readonly string[]).includes(call.name)
       ? runSelfSubtool(call)
@@ -204,7 +278,13 @@ export function createFocusToolRunner(
 
 // runner 的寿命是一轮：openedThisRound 只在这一轮里有意义，所以调用方每轮都要新建
 // 一个。跨轮复用的话，上一轮的一次打开会一直放行后面每一轮的过期焦点。
-function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) => Promise<string> {
+//
+// onMessageSent 只在 send_message 真的发出去之后触发。它不挂在 sendToConversation 上，
+// 是因为那条通道也被「我搜一下」这句吆喝用着——那句不是她要说的话，不该被当成转发。
+function createQqToolRunner(
+  deps: QqToolDeps,
+  hooks: { onMessageSent?: (conversationId: string, message: string) => void } = {},
+): (call: LlmToolUseBlock) => Promise<string> {
   let openedThisRound = false;
   // 「我搜一下」一轮只说一次。模型连着搜两三次很常见，每次都吆喝一遍就成了刷屏。
   let noticeSentThisRound = false;
@@ -324,6 +404,7 @@ function createQqToolRunner(deps: QqToolDeps): (call: LlmToolUseBlock) => Promis
           return refuse("发送被抑制", sending.reason);
         }
         await deps.sendToConversation(focus, message);
+        hooks.onMessageSent?.(focus, message);
         return ok({});
       }
 

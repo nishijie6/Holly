@@ -5,6 +5,7 @@ import {
   JUDGMENT_FAILURE_BACKOFF_MS,
   JUDGMENT_FAILURE_BACKOFF_THRESHOLD,
   resolveWorldObservationBroadcastGroupIds,
+  rollAutonomyDaily,
   runAutonomyLoop,
   worldObservationBroadcastGroupIds,
   type AutonomyConfig,
@@ -62,6 +63,9 @@ function baseState(overrides: Partial<AutonomyLoopState> = {}): AutonomyLoopStat
     lastArchiveWritingAttemptAt: 0,
     archiveWritingDailyDate: "2026-01-01",
     archiveWritingDailyCount: 0,
+    lastWorldObservationShareAt: 0,
+    worldObservationShareDailyDate: "2026-01-01",
+    worldObservationShareDailyCount: 0,
     recentActions: [],
     lastJudgmentAt: 0,
     judgmentFailureStreak: 0,
@@ -313,4 +317,15 @@ test("worldObservationBroadcastGroupIds 把所有可能收到播报的群合在�
     worldTopicBroadcastGroupOverrides: { 数学: ["a"], 天文学: ["a", "b"] },
   });
   assert.deepEqual(worldObservationBroadcastGroupIds(config).sort(), ["a", "b", "default"]);
+});
+
+test("转发计数跟别的当日计数一起跨天清零", () => {
+  // NOW 是 2026-01-01，前一天的计数要清零，当天的原样留着。
+  const state = baseState({ worldObservationShareDailyDate: "2025-12-31", worldObservationShareDailyCount: 4 });
+  rollAutonomyDaily(state, NOW);
+  assert.equal(state.worldObservationShareDailyCount, 0);
+  assert.equal(state.worldObservationShareDailyDate, "2026-01-01");
+  state.worldObservationShareDailyCount = 2;
+  rollAutonomyDaily(state, NOW);
+  assert.equal(state.worldObservationShareDailyCount, 2);
 });

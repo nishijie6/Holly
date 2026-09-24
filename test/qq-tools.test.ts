@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { ALL_SUBTOOL_NAMES, FOCUS_TOOL_DEFINITIONS, QQ_SUBTOOL_NAMES, createFocusToolRunner } from "../qq-tools.js";
-import type { ConversationSummary, QqToolDeps } from "../qq-tools.js";
+import type { ConversationSummary, FocusToolDeps, WorldObservationShare } from "../qq-tools.js";
 import type { LlmToolUseBlock } from "../llm-client.js";
 
 // The tools that move Holly's attention. The property worth defending is that
@@ -15,13 +15,14 @@ const CONVERSATIONS: ConversationSummary[] = [
   { id: "qq_group:200", name: "群乙", unread: 0, lastMessage: "（无新消息）", lastAt: null },
 ];
 
-function harness(overrides: Partial<QqToolDeps> = {}) {
+function harness(overrides: Partial<FocusToolDeps> = {}) {
   let focus: string | null = null;
   const sent: Array<{ id: string; message: string }> = [];
   const searched: string[] = [];
   const read: string[] = [];
   const sourceReads: string[] = [];
-  const deps: QqToolDeps = {
+  const shares: WorldObservationShare[] = [];
+  const deps: FocusToolDeps = {
     listConversations: async () => CONVERSATIONS,
     readConversation: async (id) => (CONVERSATIONS.some((c) => c.id === id) ? [`${id} 的最近消息`] : null),
     sendToConversation: async (id, message) => { sent.push({ id, message }); return "msg_1"; },
@@ -43,6 +44,10 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
     },
     writeMemory: async () => {},
     writeArchive: async () => {},
+    observeWorld: async (topic) => ({ summary: `[${topic}] 最近有这些` }),
+    worldTopics: () => ["人工智能", "天文学"],
+    worldTopicBroadcastTargets: () => [],
+    onWorldObservationShared: (share) => { shares.push(share); },
     ...overrides,
   };
   // 子工具一律经 invoke 壳进去，和生产路径一致；下面每个用例写的还是子工具名。
@@ -58,7 +63,7 @@ function harness(overrides: Partial<QqToolDeps> = {}) {
   // 下一轮：焦点和发送记录沿用，runner 新建一个——main.ts 每轮就是这么做的。
   const nextRound = (roundConversationId: string | null) =>
     bind(createFocusToolRunner({ ...deps, roundConversationId }));
-  return { call, callTop, nextRound, sent, searched, read, sourceReads, focus: () => focus };
+  return { call, callTop, nextRound, sent, searched, read, sourceReads, shares, focus: () => focus };
 }
 
 // 这个数组是稳定前缀的一部分，多一个条目就作废一次所有在飞会话的缓存。加子工具不该碰它——
@@ -498,4 +503,152 @@ test("读不了的路径,原因原样交回模型", async () => {
   const result = await call("read_source", { path: ".env" });
   assert.equal(result.ok, false);
   assert.match(result.note, /读不到/);
+});
+
+// ---------- 转发记账 ----------
+//
+// 自动播报退役以后，新闻进群靠的是她自己 send_message。监控要数得到这些，又不能把吆喝、
+// 聊天回复也数进去。
+
+test("看过一个话题再 send_message，记一笔转发", async () => {
+  const { call, shares } = harness();
+  await call("observe_world", { topic: "天文学" });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("send_message", { message: "FAST 又发现了个大气泡" });
+  assert.equal(result.ok, true);
+  assert.deepEqual(shares, [{
+    conversationId: "qq_group:100",
+    message: "FAST 又发现了个大气泡",
+    sources: [{ kind: "observe_world", ref: "天文学" }],
+  }]);
+});
+
+test("没带回东西就开口，不算转发", async () => {
+  const { call, shares } = harness();
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "在的" });
+  assert.deepEqual(shares, []);
+});
+
+test("什么都没看到，不算带回了东西", async () => {
+  const { call, shares } = harness({ observeWorld: async () => null });
+  await call("observe_world", { topic: "天文学" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "今天没啥新闻" });
+  assert.deepEqual(shares, []);
+});
+
+// 看完一条新闻说了三句，是一次转发，不是三次。换一个会话再说，那是又转给了另一个人。
+test("同一轮对同一个会话只记一次，换个会话再记", async () => {
+  const { call, shares } = harness();
+  await call("observe_world", { topic: "人工智能" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "GPT-6 出了两个新模型" });
+  await call("send_message", { message: "API 价格腰斩" });
+  await call("open_conversation", { id: "qq_group:200" });
+  await call("send_message", { message: "你们看到 GPT-6 了吗" });
+  assert.deepEqual(shares.map((s) => s.conversationId), ["qq_group:100", "qq_group:200"]);
+});
+
+// 说完 AI 的之后又去看了天文，再开口时只记新带回来的那一样。
+test("同一个会话后来又带回了新东西，只记新的那样", async () => {
+  const { call, shares } = harness();
+  await call("observe_world", { topic: "人工智能" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "AI 这边" });
+  await call("observe_world", { topic: "天文学" });
+  await call("send_message", { message: "天文那边" });
+  assert.deepEqual(shares.map((s) => s.sources), [
+    [{ kind: "observe_world", ref: "人工智能" }],
+    [{ kind: "observe_world", ref: "天文学" }],
+  ]);
+});
+
+// 判据只看同一轮：跨轮去猜这句话是不是在说上一轮看的东西，没有可靠的信号。
+test("上一轮看的，这一轮说，不记", async () => {
+  const { call, nextRound, shares } = harness();
+  await call("observe_world", { topic: "天文学" });
+  const next = nextRound(null);
+  await next("open_conversation", { id: "qq_group:100" });
+  await next("send_message", { message: "刚才看到的" });
+  assert.deepEqual(shares, []);
+});
+
+test("她自己冒念头的轮次里，读过页面再开口也算转发", async () => {
+  const { call, shares } = harness();
+  await call("read_page", { url: "https://www.quantamagazine.org/graph-sandwich" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "图三明治那篇挺有意思" });
+  assert.deepEqual(shares.map((s) => s.sources), [
+    [{ kind: "read_page", ref: "https://www.quantamagazine.org/graph-sandwich" }],
+  ]);
+});
+
+// 被人找上门的轮次里读页面，多半是在读对方贴的链接、回答对方——那是聊天，不是转发。
+test("被会话唤起的轮次里读页面再回话，不算转发", async () => {
+  const { nextRound, shares } = harness();
+  const round = nextRound("qq_group:100");
+  await round("open_conversation", { id: "qq_group:100" });
+  await round("read_page", { url: "https://example.com/a" });
+  await round("send_message", { message: "看了，他说的是这个意思" });
+  assert.deepEqual(shares, []);
+});
+
+test("被会话唤起的轮次里看过话题，照样算转发", async () => {
+  const { nextRound, shares } = harness();
+  const round = nextRound("qq_group:100");
+  await round("open_conversation", { id: "qq_group:100" });
+  await round("observe_world", { topic: "人工智能" });
+  await round("send_message", { message: "今天大事挺多的" });
+  assert.equal(shares.length, 1);
+});
+
+test("页面没读出来，不算带回了东西", async () => {
+  const { call, shares } = harness({ readPage: async () => ({ ok: false, text: "反爬" }) });
+  await call("read_page", { url: "https://phys.org/news/x" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "打不开" });
+  assert.deepEqual(shares, []);
+});
+
+// search_web 搜到的是摘要片段，她拿它查证，不拿它转发。
+test("搜一下再开口，不算转发", async () => {
+  const { call, shares } = harness();
+  await call("search_web", { query: "系外行星 射电信号" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("send_message", { message: "没搜到细节" });
+  assert.deepEqual(shares, []);
+});
+
+// 「我搜一下，稍等」和她要说的话走的是同一条发送通道，但那句是礼貌，不是转发。
+test("动手前那句吆喝不算转发", async () => {
+  const { call, sent, shares } = harness();
+  await call("observe_world", { topic: "天文学" });
+  await call("open_conversation", { id: "qq_group:100" });
+  await call("read_page", { url: "https://example.com/b", saying: "我点进去看看" });
+  assert.equal(sent.length, 1);
+  assert.deepEqual(shares, []);
+  await call("send_message", { message: "看完了，是这么回事" });
+  assert.equal(shares.length, 1);
+});
+
+test("发送被挡住，不算转发", async () => {
+  const { call, shares } = harness({ canSend: () => ({ allowed: false, reason: "只读模式" }) });
+  await call("observe_world", { topic: "天文学" });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("send_message", { message: "发不出去的" });
+  assert.equal(result.ok, false);
+  assert.deepEqual(shares, []);
+});
+
+// 消息已经进群了。记账出错要是冒成 send_message 的失败，她会以为没发成而再发一遍。
+test("记账出错不影响 send_message 的结果", async () => {
+  const { call, sent } = harness({
+    onWorldObservationShared: () => { throw new Error("disk full"); },
+  });
+  await call("observe_world", { topic: "天文学" });
+  await call("open_conversation", { id: "qq_group:100" });
+  const result = await call("send_message", { message: "新闻" });
+  assert.equal(result.ok, true);
+  assert.equal(sent.length, 1);
 });

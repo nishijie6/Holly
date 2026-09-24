@@ -184,7 +184,12 @@ import {
   type FocusInjectionInput,
 } from "./focus-prompt.js";
 import { DEFAULT_FOCUS_MODE_CONFIG, parseFocusModeConfig, type FocusModeConfig } from "./focus-mode-config.js";
-import { FOCUS_TOOL_DEFINITIONS, createFocusToolRunner, type ConversationSummary } from "./qq-tools.js";
+import {
+  FOCUS_TOOL_DEFINITIONS,
+  createFocusToolRunner,
+  type ConversationSummary,
+  type WorldObservationShare,
+} from "./qq-tools.js";
 import {
   WORLD_OBSERVATION_BROADCAST_SYSTEM_PROMPT,
   buildSearchResultJudgePrompt,
@@ -512,6 +517,8 @@ type AutonomySidebarSnapshot = {
   memoryReflectionDailyCount: number;
   lastWorldObservationAtIso: string | null;
   lastMemoryReflectionAtIso: string | null;
+  worldObservationShareDailyCount: number;
+  lastWorldObservationShareAtIso: string | null;
   latestMemory: AutonomySidebarMemory | null;
   latestWorldObservation: AutonomySidebarObservation | null;
   recentMemories: AutonomySidebarMemory[];
@@ -4820,6 +4827,8 @@ function buildFocusToolRunner(
       await writeArchiveForAutonomy({ kind, title, content, reason }),
     observeWorld: async (topic) =>
       await observeWorldForAutonomy({ topic, reason: "她自己想去看看" }, { broadcast: false }),
+    // 看完之后发不发由她决定；发了的话，这里记一笔，监控上才数得到。
+    onWorldObservationShared: recordWorldObservationShare,
     worldTopics: () => autonomyConfig.worldTopics,
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
@@ -5965,6 +5974,8 @@ function buildAutonomySidebarSnapshot(): AutonomySidebarSnapshot {
     memoryReflectionDailyCount: state?.memoryReflectionDailyCount ?? 0,
     lastWorldObservationAtIso: isoFromMs(state?.lastWorldObservationAt ?? 0),
     lastMemoryReflectionAtIso: isoFromMs(state?.lastMemoryReflectionAt ?? 0),
+    worldObservationShareDailyCount: state?.worldObservationShareDailyCount ?? 0,
+    lastWorldObservationShareAtIso: isoFromMs(state?.lastWorldObservationShareAt ?? 0),
     latestMemory: recentMemories.at(-1) ?? null,
     latestWorldObservation: recentWorldObservations.at(-1) ?? null,
     recentMemories,
@@ -5987,7 +5998,7 @@ function appendWorldObservationLog(record: Record<string, unknown>): void {
  * 只记账，不设闸：日上限已经撤掉（理由见 autonomy-engine 里那段说明），这几个数字只给人看。
  */
 function recordAutonomyActivity(
-  kind: "world_observation" | "memory_reflection" | "archive_writing",
+  kind: "world_observation" | "memory_reflection" | "archive_writing" | "world_observation_share",
 ): void {
   const state = hollyStateStore?.getAutonomyState();
   if (!state) return;
@@ -6000,11 +6011,51 @@ function recordAutonomyActivity(
   } else if (kind === "memory_reflection") {
     state.lastMemoryReflectionAt = now;
     state.memoryReflectionDailyCount += 1;
+  } else if (kind === "world_observation_share") {
+    state.lastWorldObservationShareAt = now;
+    state.worldObservationShareDailyCount += 1;
   } else {
     state.lastArchiveWritingAt = now;
     state.archiveWritingDailyCount += 1;
   }
   void hollyStateStore?.save();
+}
+
+/**
+ * 记下「她把刚看到、刚读到的东西说给了谁」。什么算一次转发，由 createFocusToolRunner 判断，
+ * 这里只负责落三笔账：
+ *
+ * - 监控流水一条 World Observation Shared。和老流水线的 Broadcast Sent 分开取名：那一条是
+ *   流水线替她发的，这一条是她自己发的，看监控的人要分得出来。
+ * - world-observations.jsonl 一条 action=share。观察记录也在这个文件里，「看了几次、转了几次」
+ *   一个文件就能数出来。loadWorldObservationMemory 只收 ok=true 的观察，这条不带 ok，不会被当成
+ *   观察恢复回来。
+ * - 侧栏的当日计数和最后一次时间。
+ *
+ * 消息此刻已经发出去了，所以这里不能抛错：抛出去会冒成 send_message 的失败，她会以为没发成而
+ * 再发一遍。写文件和存状态都是异步的，各自接住自己的失败并留痕；外面这层 try 只管一件事——
+ * 不管里面出什么事，都不让异常从这里冒进 send_message。
+ */
+function recordWorldObservationShare(share: WorldObservationShare): void {
+  try {
+    const sources = share.sources.map((source) => `${source.kind}:${source.ref}`);
+    pushMonitorEntry(
+      "outgoing",
+      "World Observation Shared",
+      `conversation_id=${share.conversationId}\nsources=${sources.join(" | ")}\n${share.message}`,
+    );
+    appendWorldObservationLog({
+      ts: new Date().toISOString(),
+      action: "share",
+      conversation_id: share.conversationId,
+      sources: share.sources,
+      message: share.message,
+    });
+    recordAutonomyActivity("world_observation_share");
+    broadcastAutonomySidebar();
+  } catch (error) {
+    console.error("Failed to record world observation share:", error);
+  }
 }
 
 function appendHollyMemoryLog(record: Record<string, unknown>): void {
