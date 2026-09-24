@@ -7531,6 +7531,7 @@ async function requestBootOrientation(
 
   const prompt = buildBootOrientationPrompt({
     nowIso,
+    nowLabel: formatLocalDateTimeForModel(new Date(nowIso)),
     previousBootAtIso: previousBootAt > 0 ? new Date(previousBootAt).toISOString() : null,
     restoredGroups: conversationHistoryByGroup.size,
     restoredTurns: countRestoredConversationTurns(),
@@ -7634,8 +7635,10 @@ async function requestQqModeDecision(
   const lifecycle = hollyStateStore?.getLifecycleState();
   if (!client) return fallbackQqModeDecision(hollyBootstrapConfig, "LLM is unavailable during QQ mode decision.");
 
+  const now = new Date();
   const prompt = buildQqModeDecisionPrompt({
-    nowIso: new Date().toISOString(),
+    nowIso: now.toISOString(),
+    nowLabel: formatLocalDateTimeForModel(now),
     bootThought: lifecycle?.lastBootThought ?? "",
     readOnly: readOnlyMode,
     fallbackMode: hollyBootstrapConfig.fallbackQqMode,

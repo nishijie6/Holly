@@ -127,8 +127,18 @@ export function parseHollyBootstrapConfig(value: unknown): HollyBootstrapConfig 
   };
 }
 
+// 这两份开机提示里的时间戳全是 UTC 的 ISO 串：now、previous_boot_at，还有素材里每条消息、
+// 每次观察、每条记忆的时间。模型会把「2026-09-24T13:24:38Z」直接念成下午一点二十四——第 641
+// 次开机就是这样写下了「现在是13:24」，而那时北京已经是晚上九点多。素材由别的路径共用，这里
+// 不去改它们的格式，而是在 now 旁边并排给出北京时间，再点明 Z 结尾的都是 UTC：口径统一在
+// ISO 上，换算交给一句话，而不是让同一份提示里混着两种写法。
+const UTC_TIMESTAMP_NOTE =
+  "Timestamps ending in Z are UTC. Holly lives in Beijing time (UTC+8): whenever you mention a time of day, use Beijing time.";
+
 export function buildBootOrientationPrompt(input: {
   nowIso: string;
+  // 北京时间，形如「2026-09-24 21:24 星期四」，和焦点轮次里的 current_time 同一个写法。
+  nowLabel: string;
   previousBootAtIso: string | null;
   restoredGroups: number;
   restoredTurns: number;
@@ -144,8 +154,9 @@ export function buildBootOrientationPrompt(input: {
     "Do not address a user and do not decide the QQ mode in this step.",
     "Return JSON only:",
     '{"inner_thought":"short private thought","should_write_memory":false,"memory_topic":"","memory":"","reason":"short reason"}',
+    UTC_TIMESTAMP_NOTE,
     "",
-    `now=${input.nowIso}`,
+    `now=${input.nowIso} (Beijing time: ${input.nowLabel})`,
     `previous_boot_at=${input.previousBootAtIso ?? "unknown"}`,
     `restored_groups=${input.restoredGroups}`,
     `restored_turns=${input.restoredTurns}`,
@@ -183,6 +194,8 @@ export function parseBootOrientation(raw: string): BootOrientation | null {
 
 export function buildQqModeDecisionPrompt(input: {
   nowIso: string;
+  // 北京时间，见 buildBootOrientationPrompt 上面那段。
+  nowLabel: string;
   bootThought: string;
   readOnly: boolean;
   fallbackMode: QqRuntimeMode;
@@ -200,8 +213,9 @@ export function buildQqModeDecisionPrompt(input: {
       : "read_only=false, so all three modes are available.",
     "Return JSON only:",
     '{"qq_mode":"observe","reason":"short private reason","reconsider_after_minutes":60}',
+    UTC_TIMESTAMP_NOTE,
     "",
-    `now=${input.nowIso}`,
+    `now=${input.nowIso} (Beijing time: ${input.nowLabel})`,
     `fallback_mode=${input.fallbackMode}`,
     `default_reconsider_after_minutes=${input.defaultReconsiderMinutes}`,
     `boot_inner_thought=${input.bootThought || "(none)"}`,
