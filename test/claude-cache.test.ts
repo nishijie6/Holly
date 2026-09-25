@@ -98,6 +98,28 @@ test("Claude usage records a cache-only request", () => {
   });
 });
 
+test("Claude usage splits cache writes by the TTL the server actually applied", () => {
+  const readClaudeUsageTokens = usageReader();
+  // 断点都要的是 1h；5m 那一格不为 0，就是服务端没认，监控要靠这个拆分才看得出来。
+  assert.deepEqual(readClaudeUsageTokens({
+    usage: {
+      input_tokens: 100,
+      cache_creation_input_tokens: 3_000,
+      cache_read_input_tokens: 90_000,
+      cache_creation: { ephemeral_1h_input_tokens: 2_000, ephemeral_5m_input_tokens: 1_000 },
+      output_tokens: 20,
+    },
+  }), {
+    inputTokens: 93_100,
+    uncachedInputTokens: 100,
+    cacheCreationInputTokens: 3_000,
+    cacheReadInputTokens: 90_000,
+    outputTokens: 20,
+    cacheCreation1hInputTokens: 2_000,
+    cacheCreation5mInputTokens: 1_000,
+  });
+});
+
 // The shape that made four Opus routes pay full price for weeks: a short fixed
 // system constant plus one user message carrying everything. generateText marks
 // that single message volatile (volatileTailMessages: 1), so no breakpoint can

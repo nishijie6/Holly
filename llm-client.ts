@@ -101,7 +101,9 @@ export type LlmClient = {
   model: string;
   systemPrompt: string;
   displayName: string;
-  consumeTokenUsage(): import("./token-usage.js").CallTokenUsage | null;
+  // 取出并清空这个 client 记下的全部用量。只给「取空」不给「取一条」：一次工具循环有几轮
+  // 就有几条，逐条取必然漏取、越积越多（见 TokenUsageQueue.drain）。
+  drainTokenUsage(): import("./token-usage.js").CallTokenUsage[];
   // purpose 必填，防止新调用点产生无法归因的用量；token 账本和逐次提示缓存记录
   // 都以它作为分类依据。
   //
@@ -1009,12 +1011,23 @@ export function readClaudeUsageTokens(data: unknown): TokenUsageBreakdown | null
   const outputTokens = num(u.output_tokens);
   const inputTokens = uncachedInputTokens + cacheCreationInputTokens + cacheReadInputTokens;
   if (inputTokens === 0 && outputTokens === 0) return null;
+  // 只有响应真的带了 cache_creation 拆分才记，缺席时不补 0：「服务端没说」和「服务端说
+  // 没有 5m 写入」是两回事，后者才能证明 1h TTL 生效了。
+  const creation = u.cache_creation && typeof u.cache_creation === "object"
+    ? u.cache_creation as Record<string, unknown>
+    : null;
   return {
     inputTokens,
     uncachedInputTokens,
     cacheCreationInputTokens,
     cacheReadInputTokens,
     outputTokens,
+    ...(creation
+      ? {
+        cacheCreation1hInputTokens: num(creation.ephemeral_1h_input_tokens),
+        cacheCreation5mInputTokens: num(creation.ephemeral_5m_input_tokens),
+      }
+      : {}),
   };
 }
 
@@ -1479,7 +1492,7 @@ export async function createLlmClient(
     model: profile.model,
     systemPrompt: profile.systemPrompt,
     displayName: `${profile.name} (${profile.model})`,
-    consumeTokenUsage: () => usageQueue.consume(),
+    drainTokenUsage: () => usageQueue.drain(),
     async runToolLoop(input): Promise<ClaudeToolLoopResult> {
       if (profile.provider !== "claude") {
         // Tool use here is the Anthropic Messages shape; Codex would need its

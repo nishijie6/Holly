@@ -30,6 +30,7 @@ type TokenUsageModule = {
       outputTokens: number;
       capturedAt: number;
     } | null;
+    drain(): Array<{ purpose: string; inputTokens: number; capturedAt: number }>;
   };
   normalizeStoredTokenCounts(value: unknown): {
     inputTokens: number;
@@ -365,6 +366,38 @@ test("each queued call keeps the purpose it was made for, in completion order", 
 
   assert.equal(client.consume()?.purpose, "ledger-compaction");
   assert.equal(client.consume()?.purpose, "focus-loop");
+  assert.equal(client.consume(), null);
+});
+
+test("draining returns every round of a tool loop, not just the first", async () => {
+  const { TokenUsageQueue } = await loadUsageModule();
+  let now = 1_000;
+  const client = new TokenUsageQueue("claude-sonnet-4-6", () => now);
+  const usage = (inputTokens: number) => ({
+    inputTokens,
+    uncachedInputTokens: 0,
+    cacheCreationInputTokens: 0,
+    cacheReadInputTokens: inputTokens,
+    outputTokens: 1,
+  });
+
+  // 一次三轮的工具循环记三条。以前调用结束只取一条，另外两条留在队列里，下一次调用取到的
+  // 就是它们——监控上看到的永远是更早的请求。
+  client.record(usage(100), "inner-thought");
+  now = 2_000;
+  client.record(usage(200), "inner-thought");
+  now = 3_000;
+  client.record(usage(300), "inner-thought");
+
+  assert.deepEqual(
+    client.drain().map(({ inputTokens, capturedAt }) => ({ inputTokens, capturedAt })),
+    [
+      { inputTokens: 100, capturedAt: 1_000 },
+      { inputTokens: 200, capturedAt: 2_000 },
+      { inputTokens: 300, capturedAt: 3_000 },
+    ],
+  );
+  assert.deepEqual(client.drain(), []);
   assert.equal(client.consume(), null);
 });
 

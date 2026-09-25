@@ -34,6 +34,12 @@ export type TokenUsageBreakdown = {
   // 整个请求的大小判断；这正是过去把 1.1 万 token 请求里的 40-token 前缀误判为
   // 前缀漂移的原因。
   cacheablePrefixTokens?: number;
+  // cacheCreationInputTokens 按服务端实际采用的 TTL 拆开。请求里每个断点都写的是 1h，
+  // 所以 5m 这一格本该恒为 0；不为 0 就说明 1h 没生效，缓存五分钟没人读就会过期——
+  // 而空闲时的念头恰好是每五分钟一次，全落在过期边缘上。响应里没有这个拆分（Codex、
+  // 早于该字段的旧数据）时两项都不出现，不能当成 0 来理解。
+  cacheCreation1hInputTokens?: number;
+  cacheCreation5mInputTokens?: number;
 };
 
 // 这里有意只做估算，不充当分词器：它只需判断前缀是否跨过 512/1024/2048/4096
@@ -112,12 +118,26 @@ export class TokenUsageQueue {
       ...(typeof usage.cacheablePrefixTokens === "number"
         ? { cacheablePrefixTokens: tokenCount(usage.cacheablePrefixTokens) }
         : {}),
+      ...(typeof usage.cacheCreation1hInputTokens === "number"
+        ? { cacheCreation1hInputTokens: tokenCount(usage.cacheCreation1hInputTokens) }
+        : {}),
+      ...(typeof usage.cacheCreation5mInputTokens === "number"
+        ? { cacheCreation5mInputTokens: tokenCount(usage.cacheCreation5mInputTokens) }
+        : {}),
       capturedAt: this.now(),
     });
   }
 
   consume(): CallTokenUsage | null {
     return this.queue.shift() ?? null;
+  }
+
+  // 一次调用不一定只有一条记录：工具循环每一轮都是一次独立请求，各记一条。消费端以前
+  // 每次调用只取一条，多出来的就在队列里越积越多——监控上看到的永远是一个小时前的请求，
+  // 小时桶也按取出的时刻归档，重启时积压的整批直接丢掉、账上少记。调用结束时一次取空，
+  // 队列才始终和刚结束的那次调用对得上。
+  drain(): CallTokenUsage[] {
+    return this.queue.splice(0);
   }
 }
 

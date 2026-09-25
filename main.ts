@@ -2121,8 +2121,12 @@ function persistPromptCacheStats(): void {
 // 每次模型调用都记两份：按小时（看趋势）和按用途（看是谁在烧钱——回复、
 // 焦点循环、自主判断各记各的）。同一次调用同时进两张表，所以两张表的总量应该
 // 对得上，对不上就说明有调用路径漏了记账。
+//
+// 归到请求发生的那一小时，而不是记账这一刻：一次调用可能跨过整点，调用失败时攒下的几轮
+// 也要等下一次调用结束才被取出。
 function recordPromptCacheSample(usage: CallTokenUsage, summary: PromptCacheCallSummary): void {
-  const hour = localHourKey(new Date());
+  const capturedAt = new Date(usage.capturedAt);
+  const hour = localHourKey(capturedAt);
   promptCacheByHour.set(
     hour,
     addSummaryToPromptCacheCounts(
@@ -2132,7 +2136,7 @@ function recordPromptCacheSample(usage: CallTokenUsage, summary: PromptCacheCall
     ),
   );
 
-  const date = localDateKey();
+  const date = localDateKey(capturedAt);
   let byPurpose = promptCacheByPurposeDate.get(date);
   if (!byPurpose) {
     byPurpose = new Map<string, PromptCacheCounts>();
@@ -2208,7 +2212,8 @@ function recordTokenUsage(usage: CallTokenUsage, belowMinimum: boolean): void {
   if (!usage.model || (usage.inputTokens <= 0 && usage.outputTokens <= 0)) {
     return;
   }
-  const date = localDateKey();
+  // 与 recordPromptCacheSample 同理，按请求发生的日期记，跨零点的调用不会记到第二天。
+  const date = localDateKey(new Date(usage.capturedAt));
   let models = tokenStatsByDate.get(date);
   if (!models) {
     models = new Map<string, ModelTokenCounts>();
@@ -6507,20 +6512,24 @@ function compactReflectionText(text: string, maxChars: number): string {
 
 function broadcastLatestLlmUsage(client: LlmClient): void {
   broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
-  const callTokens = client.consumeTokenUsage();
-  if (!callTokens) {
+  // 一次取空：工具循环跑了几轮就有几条。以前只取一条，剩下的积压下来，监控上每条命中率
+  // 都晚一个多小时，小时柱也跟着错位，见 TokenUsageQueue.drain。
+  const calls = client.drainTokenUsage();
+  if (calls.length === 0) {
     return;
   }
 
-  // 只分类一次，让账本、序列和监控记录等所有消费方读取同一结论；同一次调用不能在
-  // 一个地方算未命中、另一个地方又算不可缓存。
-  const summary = summarizePromptCacheCall(callTokens, callTokens.model);
-  recordTokenUsage(callTokens, summary?.belowMinimum ?? false);
-  broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-  if (summary) {
-    recordPromptCacheSample(callTokens, summary);
-    pushPromptCacheEntry(callTokens, summary);
+  for (const callTokens of calls) {
+    // 只分类一次，让账本、序列和监控记录等所有消费方读取同一结论；同一次调用不能在
+    // 一个地方算未命中、另一个地方又算不可缓存。
+    const summary = summarizePromptCacheCall(callTokens, callTokens.model);
+    recordTokenUsage(callTokens, summary?.belowMinimum ?? false);
+    if (summary) {
+      recordPromptCacheSample(callTokens, summary);
+      pushPromptCacheEntry(callTokens, summary);
+    }
   }
+  broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
 }
 
 // 每日总量只能说明提示缓存写入和读回了多少 token，无法指出具体由哪些调用产生；
@@ -6563,7 +6572,19 @@ function pushPromptCacheEntry(usage: CallTokenUsage, summary: PromptCacheCallSum
     );
   }
 
-  pushMonitorEntry("status", title, lines.join("\n"), usage.model);
+  // 请求里的断点一律是 1h，5m 的写入只可能是服务端没认这个 TTL。记成 error 而不是埋在
+  // status 里：空闲念头每五分钟一次，TTL 一旦退回五分钟，命中率会随手一抖就整段重写。
+  const ttlDowngraded = (usage.cacheCreation5mInputTokens ?? 0) > 0;
+  if (usage.cacheCreation1hInputTokens !== undefined || usage.cacheCreation5mInputTokens !== undefined) {
+    lines.push(
+      `cache_write_ttl 1h=${count(usage.cacheCreation1hInputTokens ?? 0)} 5m=${count(usage.cacheCreation5mInputTokens ?? 0)}`,
+    );
+  }
+  if (ttlDowngraded) {
+    lines.push("Requested a 1h TTL but the server wrote 5m cache entries; they expire after five idle minutes.");
+  }
+
+  pushMonitorEntry(ttlDowngraded ? "error" : "status", title, lines.join("\n"), usage.model);
 }
 
 // Keeps line breaks (collapsing blank lines) so multi-item broadcasts — one
@@ -8065,6 +8086,14 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
 // 主动发言指令只放在当前消息槽位，使本次调用命中一小时提示缓存，而不是重新处理完整
 // 上下文。时间线完整传入且不额外标记；指令只说明群和本轮触发起点，由模型自行沿时间线
 // 判断。其他群的动态若存在，也只通过与响应式回复相同的背景摘要出现。
+//
+// 上面说的那份共享缓存，只在 focus_mode 关闭时才存在。焦点模式打开后群消息改走焦点循环，
+// 回复路由不再有人写（reply-decision 自 09-06 起没再出现过），这里读得回的只剩自己上一次
+// 写下的条目：同一晚扎堆的几次判断能命中，隔了一小时以上的第一次就是整段重写，约十万
+// token。这是有意接受的代价——主动发言还在 shadow 模式，挪到焦点前缀上等于换掉它判断时
+// 看到的上下文，是功能的重新设计而不是缓存修复。
+//
+// 所以 proactive-decision 在命中率表里偏低是预期内的，不是前缀漂移。
 async function evaluateProactiveRevival(
   request: ProactiveRevivalRequest,
 ): Promise<ProactiveDecision | null> {
