@@ -36,6 +36,7 @@ import {
   type LlmMessage,
   type LlmToolUseBlock,
 } from "./llm-client.js";
+import { CLAUDE_OAUTH_CALLBACK_PATH, CLAUDE_OAUTH_LOGIN_PATH, claudeOAuth } from "./claude-oauth.js";
 import {
   ConnectionWatchdog,
   shouldCountTowardConnectionWatchdog,
@@ -2253,6 +2254,14 @@ function sendHtml(res: ServerResponse, html: string): void {
     "Content-Length": Buffer.byteLength(html),
   });
   res.end(html);
+}
+
+function sendText(res: ServerResponse, statusCode: number, text: string): void {
+  res.writeHead(statusCode, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Content-Length": Buffer.byteLength(text),
+  });
+  res.end(text);
 }
 
 function getRequestUrl(req: IncomingMessage): URL {
@@ -9266,6 +9275,39 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
+      if (req.method === "GET" && url.pathname === CLAUDE_OAUTH_LOGIN_PATH) {
+        // 回调主机名照官方 CLI 写 localhost，授权服务器按登记的回环地址校验 redirect_uri。
+        const authorizeUrl = claudeOAuth.beginLogin(`http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_CALLBACK_PATH}`);
+        res.writeHead(302, { Location: authorizeUrl });
+        res.end();
+        return;
+      }
+
+      if (req.method === "GET" && url.pathname === CLAUDE_OAUTH_CALLBACK_PATH) {
+        const code = url.searchParams.get("code");
+        const state = url.searchParams.get("state");
+        if (!code || !state) {
+          const reason = url.searchParams.get("error_description") || url.searchParams.get("error") || "缺少 code 或 state";
+          sendText(res, 400, `Claude 登录未完成：${reason}`);
+          return;
+        }
+        try {
+          const creds = await claudeOAuth.completeLogin(code, state);
+          console.log(`Claude login completed${creds.email ? ` for ${creds.email}` : ""}; credentials at ${claudeOAuth.credentialsPath}`);
+          sendText(res, 200, `Holly 已登录 Claude${creds.email ? `（${creds.email}）` : ""}，可以关掉这个页面了。`);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          console.warn("Claude login failed.", error);
+          // 回调里的 state 已经用掉了，刷新这个页面只会得到「已过期」；直接给出重新登录的入口。
+          sendText(
+            res,
+            502,
+            `Claude 登录失败：${message}\n\n请重新打开 http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_LOGIN_PATH} 再授权一次（刷新本页没用）。`,
+          );
+        }
+        return;
+      }
+
       sendJson(res, 404, { error: "Not found" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -9279,6 +9321,13 @@ async function bootstrap(): Promise<void> {
     console.log(`WebSocket client target is ${WS_TARGET_URL}`);
     console.log(`Response LLM profile: ${client.displayName}`);
     console.log(`Decision LLM profile: ${decisionClient.displayName}`);
+    if (client.provider === "claude" || decisionClient.provider === "claude") {
+      void claudeOAuth.hasCredentials().then((loggedIn) => {
+        if (!loggedIn) {
+          console.warn(`Claude 未登录：在浏览器打开 http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_LOGIN_PATH}`);
+        }
+      });
+    }
     if (store) {
       console.log(`Qdrant store: ${store.description}`);
     }

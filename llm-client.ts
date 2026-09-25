@@ -7,6 +7,7 @@ import path from "node:path";
 
 import YAML from "yaml";
 
+import { claudeOAuth } from "./claude-oauth.js";
 import { LlmHttpError, ProviderRateLimitGate } from "./connection-watchdog.js";
 import {
   TokenUsageQueue,
@@ -198,14 +199,7 @@ const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 const codexRateLimitGate = new ProviderRateLimitGate({ provider: "Codex" });
 
-const CLAUDE_CREDENTIALS_PATH = path.join(os.homedir(), ".claude", ".credentials.json");
-// 在 macOS 上，Claude Code 把 OAuth 数据存进登录钥匙串，而不是 Linux/CI 使用的
-// .credentials.json 文件。服务名和账户名与 CLI 的写入方式保持一致：服务名为
-// "Claude Code-credentials"，账户名为当前用户名。
-const CLAUDE_KEYCHAIN_SERVICE = "Claude Code-credentials";
 const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-const CLAUDE_OAUTH_TOKEN_URL = "https://console.anthropic.com/v1/oauth/token";
-const CLAUDE_OAUTH_CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
 const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
 const claudeRateLimitGate = new ProviderRateLimitGate({ provider: "Claude" });
@@ -793,172 +787,6 @@ async function requestCodexText(
   throw new Error("Codex request failed after retry.");
 }
 
-type ClaudeCredentialsSource = "file" | "keychain";
-
-type ClaudeCredentials = {
-  accessToken: string;
-  refreshToken: string | null;
-  expiresAt: number | null;
-  raw: Record<string, unknown>;
-  source: ClaudeCredentialsSource;
-};
-
-function asClaudeOauthRecord(file: Record<string, unknown>): Record<string, unknown> {
-  const oauth = file.claudeAiOauth;
-  if (!oauth || typeof oauth !== "object") {
-    throw new Error("claudeAiOauth not found in Claude credentials");
-  }
-  return oauth as Record<string, unknown>;
-}
-
-function parseClaudeCredentials(rawJson: string, source: ClaudeCredentialsSource): ClaudeCredentials {
-  const raw = JSON.parse(rawJson) as Record<string, unknown>;
-  const oauth = asClaudeOauthRecord(raw);
-
-  const accessToken = oauth.accessToken;
-  if (typeof accessToken !== "string" || !accessToken) {
-    throw new Error("accessToken not found in claudeAiOauth credentials");
-  }
-
-  return {
-    accessToken,
-    refreshToken: typeof oauth.refreshToken === "string" ? oauth.refreshToken : null,
-    expiresAt: typeof oauth.expiresAt === "number" ? oauth.expiresAt : null,
-    raw,
-    source,
-  };
-}
-
-function readClaudeKeychainRaw(): string {
-  const account = os.userInfo().username;
-  return execSync(
-    `security find-generic-password -s "${CLAUDE_KEYCHAIN_SERVICE}" -a "${account}" -w`,
-    { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] },
-  ).trim();
-}
-
-// The file and the Keychain hold the same OAuth blob but drift apart: the CLI
-// rotates the Keychain copy, while refreshes here are persisted to the file. A
-// fixed precedence means 401s against a token the other store already replaced,
-// so rank the two by how usable each is right now. `preferred` wins ties.
-export function pickFresherClaudeCredentials<T extends { expiresAt: number | null }>(
-  preferred: T | null,
-  other: T | null,
-): T | null {
-  if (!preferred) return other;
-  if (!other) return preferred;
-
-  const usable = (creds: T): boolean => !isExpiringSoon(creds.expiresAt);
-  if (usable(preferred) !== usable(other)) {
-    return usable(preferred) ? preferred : other;
-  }
-
-  // A null expiresAt keeps the meaning isExpiringSoon() gives it — not expiring
-  // — so it never loses to a dated token.
-  const rank = (creds: T): number => creds.expiresAt ?? Number.POSITIVE_INFINITY;
-  return rank(other) > rank(preferred) ? other : preferred;
-}
-
-async function readClaudeCredentials(): Promise<ClaudeCredentials> {
-  // The on-disk file is the Linux/CI location and where token refreshes are
-  // persisted; the macOS Keychain is where the Claude Code CLI stores
-  // credentials by default. Read both and take the fresher one.
-  let fileError: unknown = null;
-  let fileCreds: ClaudeCredentials | null = null;
-  try {
-    fileCreds = parseClaudeCredentials(await readFile(CLAUDE_CREDENTIALS_PATH, "utf-8"), "file");
-  } catch (error) {
-    fileError = error;
-  }
-
-  let keychainCreds: ClaudeCredentials | null = null;
-  if (process.platform === "darwin") {
-    try {
-      keychainCreds = parseClaudeCredentials(readClaudeKeychainRaw(), "keychain");
-    } catch {
-      // Keychain miss — fall back to whatever the file gave us.
-    }
-  }
-
-  const creds = pickFresherClaudeCredentials(fileCreds, keychainCreds);
-  if (!creds) {
-    // Surface the file error, which names the primary credentials path.
-    throw fileError ?? new Error(`Claude credentials not found at ${CLAUDE_CREDENTIALS_PATH}`);
-  }
-  return creds;
-}
-
-async function refreshClaudeCredentials(creds: ClaudeCredentials): Promise<ClaudeCredentials | null> {
-  if (!creds.refreshToken) {
-    return null;
-  }
-
-  const res = await fetch(CLAUDE_OAUTH_TOKEN_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      grant_type: "refresh_token",
-      refresh_token: creds.refreshToken,
-      client_id: CLAUDE_OAUTH_CLIENT_ID,
-    }),
-    signal: AbortSignal.timeout(10_000),
-  });
-
-  if (!res.ok) {
-    const body = await res.text().catch(() => "");
-    throw new Error(`Claude token refresh failed (${res.status}): ${body || "<empty>"}`);
-  }
-
-  const data = (await res.json()) as {
-    access_token: string;
-    refresh_token?: string;
-    expires_in?: number;
-  };
-
-  const refreshToken = data.refresh_token ?? creds.refreshToken;
-  const expiresAt = data.expires_in ? Date.now() + data.expires_in * 1000 : null;
-  const oauth = {
-    ...asClaudeOauthRecord(creds.raw),
-    accessToken: data.access_token,
-    refreshToken,
-    expiresAt,
-  };
-  const nextRaw = { ...creds.raw, claudeAiOauth: oauth };
-
-  // Persist the refreshed token to the file rather than back to the Keychain:
-  // readClaudeCredentials() reads the file first, so the next read picks it up,
-  // and this avoids a `security add-generic-password` write that can trigger a
-  // GUI Keychain-authorization prompt this headless service can't answer.
-  await mkdir(path.dirname(CLAUDE_CREDENTIALS_PATH), { recursive: true });
-  await writeFile(CLAUDE_CREDENTIALS_PATH, JSON.stringify(nextRaw), { encoding: "utf-8", mode: 0o600 });
-
-  return {
-    accessToken: data.access_token,
-    refreshToken,
-    expiresAt,
-    raw: nextRaw,
-    source: "file",
-  };
-}
-
-async function getClaudeCredentials(): Promise<ClaudeCredentials> {
-  const creds = await readClaudeCredentials();
-  if (!isExpiringSoon(creds.expiresAt)) {
-    return creds;
-  }
-
-  // A failed refresh leaves an expired token in play, which surfaces much later
-  // as an opaque 401 from the API — say so here instead.
-  const refreshed = await refreshClaudeCredentials(creds).catch((error: unknown) => {
-    console.warn(
-      `Claude token refresh failed (credentials source: ${creds.source}); continuing with the expired token.`,
-      error,
-    );
-    return null;
-  });
-  return refreshed ?? creds;
-}
-
 function buildClaudeHeaders(accessToken: string): Record<string, string> {
   return {
     Authorization: `Bearer ${accessToken}`,
@@ -1284,7 +1112,7 @@ async function requestClaudeMessage(
   inspectBody: (body: Record<string, unknown>) => void = () => {},
 ): Promise<Record<string, unknown>> {
   const rateLimitRevision = claudeRateLimitGate.beginRequest();
-  let creds = await getClaudeCredentials();
+  let creds = await claudeOAuth.getCredentials();
   const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
   // Before the wire, and before any retry: the prefix is a property of the
   // request we built, not of whether it happened to succeed.
@@ -1326,25 +1154,13 @@ async function requestClaudeMessage(
     captureClaudeUsage(res);
 
     if ((res.status === 401 || res.status === 403) && authAttempt === 0) {
-      // The OAuth credentials are shared with the Claude Code app, which uses
-      // rotating refresh tokens: a concurrent rotation invalidates both the
-      // access token we just sent and our in-hand refresh token. Re-read the
-      // file first — the other process has usually already written fresh
-      // tokens, so we can adopt them instead of spending our now-stale refresh
-      // token on a refresh that would itself 401.
-      const latest = await readClaudeCredentials().catch(() => null);
-      if (latest && latest.accessToken !== creds.accessToken) {
-        creds = latest;
+      // 票据是 Holly 独占的，被拒只可能是 access token 提前失效；换一次再试。并发的其他
+      // 请求若已经换过，forceRefresh 会直接交回那份新的，不会再花一次刷新。
+      const refreshed = await claudeOAuth.forceRefresh(creds);
+      if (refreshed) {
+        creds = refreshed;
         authAttempt += 1;
         continue;
-      }
-      if (creds.refreshToken) {
-        const refreshed = await refreshClaudeCredentials(creds).catch(() => null);
-        if (refreshed) {
-          creds = refreshed;
-          authAttempt += 1;
-          continue;
-        }
       }
     }
 
@@ -1497,7 +1313,7 @@ export async function runClaudeToolLoop(input: {
 export async function probeClaudeUsage(model: string): Promise<ClaudeUsage | null> {
   try {
     const rateLimitRevision = claudeRateLimitGate.beginRequest();
-    const creds = await getClaudeCredentials();
+    const creds = await claudeOAuth.getCredentials();
     const body = {
       model,
       max_tokens: 1,

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 
 import { ConversationLedger } from "../conversation-ledger.js";
@@ -156,7 +159,15 @@ test("restore keeps a transcript that ends on a settled turn", () => {
 
 // --- the seam Phase 3 depends on -------------------------------------------
 
-test("the tool loop's turn hooks keep a ledger in step, in order", async () => {
+test("the tool loop's turn hooks keep a ledger in step, in order", async (t) => {
+  // 传输层要先拿到 Holly 自己的登录票据；给一份临时的假票据，别读到本机真实的登录。
+  const oauthStoreDir = await mkdtemp(join(tmpdir(), "holly-ledger-oauth-"));
+  t.after(() => rm(oauthStoreDir, { recursive: true, force: true }));
+  process.env.HOLLY_CLAUDE_OAUTH_STORE = join(oauthStoreDir, "credentials.json");
+  await writeFile(
+    process.env.HOLLY_CLAUDE_OAUTH_STORE,
+    JSON.stringify({ accessToken: "test-access", refreshToken: "test-refresh", expiresAt: Date.now() + 86_400_000 }),
+  );
   const { runClaudeToolLoop } = await import("../llm-client.js");
   const original = globalThis.fetch;
   const responses: Array<Record<string, unknown>> = [

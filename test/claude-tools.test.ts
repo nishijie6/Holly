@@ -167,6 +167,16 @@ test("parseClaudeToolUses skips malformed blocks instead of throwing", () => {
 
 // --- the loop --------------------------------------------------------------
 
+// 传输层要先拿到 Holly 自己的登录票据才会发请求。给它一份临时的假票据，过期时间放远，
+// 免得测试依赖本机有没有登录，更不能读到真实的票据。
+const oauthStoreDir = await mkdtemp(join(tmpdir(), "holly-claude-tools-oauth-"));
+process.env.HOLLY_CLAUDE_OAUTH_STORE = join(oauthStoreDir, "credentials.json");
+await writeFile(
+  process.env.HOLLY_CLAUDE_OAUTH_STORE,
+  JSON.stringify({ accessToken: "test-access", refreshToken: "test-refresh", expiresAt: Date.now() + 86_400_000 }),
+);
+test.after(() => rm(oauthStoreDir, { recursive: true, force: true }));
+
 // runClaudeToolLoop goes through the real transport, so exercise it by stubbing
 // global fetch: that keeps the auth/retry/usage path under test rather than
 // mocked out, which is where the loop's real risk sits.

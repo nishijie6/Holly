@@ -13,5 +13,6 @@ __pycache__/
 
 # Local / credentials — never commit
 .codex/auth.json
+.claude-oauth/
 .claude/settings.local.json
 /config.yaml
