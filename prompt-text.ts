@@ -15,9 +15,9 @@ import { fileURLToPath } from "node:url";
 // 装作没事——那样她会变成一个没有设定的裸模型，还照样往群里说话。宁可起不来。
 // 与 autonomy 那份「最近写过什么」相反：那个缺了只少几行提示，这个缺了就没有她了。
 //
-// 路径按本模块自身的位置解析，不看进程 cwd：PM2 用 tsx 直接跑仓库里的源码
-// （ecosystem.config.cjs），dist 不参与运行，所以这里和 prompts/ 始终是同级。哪天真改成跑
-// dist，第一次加载就会当场抛错，而不是安静地少掉半个 prompt。
+// 路径按本模块自身的位置解析，不看进程 cwd：开发模式读取仓库里的 prompts/，
+// npm run build 会把这些文件复制到 dist/prompts/，编译模式也读取与模块同级的文件。
+// 构建资源缺失时直接抛错，不带着不完整的 prompt 继续运行。
 
 const PROMPT_DIR = join(dirname(fileURLToPath(import.meta.url)), "prompts");
 

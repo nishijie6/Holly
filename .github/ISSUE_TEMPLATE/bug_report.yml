@@ -1,0 +1,35 @@
+name: Bug report
+description: Report a reproducible problem using sanitized data.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include tokens, private messages, raw logs or configuration files.
+        Report vulnerabilities privately through the repository's Security tab.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem and expected behavior
+      description: What happened, and what should have happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Use synthetic IDs and invented messages.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Node version, Holly commit, LLM provider and enabled features.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Paste only the relevant error; remove credentials and identifying data.

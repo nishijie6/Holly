@@ -7,6 +7,11 @@ Holly is a local TypeScript service for receiving upstream chat events, deciding
 
 Real account IDs, service endpoints, credentials and persona text belong in the ignored local `config.yaml` and `.env` files. Only sanitized examples are tracked by Git.
 
+See [the setup guide](docs/SETUP.md) for first startup, model login, QQ connection,
+optional search and troubleshooting. Contributions are welcome through
+[issues and pull requests](CONTRIBUTING.md); report vulnerabilities through the
+[private security reporting channel](SECURITY.md).
+
 ## 中文说明
 
 Holly 是一个本地运行的 TypeScript 消息服务，用来接收上游 WebSocket 消息、调用 LLM 判断是否需要回复，并把消息写入 SQLite 或 Qdrant 以便后续检索和上下文记忆。
@@ -213,7 +218,7 @@ or storage failures fall back to the configured mode instead of blocking startup
 
 ## Notes
 
-- The former AIRadar-derived AI-tone classifier and model weights have been removed because redistribution permission could not be established. AI-tone scoring is no longer available; old `ai_tone` settings are ignored.
+- This release does not include AI-tone scoring; old `ai_tone` settings are ignored.
 
 - Session logs are written to the `logs/` directory.
 - The repository also contains a Python file (`main.py`), but the active service described here is the TypeScript implementation.
