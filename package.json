@@ -18,7 +18,7 @@
     "start": "node --use-env-proxy --env-file-if-exists=.env dist/main.js",
     "dev": "node --use-env-proxy --env-file-if-exists=.env --import tsx main.ts",
     "llm:test": "node --use-env-proxy --env-file-if-exists=.env --import tsx test.ts",
-    "test": "node --import tsx --test \"test/*.test.ts\"",
+    "test": "node --import tsx --test --test-timeout=60000 \"test/*.test.ts\"",
     "eval:proactive": "node --use-env-proxy --env-file-if-exists=.env --import tsx proactive-eval.ts",
     "search:test": "node --use-env-proxy --env-file-if-exists=.env --import tsx web-search.ts",
     "search-flow:test": "node --use-env-proxy --env-file-if-exists=.env --import tsx search-flow-eval.ts",
