@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -57,4 +57,15 @@ test("an unknown decision profile is rejected during config loading", async () =
   await withConfig(profilesYaml.replace("decision_profile: claude_sonnet", "decision_profile: missing"), async (path) => {
     await assert.rejects(() => listLlmProfiles(path), /decision profile 'missing' not found/i);
   });
+});
+
+test("a missing local config explains how to create it without creating one implicitly", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "holly-missing-config-"));
+  const path = join(dir, "config.yaml");
+  try {
+    await assert.rejects(() => listLlmProfiles(path), /copy.*config\.example\.yaml.*config\.yaml/i);
+    await assert.rejects(() => access(path), { code: "ENOENT" });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

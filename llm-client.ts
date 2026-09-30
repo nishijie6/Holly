@@ -337,7 +337,9 @@ function delay(ms: number): Promise<void> {
 
 async function loadConfig(configPath: string): Promise<AppConfig> {
   if (!existsSync(configPath)) {
-    throw new Error(`Config file not found: ${configPath}.`);
+    throw new Error(
+      `Config file not found: ${configPath}. Copy config.example.yaml to config.yaml and fill in your local settings before starting Holly.`,
+    );
   }
 
   const raw = await readFile(configPath, "utf-8");

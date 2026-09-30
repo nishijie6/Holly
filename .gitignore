@@ -10,9 +10,10 @@ __pycache__/
 *.log
 .env
 .env.*
+!.env.example
 
 # Local / credentials — never commit
+/config.yaml
 .codex/auth.json
 .claude-oauth/
 .claude/settings.local.json
-/config.yaml

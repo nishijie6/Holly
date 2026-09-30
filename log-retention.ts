@@ -34,7 +34,6 @@ export const JSONL_RETENTION_RULES: readonly JsonlRetentionRule[] = [
   { file: "world-observations.jsonl", keepLines: 2_000, readBy: "loadWorldObservationMemory (cap 128)" },
   { file: "holly-memories.jsonl", keepLines: 2_000, readBy: "memory sidebar (slice(-12))" },
   { file: "boot-thoughts.jsonl", keepLines: 1_000, readBy: "nothing — write-only" },
-  { file: "ai-tone.jsonl", keepLines: 2_000, readBy: "nothing — write-only shadow log" },
   { file: "proactive-shadow.jsonl", keepLines: 2_000, readBy: "nothing — write-only shadow log" },
 ];
 

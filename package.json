@@ -1,5 +1,11 @@
 {
-  "name": "pybot-ts",
+  "name": "holly",
+  "license": "MIT",
+  "description": "A local QQ chat agent with configurable LLMs, memory and an operator dashboard",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nishijie6/Holly.git"
+  },
   "version": "1.0.0",
   "private": true,
   "type": "module",
@@ -16,7 +22,6 @@
     "eval:proactive": "NODE_USE_ENV_PROXY=1 tsx proactive-eval.ts",
     "search:test": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx web-search.ts",
     "search-flow:test": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx search-flow-eval.ts",
-    "ai-tone:test": "tsx ai-tone.ts",
     "db:migrate:qdrant-to-sqlite": "NODE_USE_ENV_PROXY=1 node --env-file-if-exists=.env --import tsx migrate-qdrant-to-sqlite.ts",
     "pm2:start": "pm2 start ecosystem.config.cjs",
     "pm2:stop": "pm2 stop ecosystem.config.cjs",
@@ -30,13 +35,14 @@
     "yaml": "^2.8.1"
   },
   "overrides": {
-    "undici": "^8.8.0"
+    "undici": "^8.11.2",
+    "js-yaml": "^4.3.2"
   },
   "devDependencies": {
     "@types/node": "^24.6.0",
     "@types/ws": "^8.18.1",
-    "pm2": "^7.0.3",
-    "tsx": "^4.20.5",
+    "pm2": "^7.0.4",
+    "tsx": "^4.23.15",
     "typescript": "^5.9.3"
   }
 }

@@ -1219,8 +1219,8 @@ export function renderMonitorPage(wsTargetUrl: string): string {
         <div class="ph2"><span class="ph2-title">Filters</span></div>
         <div class="pb">
           <form class="fgrid" @submit.prevent="loadMemories">
-            <label>Group ID <input v-model="mf.groupId" placeholder="20000002" /></label>
-            <label>User ID <input v-model="mf.userId" placeholder="10000003" /></label>
+            <label>Group ID <input v-model="mf.groupId" placeholder="群号" /></label>
+            <label>User ID <input v-model="mf.userId" placeholder="QQ 号" /></label>
             <label>Type
               <select v-model="mf.messageType">
                 <option value="group">group</option>

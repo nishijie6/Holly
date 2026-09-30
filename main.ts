@@ -206,7 +206,6 @@ import {
   parseWorldObservationShareDecision,
   type WorldObservationShareDecision,
 } from "./autonomy-prompts.js";
-import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
 import {
   ThoughtHistoryStore,
   type ThoughtEntry,
@@ -720,16 +719,6 @@ const DEFAULT_BROWSER_AGENT_CONFIG: BrowserAgentRuntimeConfig = {
   querySuffix: "latest updates",
 };
 
-type AiToneRuntimeConfig = {
-  enabled: boolean;
-  threshold: number;
-};
-
-const DEFAULT_AI_TONE_CONFIG: AiToneRuntimeConfig = {
-  enabled: true,
-  threshold: 0.6,
-};
-
 const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
   enabled: true,
   mode: "shadow",
@@ -750,7 +739,7 @@ const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
     "AI", "人工智能", "机器学习", "深度学习", "神经网络", "大模型", "算法", "llm", "gpt", "transformer",
     "天文", "星空", "星系", "宇宙", "行星", "恒星", "黑洞", "望远镜", "nasa", "卫星", "月球", "火星",
   ],
-  echoOnlyGroups: ["20000003"],
+  echoOnlyGroups: [],
 };
 
 const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
@@ -871,8 +860,6 @@ let archiveWriteQueue: Promise<void> = Promise.resolve();
 let readOnlyMode = false;
 let readOnlyPersistQueue: Promise<void> = Promise.resolve();
 let worldBroadcastPersistQueue: Promise<void> = Promise.resolve();
-let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
-let aiToneClassifier: AiToneClassifier | null = null;
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // 每个群的「当天历史补齐」任务。存 Promise 而不是布尔标记，是为了让并发的
 // 第二个调用者能等同一次补齐，而不是各拉各的；按天记 key 则保证跨过零点后
@@ -1364,8 +1351,6 @@ async function loadSearchConfig(configPath: string): Promise<SearchRuntimeConfig
   };
 }
 
-// Read the optional `ai_tone:` config section. Shadow-only signal — scores each
-// outgoing reply and logs it, never blocks. Hot-reloaded by the config watcher.
 function readOptionalString(value: unknown): string | null {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
@@ -1403,23 +1388,6 @@ async function loadBrowserAgentConfig(configPath: string): Promise<BrowserAgentR
   };
 }
 
-async function loadAiToneConfig(configPath: string): Promise<AiToneRuntimeConfig> {
-  const base = { ...DEFAULT_AI_TONE_CONFIG };
-  if (!existsSync(configPath)) return base;
-  let parsed: { ai_tone?: Record<string, unknown> } | null = null;
-  try {
-    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as { ai_tone?: Record<string, unknown> } | null) ?? {};
-  } catch {
-    return base;
-  }
-  const a = parsed?.ai_tone;
-  if (!a || typeof a !== "object") return base;
-  const threshold = typeof a.threshold === "number" ? a.threshold : Number(a.threshold);
-  return {
-    enabled: typeof a.enabled === "boolean" ? a.enabled : base.enabled,
-    threshold: Number.isFinite(threshold) && threshold > 0 && threshold < 1 ? threshold : base.threshold,
-  };
-}
 
 // 代理设置必须在任何一次 fetch 之前完成，所以它是 bootstrap 的第一步。
 // 这里改的是进程环境变量而不是某个 client 的参数——因为要影响的是所有出网调用
@@ -1912,7 +1880,6 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
-  const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   const nextAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const nextPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
   const previousQqModePolicy = hollyBootstrapConfig.qqModePolicy;
@@ -1926,7 +1893,6 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   proactiveConfig = nextProactiveConfig;
   searchConfig = nextSearchConfig;
   browserAgentConfig = nextBrowserAgentConfig;
-  aiToneConfig = nextAiToneConfig;
   adminPolicyConfig = nextAdminPolicyConfig;
   privateChatConfig = nextPrivateChatConfig;
   adminCodeRunner?.setConfig(nextAdminPolicyConfig.codeImprovement);
@@ -5836,8 +5802,6 @@ async function forwardUnreadMessagesToModel(messages: readonly PendingModelMessa
     return;
   }
 
-  // Shadow: score the reply's AI tone before sending (log-only, never blocks).
-  recordOutgoingAiTone(decision.finalAnswer, effectiveContext.groupId);
 
   const sentMessageId = await sendReplyForContext(
     effectiveContext,
@@ -5883,47 +5847,6 @@ async function runUnreadBatchForModel(messages: PendingModelMessage[]): Promise<
   }
 }
 
-// ---------- 影子信号：只观察，不干预 ----------
-//
-// 「AI 味」打分属于还在标定期的功能：它现在对 Holly 那种短而技术的回复误报偏高，
-// 所以只写日志、不参与任何决定。这是这个项目里引入新判断的固定做法——
-// 先让它在真实流量上跑一段时间、能翻出记录来对比，再考虑让它有发言权。
-
-const AI_TONE_SHADOW_LOG_PATH = join(LOG_DIR, "ai-tone.jsonl");
-
-// Shadow signal: score an outgoing reply's "AI tone" and log it. Never blocks
-// the send — observe-only while the model is calibrated for Holly's short,
-// technical replies (it currently over-flags those; see ai-tone.ts).
-function recordOutgoingAiTone(text: string, groupId: number | string | null): void {
-  const classifier = aiToneClassifier;
-  if (!classifier || !aiToneConfig.enabled) return;
-  const cleaned = text.trim();
-  if (!cleaned) return;
-
-  let result;
-  try {
-    result = classifier.predict(cleaned, aiToneConfig.threshold);
-  } catch {
-    return;
-  }
-
-  pushMonitorEntry(
-    "status",
-    `AI-Tone(shadow) ${result.label} P(AI)=${result.prob.toFixed(2)}`,
-    `group=${groupId ?? "?"}\n${cleaned}`,
-  );
-
-  const record = {
-    ts: new Date().toISOString(),
-    group: String(groupId ?? ""),
-    prob: Number(result.prob.toFixed(4)),
-    isAI: result.isAI,
-    label: result.label,
-    text: cleaned,
-  };
-  aiToneShadowLog.append(record);
-}
-
 const PROACTIVE_SHADOW_LOG_PATH = join(LOG_DIR, "proactive-shadow.jsonl");
 
 function appendProactiveShadowLog(record: Record<string, unknown>): void {
@@ -5937,7 +5860,6 @@ const THOUGHT_HISTORY_LOG_PATH = join(LOG_DIR, "thought-history.jsonl");
 
 // One queue each. Three of these previously chained onto the proactive shadow
 // log's queue, which serialized four unrelated files behind one another.
-const aiToneShadowLog = new JsonlLog(AI_TONE_SHADOW_LOG_PATH, "ai-tone shadow log");
 const proactiveShadowLog = new JsonlLog(PROACTIVE_SHADOW_LOG_PATH, "proactive shadow log");
 const worldObservationLog = new JsonlLog(WORLD_OBSERVATION_LOG_PATH, "world observation log");
 const hollyMemoryLog = new JsonlLog(HOLLY_MEMORY_LOG_PATH, "Holly memory log");
@@ -7211,7 +7133,6 @@ async function maybeBroadcastWorldObservation(
       continue;
     }
 
-    recordOutgoingAiTone(message, target.key);
     const sentMessageId = await sendGroupMessage(target.numericId, message);
     appendConversationTurn({
       groupId: target.key,
@@ -8900,7 +8821,6 @@ async function bootstrap(): Promise<void> {
   const loadedProactiveConfig = await loadProactiveConfig(CONFIG_PATH);
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
-  const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
   const loadedHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   const loadedAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const loadedPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
@@ -8928,8 +8848,6 @@ async function bootstrap(): Promise<void> {
   adminPolicyConfig = loadedAdminPolicyConfig;
   privateChatConfig = loadedPrivateChatConfig;
   focusModeConfig = loadedFocusModeConfig;
-  aiToneConfig = loadedAiToneConfig;
-  aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   domainReputationStore = await DomainReputationStore.load(join(LOG_DIR, "domain-reputation.json"));
   thoughtHistoryStore = await ThoughtHistoryStore.load(THOUGHT_HISTORY_LOG_PATH, THOUGHT_HISTORY_LIMIT);

@@ -81,7 +81,7 @@ function renderBatchLine(message: FocusBatchMessage, maxChars: number): string |
 //
 // 会话必须拆成「消息来自」和「当前打开」两项写。这里原本只有一个 conversation: 群X,
 // 后台通知里它指的是消息来自哪,模型却读成了「我现在在 X」,没打开就 send_message,
-// 话进了焦点实际停着的另一个群(2026-09-10,20000003 的复读发进了 20000001)。
+// 话进了焦点实际停着的另一个群。
 // 前台路径里两项相同也照写:同一个字段在两种注入里意思不同,正是那次误读的来源。
 function renderRoundMetadata(input: FocusInjectionInput): string[] {
   const lines = [

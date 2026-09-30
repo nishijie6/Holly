@@ -1,8 +1,13 @@
 # Kagami 与 Holly 的实现对比
 
-对比对象：`/path/to/kagami`（本仓库）与 `/path/to/Holly`。
+对比对象：`/path/to/kagami` 与 `/path/to/Holly`（本仓库）。
 方法：结论一律回到源码核实，文件引用格式为 `路径:行号`。文档（README / ARCHITECTURE.md）只作导航线索，
 凡与代码冲突处单列一节说明。
+
+本文是历史实现快照。配置隐私一节已随本地配置迁移更新；示例中的账号、群号与路径均为占位值。
+
+开源准备更新：Holly 的 AIRadar 衍生实现和模型权重因再分发授权未确认而移除；
+下文 ai-tone 的对比仅描述旧版本，不代表当前版本包含该能力。
 
 ---
 
@@ -85,7 +90,7 @@ Holly 比 kagami **晚 8 个月起步**，且至今仍在演进；kagami 在 Hol
 | 测试 | vitest，1,439 用例 / 215 文件 | `node --test`，124 用例 / 20 文件 |
 | lint / format / 死码 | eslint + prettier + knip | **无** |
 | CI | GitHub Actions 5 路并行矩阵 | 无 `.github/` |
-| 配置密钥分离 | `config.yaml` + gitignored `config.secret.yaml` | 单个 `config.yaml`，PII 与云端 URL 明文入库 |
+| 配置密钥分离 | `config.yaml` + gitignored `config.secret.yaml` | 本地 `config.yaml` / `.env` 被 Git 忽略，仅提交 `.example` 模板 |
 | 对外绑定 | 仅 gateway 绑 `0.0.0.0:20004`，其余全绑 `127.0.0.1` | 全部绑 `127.0.0.1:5000` |
 
 ---
@@ -253,7 +258,7 @@ Holly 没有 provider 接口。`LlmProvider = "codex" | "claude"`（[`Holly/llm-
 
 Holly 的 profile 是**面向用户的模型档位**：`llm.active` 选一个，`llm.profiles.<name>` 给
 `{provider, model, system_prompt?}`（[`Holly/config.yaml:103-115`](../../Holly/config.yaml)：
-`codex_gpt54` / `claude_sonnet` / `claude_opus` / `claude_haiku`，当前 active = `claude_opus`）。
+`codex_gpt54` / `claude_sonnet` / `claude_opus` / `claude_haiku`，当时 active = `claude_opus`）。
 切换是运行时的——监控页 `POST /api/llm/active`（[`Holly/main.ts:8614`](../../Holly/main.ts)）能热切，
 且会 `saveConfig` 写回 config.yaml（[`Holly/llm-client.ts:158`](../../Holly/llm-client.ts)）。
 
@@ -545,13 +550,12 @@ cwd 逐级向上 → `anchorUrl`（调用方的 `import.meta.url`）所在目录
 11 个服务各自的 host/port。注释区分了两个概念：「host 是「别的服务/网关如何 reach 它」（reachable host），
 不是绑定地址。绑定地址是各服务代码里的安全决策」。
 
-### Holly：单文件，PII 明文
+### Holly：本地配置与公开模板分离
 
-[`Holly/config.yaml`](../../Holly/config.yaml) 是唯一配置文件（198 行），**没有密钥分离**。
-里面明文包含：管理员 QQ 号 `10000001`（:13）、bot QQ `10000002`（:53,126）、
-三个群号 `20000002` / `20000003`（:143-144,161,182）、
-Qdrant Cloud 完整实例 URL 含集群 ID（:134）、代理地址（:117）、
-以及 700+ 字的人设 system prompt（:33-102）。这个文件**在 git 里**。
+运行时读取本地 `config.yaml`，管理员 QQ、bot QQ、群号、服务地址、凭据和自定义人设均放在这个文件或 `.env` 中。
+这两个文件被 Git 忽略；仓库只保留 [`config.example.yaml`](../config.example.yaml) 和 [`.env.example`](../.env.example)。
+首次运行复制模板后填写真实值，已有安装继续使用原来的本地文件。示例默认只读、QQ 离线、管理员与自主任务关闭。
+历史版本曾提交过私人配置；历史已完成脱敏重写，GitHub 也已确认清理旧对象。
 
 加载方式是每个模块**各自读一遍**：`sqlite-store.ts` 有自己的 `resolveSqliteConfig`（:41-66）、
 `memory-store.ts` 有 `resolveDatabaseProvider`（:32-56）、`llm-client.ts` 有 `loadConfig`（:149）。
@@ -823,8 +827,8 @@ Holly 已经借了 NotificationCenter 模型、私聊 fail-closed 边界、SQLit
 
 1. **给 LLM 层加工具调用。** 这是 Holly 最大的架构天花板——目前每加一个能力就要在 `main.ts` 里写一段硬编排。
    kagami 的 `packages/llm`（100 行的类型契约）+ `tool-component.ts`（工具接口）是可以照抄的最小集。
-2. **给配置加密钥分离。** `config.yaml` 目前明文含管理员 QQ、bot QQ、三个群号、Qdrant Cloud 实例 URL 且已入 git。
-   kagami 的两文件深合并（`packages/config`，391 行）是个可直接复刻的小方案。
+2. **配置隐私迁移已完成。** 真实值留在 Git 忽略的 `config.yaml` / `.env`，仅提交 `.example` 模板。
+   运行时仍读取和写回同一个本地配置文件；历史记录与 GitHub 缓存清理也已完成。
 3. **加 lint + CI。** Holly 完全没有 eslint / prettier / CI。以 44 commits 的体量现在加成本最低；
    `codex-provider.ts` 这种孤儿文件正是 knip 一跑就能发现的。
 

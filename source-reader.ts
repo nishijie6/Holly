@@ -6,7 +6,7 @@ import { extname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 // 她就跑在这份代码上，被问起「你为什么会这样」的时候，凭印象编不如去读一眼。但同一个目录里
 // 还躺着 .env、logs/（完整聊天记录）、data/（SQLite）和 archive/（她自己的作品），所以这里
 // 是白名单而不是黑名单：只认源码和文档那几种扩展名，只在仓库根以内，点开头的一律不给。
-// config.yaml 也不给——它有 access_token 字段，现在是空的，以后未必。
+// config.yaml 也不给——它是被 Git 忽略的本地配置，包含账号、端点和凭据。
 //
 // 读到的内容会进 ledger 并永久留在上下文里，所以单次读有字符上限：她该读的是某一处究竟怎么
 // 写的，不是把整份 main.ts 搬进脑子。

@@ -2,7 +2,10 @@ name: test
 
 # Every branch, not just main: the point is to catch a break the moment it
 # is pushed, including on branches an agent is working on.
-on: push
+on: [push, pull_request]
+
+permissions:
+  contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,6 +29,12 @@ jobs:
 
       - name: Unit tests
         run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Dependency security audit
+        run: npm audit --audit-level=high
 
       # Lands with fix/admin-code-worker-isolation; no-ops until then.
       - name: Integration tests

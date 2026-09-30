@@ -1,14 +1,12 @@
 // Web search for Holly's "look it up before answering" capability.
 //
 // Backend: a self-hosted SearXNG instance (free, no per-query billing) reached
-// over the loopback interface — see run-searxng.sh / the local.searxng
-// LaunchAgent in /path/to/searxng. The endpoint is read from the
-// SEARXNG_URL env var (see .env), defaulting to http://127.0.0.1:8888. The
+// over the loopback interface. Set up SearXNG separately; the endpoint is read
+// from SEARXNG_URL (see .env.example), defaulting to http://127.0.0.1:8888. The
 // backend is swappable: callers depend only on searchWeb() -> SearchResult[].
 //
-// SearXNG runs locally, so no Clash proxy is needed for this request itself;
-// SearXNG's own outbound requests to Bing/Brave/etc. go through the system
-// proxy (already configured on this Mac).
+// A local SearXNG endpoint needs no proxy for this request itself. Configure
+// SearXNG's outbound access to its search engines in that service.
 
 import { pathToFileURL } from "node:url";
 
