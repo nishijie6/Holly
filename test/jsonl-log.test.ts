@@ -83,10 +83,21 @@ test("failures name the log, because the caller never sees the rejection", async
 });
 
 test("append never throws at the call site", async () => {
-  const log = new JsonlLog("/proc/definitely/not/writable/log.jsonl", "unwritable", () => {});
-  // A log write must not be the reason the thing being logged fails.
-  assert.doesNotThrow(() => log.append({ n: 1 }));
-  await log.flush();
+  const dir = join(tmpdir(), `jsonl-log-${randomUUID()}`);
+  await mkdir(dir, { recursive: true });
+  const parentFile = join(dir, "not-a-directory");
+  await writeFile(parentFile, "blocks directory creation", "utf-8");
+  const errors: unknown[] = [];
+  const log = new JsonlLog(join(parentFile, "log.jsonl"), "unwritable", (_message, error) => errors.push(error));
+  try {
+    // Use a real, deterministic filesystem error. Recursive mkdir below /proc
+    // can retry indefinitely on Linux instead of rejecting like it does on macOS.
+    assert.doesNotThrow(() => log.append({ n: 1 }));
+    await log.flush();
+    assert.equal(errors.length, 1);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });
 
 test("two logs do not share a queue", async () => {
