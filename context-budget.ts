@@ -60,6 +60,12 @@ export function estimateMessageTokens(message: LlmMessage): number {
   // whole rendered conversation, so a turn whose content is "" can still be
   // thousands of tokens. Counting only `content` would report such a transcript
   // as nearly free and let it grow past any budget unnoticed.
+  if (message.responseItems?.length) {
+    // These are the actual wire items. Prose and tool blocks mirror them, so
+    // counting both would double the budget; encrypted reasoning still costs
+    // context and must not disappear from the estimate.
+    return message.responseItems.reduce((sum, item) => sum + estimateTextTokens(JSON.stringify(item)) + 4, 6);
+  }
   const blockTokens = (message.blocks ?? []).reduce((sum, block) => {
     if (block.type === "tool_use") {
       return sum + estimateTextTokens(block.name) + estimateTextTokens(JSON.stringify(block.input)) + 4;
@@ -177,7 +183,19 @@ export function compressMemoryPrompt(memoryPrompt: string, budgetTokens: number)
   return result === header ? compactTextToTokenBudget(header, budgetTokens) : result;
 }
 
+// Codex ChatGPT-authenticated client windows (with the client's 95% effective
+// input allowance) differ from the API model's advertised maximum. Keep an
+// explicit table and use a conservative default for unrecognized GPT models.
+const CODEX_CONTEXT_WINDOWS: Readonly<Record<string, number>> = {
+  "gpt-6.1-sol": 475_000,
+  "gpt-6-astra": 258_400,
+  "gpt-6-sol": 258_400,
+  "gpt-6-luna": 258_400,
+  "gpt-5.6-sol": 258_400,
+  "gpt-5.6-terra": 258_400,
+  "gpt-5.6-luna": 258_400,
+};
+
 export function modelContextWindowTokens(model: string): number {
-  // Haiku 4.5 has a 200K window; Opus 4.x and Sonnet 4.6 are 1M.
-  return /haiku/i.test(model) ? 200_000 : 1_000_000;
+  return CODEX_CONTEXT_WINDOWS[model.trim().toLowerCase()] ?? 128_000;
 }

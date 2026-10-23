@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   DEFAULT_LEDGER_COMPACTION_OPTIONS,
+  LEDGER_COMPACTION_SYSTEM_PROMPT,
   buildLedgerCompactionInstruction,
   buildLedgerCompactionMessages,
   buildStaleLedgerSummaryMessages,
@@ -10,11 +11,13 @@ import {
   planLedgerCompaction,
   renderLedgerSummaryTurn,
 } from "../ledger-compaction.js";
+import * as compactionModule from "../ledger-compaction.js";
 import { ConversationLedger } from "../conversation-ledger.js";
-import { buildClaudeRequestBody, digestClaudeCachedPrefix, type LlmMessage } from "../llm-client.js";
+import { buildCodexRequestBody, digestCodexCachedPrefix, type LlmMessage } from "../llm-client.js";
 import { CachePrefixTracker } from "../cache-prefix.js";
 import { FOCUS_TOOL_DEFINITIONS } from "../qq-tools.js";
 import { buildFocusSystemPrompt } from "../focus-prompt.js";
+import { estimateMessagesTokens } from "../context-budget.js";
 
 // Where to cut a transcript. The failure that matters is not "summarized too
 // much" — it is a cut landing inside a tool exchange, which the API rejects
@@ -65,6 +68,102 @@ test("the threshold counts tool blocks, not just prose", () => {
 });
 
 // --- where the cut lands ---------------------------------------------------
+
+test("an oversized transcript plans one full cut with bounded summary requests and no encrypted reasoning", async () => {
+  const messages: LlmMessage[] = Array.from({ length: 24 }, (_, i) => [
+    text(`round-${i}: ${"历史事实 ".repeat(300)}`),
+    {
+      role: "assistant" as const,
+      content: `completed-${i}`,
+      responseItems: [{ type: "reasoning", encrypted_content: "opaque-reasoning".repeat(2000) }],
+    },
+  ]).flat();
+  const options = { thresholdTokens: 2_000, keepRatio: 0.25, maxSummaryTokens: 6_000 };
+  const plan = planLedgerCompaction(messages, options);
+  assert.ok(plan);
+  assert.equal(plan.summarize.length, messages.length - 2, "plan through the low-water mark, independent of the per-request budget");
+  assert.equal(plan.keep[0].role, "user");
+  assert.deepEqual([...plan.summarize, ...plan.keep], messages, "batching cannot drop historical turns");
+
+  const ledger = new ConversationLedger();
+  ledger.restore(messages);
+  const compactor = new compactionModule.LedgerCompactor();
+  let requests = 0;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async (request) => {
+      requests++;
+      assert.ok(estimateMessagesTokens(request) <= options.maxSummaryTokens);
+      const wire = JSON.stringify(buildCodexRequestBody("gpt-6.1-sol", "summarize", request));
+      assert.doesNotMatch(wire, /opaque-reasoning/);
+      return "## 持续背景\n- 保留累计历史事实";
+    }, options);
+    if (result.status === "compacted") break;
+    assert.equal(result.status, "progress");
+    assert.deepEqual(ledger.snapshot(), messages, "every slice must finish before replacing history");
+  }
+  assert.ok(requests > 1);
+  assert.deepEqual(ledger.snapshot().slice(1), plan.keep);
+});
+
+test("multi-round compaction preserves the cache prefix until one final replacement creates headroom", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([
+    text(renderLedgerSummaryTurn("## 持续背景\n- FACT-BASE: an unfinished promise")),
+    ...Array.from({ length: 12 }, (_, i) => [
+      text(`FACT-${i}: ${"历史材料".repeat(200)}`), say(`round-${i} complete`),
+    ]).flat(),
+  ]);
+  const options = { thresholdTokens: 4_000, keepRatio: 0.25, maxSummaryTokens: 4_000 };
+  const original = [...ledger.snapshot()];
+  const plan = planLedgerCompaction(original, options);
+  assert.ok(plan);
+  const compactor = new compactionModule.LedgerCompactor();
+  const tracker = new CachePrefixTracker();
+  const inspect = () => tracker.inspect("focus-ledger", digestCodexCachedPrefix(buildCodexRequestBody(
+    "gpt-6.1-sol", "stable persona", [...ledger.snapshot()],
+    { tools: [...FOCUS_TOOL_DEFINITIONS], volatileTailMessages: 1 },
+  ))).status;
+  assert.equal(inspect(), "fresh");
+  const sources: string[] = [];
+  const arriving: LlmMessage[] = [];
+  let lastSummary = "";
+  let completed = false;
+  let requests = 0;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async (request) => {
+      requests++;
+      assert.ok(estimateMessagesTokens(request) <= options.maxSummaryTokens);
+      if (lastSummary) assert.ok(request[0].content.includes(lastSummary), "carry the previous slice's summary forward");
+      sources.push(request[0].content.match(/<historical_transcript>\n([\s\S]*)\n<\/historical_transcript>/u)![1]);
+      const facts = [...new Set(sources.join("").match(/FACT-(?:BASE|\d+)/gu))];
+      lastSummary = `## 持续背景\n- ${facts.join(", ")}`;
+      return lastSummary;
+    }, options);
+    if (result.status === "compacted") {
+      completed = true;
+      assert.equal(inspect(), "rebuilt");
+      break;
+    }
+    assert.equal(result.status, "progress", "small summary requests must not cause repeated prefix replacements");
+    assert.equal(inspect(), "unchanged");
+    assert.deepEqual(ledger.snapshot(), [...original, ...arriving]);
+    const incoming = text(`message arriving during slice ${i}`);
+    ledger.appendUserText(incoming.content);
+    arriving.push(ledger.snapshot().at(-1)!);
+    assert.equal(inspect(), "extended");
+  }
+  assert.equal(completed, true);
+  assert.ok(requests > 1);
+  for (const message of plan.summarize) {
+    const fact = message.content.match(/FACT-(?:BASE|\d+)/u)?.[0];
+    if (fact) assert.ok(sources.join("").includes(fact), `summarize ${fact} before discarding its source`);
+  }
+  assert.match(ledger.snapshot()[0].content, /FACT-BASE/);
+  assert.deepEqual(ledger.snapshot().slice(1), [...plan.keep, ...arriving]);
+  assert.deepEqual(ledger.pendingToolUses, []);
+  assert.ok(estimateMessagesTokens(ledger.snapshot()) < options.thresholdTokens, "finished compaction leaves room for new turns");
+  assert.equal((await compactor.compact(ledger, async () => { throw new Error("must not immediately compact again"); }, options)).status, "not-needed");
+});
 
 test("the newest turns are kept and the front is summarized", () => {
   const messages = Array.from({ length: 8 }, (_, i) => text(`第${i}条`));
@@ -145,7 +244,7 @@ test("keepRatio is clamped so a bad config cannot summarize everything", () => {
   assert.ok(huge.summarize.length >= 1, "compaction that summarizes nothing is not compaction");
 });
 
-// --- the summary call reuses the focus prefix -------------------------------
+// --- summary requests carry bounded historical facts ------------------------
 
 const LEDGER: LlmMessage[] = [
   text("<conversation_summary>\n## 持续背景\n- 群20000003 禁止复读\n</conversation_summary>"),
@@ -159,56 +258,42 @@ const LEDGER: LlmMessage[] = [
   text("[通知] 群20000002 有 2 条新消息,焦点没动:\n  [某人(1)] 看新闻\n[本轮 current_time: 2026-09-11 13:05 星期五 | 消息来自: 群20000002 | 当前打开: 群20000001]"),
 ];
 
-test("the compaction request is the ledger unchanged, plus one instruction at the end", () => {
+test("the summary contains prefix facts and tool results while leaving the live tail out", () => {
   const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
   assert.ok(plan);
   const messages = buildLedgerCompactionMessages(LEDGER, plan);
 
-  assert.equal(messages.length, LEDGER.length + 1);
-  LEDGER.forEach((message, index) => assert.equal(messages[index], message, `message ${index} must be the ledger's own`));
-  assert.equal(messages.at(-1)?.role, "user");
-  assert.match(messages.at(-1)?.content ?? "", /^<system_reminder>/u);
+  assert.equal(messages.length, 1);
+  assert.equal(messages[0].role, "user");
+  assert.match(messages[0].content, /群20000003 禁止复读/);
+  assert.match(messages[0].content, /工具调用 open_conversation/);
+  assert.match(messages[0].content, /工具结果 \(tu_1\): 结果/);
+  assert.doesNotMatch(messages[0].content, /看新闻/);
 });
 
-// 这一条钉的是整件事的前提：摘要请求在线上的 system、工具和消息块，必须是焦点循环请求的逐字节
-// 延长，否则「复用前缀、命中缓存」只是一句注释。cache_control 不参与缓存键，比较时去掉。
-test("the compaction request extends the focus loop's request byte for byte", () => {
+test("the independent summary request cannot execute historical tools", () => {
+  const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
+  assert.ok(plan);
+  const body = buildCodexRequestBody("gpt-6.1-sol", LEDGER_COMPACTION_SYSTEM_PROMPT, buildLedgerCompactionMessages(LEDGER, plan));
+  assert.equal(body.tools, undefined);
+  assert.ok(wireInput(body).every((item) => item.role === "user"));
+  assert.match(String(wireInput(body)[0].content), /工具调用 open_conversation/);
+});
+
+test("summary attempts on their own cache route leave an unchanged focus prefix intact", () => {
   const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
   assert.ok(plan);
   const system = buildFocusSystemPrompt("你是 Holly。").trim();
-  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...FOCUS_TOOL_DEFINITIONS] };
-  const focus = buildClaudeRequestBody("claude-sonnet-4-6", system, LEDGER, options);
-  const compaction = buildClaudeRequestBody("claude-sonnet-4-6", system, buildLedgerCompactionMessages(LEDGER, plan), options);
-
-  assert.deepEqual(compaction.tools, focus.tools);
-  assert.deepEqual(compaction.system, focus.system);
-
-  const focusBlocks = wireBlocks(focus);
-  const compactionBlocks = wireBlocks(compaction);
-  assert.equal(compactionBlocks.length, focusBlocks.length + 1, "only the instruction is new");
-  assert.deepEqual(compactionBlocks.slice(0, focusBlocks.length), focusBlocks);
-  // 焦点请求缓存到的位置，整个落在摘要请求的缓存范围之内。
-  assert.ok(breakpointIndex(compaction) >= breakpointIndex(focus));
-});
-
-// 反过来看这对请求的先后。压缩请求在焦点路由上发出之后，下一次焦点请求哪怕面对一模一样的账本（压缩
-// 失败、什么都没替换），检测器也会判成重建：压缩请求把整本账本算进了缓存前缀，焦点请求却把最后一条
-// 当作易变尾部排除在外，前缀少了一块。所以 main.ts 在「发过压缩请求」时就给紧接着的第一轮标上
-// expectRebuild，而不是只在压缩成功时——否则每次压缩失败都会留下一条假的 Prefix Drift。
-test("after a compaction request, the next focus request inspects as rebuilt even if the ledger is unchanged", () => {
-  const plan = planLedgerCompaction(LEDGER, { thresholdTokens: 1, keepRatio: 0.4 });
-  assert.ok(plan);
-  const system = buildFocusSystemPrompt("你是 Holly。").trim();
-  const options = { cacheStablePrefix: true, volatileTailMessages: 1, tools: [...FOCUS_TOOL_DEFINITIONS] };
+  const options = { volatileTailMessages: 1, tools: [...FOCUS_TOOL_DEFINITIONS] };
   const tracker = new CachePrefixTracker();
-  const inspect = (messages: LlmMessage[]) => tracker.inspect(
-    "claude-sonnet-4-6|focus-ledger",
-    digestClaudeCachedPrefix(buildClaudeRequestBody("claude-sonnet-4-6", system, messages, options)),
+  const inspect = (messages: LlmMessage[], route = "focus-ledger") => tracker.inspect(
+    `gpt-6.1-sol|${route}`,
+    digestCodexCachedPrefix(buildCodexRequestBody("gpt-6.1-sol", system, messages, options)),
   ).status;
 
   assert.equal(inspect(LEDGER), "fresh");
-  assert.equal(inspect(buildLedgerCompactionMessages(LEDGER, plan)), "extended");
-  assert.equal(inspect(LEDGER), "rebuilt");
+  assert.equal(inspect(buildLedgerCompactionMessages(LEDGER, plan), "ledger-compaction"), "fresh");
+  assert.equal(inspect(LEDGER), "unchanged");
 });
 
 // --- the instruction and the summary turn -----------------------------------
@@ -242,9 +327,10 @@ test("a summary turn round-trips, and wrappers the model adds are stripped", () 
 
 test("a stale transcript is summarized whole, after dropping a trailing unanswered tool call", () => {
   const messages = buildStaleLedgerSummaryMessages([...LEDGER, calls("tu_9", "再看看")]);
-  // 结尾没收到结果的工具调用丢掉，其余原样照发，最后多一条整理指令。
-  assert.equal(messages.length, LEDGER.length + 1);
-  LEDGER.forEach((message, index) => assert.deepEqual(messages[index], message, `message ${index}`));
+  assert.equal(messages.length, 1);
+  assert.match(messages[0].content, /今天真热啊/);
+  assert.match(messages[0].content, /看新闻/);
+  assert.doesNotMatch(messages[0].content, /tu_9|再看看/);
 
   const instruction = messages.at(-1)?.content ?? "";
   assert.match(instruction, /上面的全部内容/u);
@@ -257,6 +343,230 @@ test("a stale transcript with nothing settled left has nothing to summarize", ()
   assert.throws(() => buildStaleLedgerSummaryMessages([calls("tu_1")]), /nothing left to summarize/u);
 });
 
+test("a failed summary keeps every turn and defers further attempts until the retry window", async () => {
+  assert.equal(typeof compactionModule.LedgerCompactor, "function");
+  let now = 1_000_000;
+  const compactor = new compactionModule.LedgerCompactor({ now: () => now, retryMs: 1000 });
+  const ledger = new ConversationLedger();
+  ledger.restore(Array.from({ length: 12 }, (_, i) => text(`fact-${i}: ${"背景".repeat(100)}`)));
+  const before = [...ledger.snapshot()];
+  let attempts = 0;
+  const summarize = async () => {
+    if (++attempts === 1) throw new Error("fetch failed");
+    return "## 持续背景\n- 已整理历史事实";
+  };
+  await assert.rejects(compactor.compact(ledger, summarize, LOW), /fetch failed/);
+  assert.deepEqual(ledger.snapshot(), before);
+  now += 999;
+  assert.equal((await compactor.compact(ledger, summarize, LOW)).status, "deferred");
+  assert.equal(attempts, 1);
+  now += 1;
+  assert.equal((await compactor.compact(ledger, summarize, LOW)).status, "compacted");
+  assert.equal(attempts, 2);
+  assert.ok(ledger.size < before.length);
+  assert.deepEqual(ledger.pendingToolUses, []);
+});
+
+test("an empty summary cannot discard history", async () => {
+  assert.equal(typeof compactionModule.LedgerCompactor, "function");
+  const ledger = new ConversationLedger();
+  ledger.restore([text("背景".repeat(100)), text("当前这一轮")]);
+  const before = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor();
+  await assert.rejects(compactor.compact(ledger, async () => "  ", LOW), /empty/i);
+  assert.deepEqual(ledger.snapshot(), before);
+});
+
+test("one oversized tool round advances in bounded stages and retains its originals until every slice is summarized", async () => {
+  const ledger = new ConversationLedger();
+  const messages: LlmMessage[] = [text("FACT-A: an unfinished promise")];
+  for (let i = 0; i < 5; i++) {
+    messages.push(calls(`large-${i}`), {
+      role: "user", content: "",
+      blocks: [{ type: "tool_result", toolUseId: `large-${i}`, content: `${"材料".repeat(4000)}${i === 4 ? " FACT-Z: the final source fact" : ""}` }],
+    });
+  }
+  messages.push(say("the tool round is settled"), text("CURRENT: a later conversation"));
+  ledger.restore(messages);
+  const before = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor();
+  const seenFacts = new Set<string>();
+  let requests = 0;
+  let complete = false;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async (input) => {
+      requests++;
+      assert.ok(JSON.stringify(input).length < 12_000, "even a single large tool round must stay bounded");
+      for (const fact of ["FACT-A", "FACT-Z"]) if (input[0].content.includes(fact)) seenFacts.add(fact);
+      return "## 持续背景\n- " + [...seenFacts].join(", ");
+    }, { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 });
+    if (result.status === "compacted") { complete = true; break; }
+    assert.equal(result.status, "progress");
+    assert.deepEqual(ledger.snapshot(), before, "partial work cannot delete the original round");
+  }
+  assert.equal(complete, true);
+  assert.ok(requests > 1);
+  assert.deepEqual([...seenFacts].sort(), ["FACT-A", "FACT-Z"]);
+  assert.match(ledger.snapshot()[0].content, /FACT-A.*FACT-Z/s);
+  assert.equal(ledger.snapshot().at(-1)?.content, "CURRENT: a later conversation");
+  assert.deepEqual(ledger.pendingToolUses, []);
+});
+
+test("a network failure retries the same unread source after backoff without losing earlier progress", async () => {
+  let now = 1_000_000;
+  const ledger = new ConversationLedger();
+  ledger.restore([text("long-round: " + "事实 ".repeat(6000)), text("live-tail")]);
+  const original = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor({ now: () => now, retryMs: 1000 });
+  const options = { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 };
+  assert.equal((await compactor.compact(ledger, async () => "## 持续背景\n- first-slice-fact", options)).status, "progress");
+  let failedRequest = "";
+  await assert.rejects(compactor.compact(ledger, async (request) => {
+    failedRequest = request[0].content;
+    throw new Error("fetch failed");
+  }, options), /fetch failed/);
+  assert.deepEqual(ledger.snapshot(), original);
+  assert.equal((await compactor.compact(ledger, async () => { throw new Error("must wait"); }, options)).status, "deferred");
+  now += 1000;
+  await compactor.compact(ledger, async (request) => {
+    assert.equal(request[0].content, failedRequest);
+    assert.match(request[0].content, /first-slice-fact/);
+    return "## 持续背景\n- first-slice-fact and more";
+  }, options);
+});
+
+test("a timed out slice shrinks on retry and still summarizes every source character", async () => {
+  let now = 1000;
+  const ledger = new ConversationLedger();
+  ledger.restore([text("FACT-FIRST: " + "历史材料 ".repeat(6000) + " FACT-LAST"), text("live-tail")]);
+  const original = [...ledger.snapshot()];
+  const options = { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 };
+  const compactor = new compactionModule.LedgerCompactor({ now: () => now, retryMs: 1000 });
+  const source = (request: LlmMessage[]) => request[0].content.match(/<historical_transcript>\n([\s\S]*)\n<\/historical_transcript>/u)![1];
+  let failedSource = "";
+  await assert.rejects(compactor.compact(ledger, async (request) => {
+    failedSource = source(request);
+    throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
+  }, options), /timeout/);
+  assert.deepEqual(ledger.snapshot(), original);
+  now += 1000;
+  const consumed: string[] = [];
+  let complete = false;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async (request) => {
+      const chunk = source(request);
+      assert.ok(chunk.length < failedSource.length, "do not replay the same oversized timed-out slice");
+      consumed.push(chunk);
+      return "## 持续背景\n- FACT-FIRST and FACT-LAST retained";
+    }, options);
+    if (result.status === "compacted") { complete = true; break; }
+    assert.equal(result.status, "progress");
+    assert.deepEqual(ledger.snapshot(), original);
+  }
+  assert.equal(complete, true);
+  assert.equal(consumed.join(""), `[历史 user]\n${original[0].content}`);
+  assert.equal(ledger.snapshot().at(-1)?.content, "live-tail");
+});
+
+test("preparing an oversized ledger finishes all summary slices before it permits a focus request", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([text("old facts ".repeat(6000)), text("live-tail")]);
+  const compactor = new compactionModule.LedgerCompactor();
+  let slices = 0;
+  const result = await compactor.prepare(ledger, async () => {
+    slices++;
+    return "## 持续背景\n- old facts retained";
+  }, { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 });
+  assert.equal(result.ready, true);
+  assert.equal(result.compacted, true);
+  assert.ok(slices > 1);
+  assert.ok(estimateMessagesTokens(ledger.snapshot()) <= 1000);
+  assert.equal(ledger.snapshot().at(-1)?.content, "live-tail");
+});
+
+test("a failed preparation cannot permit an oversized request during compaction backoff", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([text("old facts ".repeat(6000)), text("live-tail")]);
+  const original = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor({ now: () => 1000 });
+  const options = { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 };
+  await assert.rejects(compactor.prepare(ledger, async () => { throw new Error("fetch failed"); }, options), /fetch failed/);
+  const result = await compactor.prepare(ledger, async () => { throw new Error("must respect backoff"); }, options);
+  assert.equal(result.ready, false);
+  assert.deepEqual(ledger.snapshot(), original);
+});
+
+test("preparation yields between slices for incoming messages without permitting the oversized request", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([text("old facts ".repeat(6000)), text("live-tail")]);
+  const original = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor();
+  let slices = 0;
+  const result = await compactor.prepare(ledger, async () => {
+    slices++;
+    return "## 持续背景\n- old facts retained";
+  }, { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 }, { shouldYield: () => true });
+  assert.equal(result.ready, false);
+  assert.equal(slices, 1);
+  assert.deepEqual(ledger.snapshot(), original);
+  const resumed = await compactor.prepare(ledger, async () => "## 持续背景\n- old facts retained", {
+    thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000,
+  });
+  assert.equal(resumed.ready, true);
+  assert.equal(resumed.compacted, true);
+});
+
+test("a confirmed summary preserves new rounds appended while it was being generated", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([text("old-facts ".repeat(1000)), text("original-live-tail")]);
+  const result = await new compactionModule.LedgerCompactor().compact(ledger, async () => {
+    ledger.appendUserText("newly-arrived-round");
+    return "## 持续背景\n- old facts retained";
+  }, LOW);
+  assert.equal(result.status, "compacted");
+  assert.deepEqual(ledger.snapshot().slice(1).map((message) => message.content), ["original-live-tail", "newly-arrived-round"]);
+});
+
+test("an existing cumulative summary cannot hide the oversized original round behind it", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([
+    text(renderLedgerSummaryTurn("## 持续背景\n- old fact")),
+    text("new-round-fact: " + "历史材料 ".repeat(6000)),
+    say("settled"), text("live-tail"),
+  ]);
+  const options = { thresholdTokens: 1000, keepRatio: 0.25, maxSummaryTokens: 4000 };
+  const plan = planLedgerCompaction(ledger.snapshot(), options);
+  assert.ok(plan && plan.summarize.length > 1, "the batch must consume original history instead of only rewriting its old summary");
+  const compactor = new compactionModule.LedgerCompactor();
+  let complete = false;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async () => "## 持续背景\n- old fact and new-round-fact", options);
+    if (result.status === "compacted") { complete = true; break; }
+    assert.equal(result.status, "progress");
+  }
+  assert.equal(complete, true);
+  assert.equal(ledger.snapshot().at(-1)?.content, "live-tail");
+});
+
+test("stale recovery can stage its sole oversized settled round without preserving a nonexistent live tail", async () => {
+  const ledger = new ConversationLedger();
+  ledger.restore([text("old complete round: " + "历史材料 ".repeat(6000))]);
+  const original = [...ledger.snapshot()];
+  const compactor = new compactionModule.LedgerCompactor();
+  let complete = false;
+  for (let i = 0; i < 100; i++) {
+    const result = await compactor.compact(ledger, async () => "## 持续背景\n- preserved stale facts", {
+      thresholdTokens: 1, keepRatio: 0.25, maxSummaryTokens: 4000, summarizeAll: true,
+    });
+    if (result.status === "compacted") { complete = true; break; }
+    assert.equal(result.status, "progress");
+    assert.deepEqual(ledger.snapshot(), original);
+  }
+  assert.equal(complete, true);
+  assert.equal(ledger.size, 1);
+  assert.match(ledger.snapshot()[0].content, /preserved stale facts/);
+});
+
 // helpers -------------------------------------------------------------------
 
 function answersToolResultsAtStart(messages: readonly LlmMessage[]): boolean {
@@ -267,19 +577,6 @@ function opensUnansweredAtEnd(messages: readonly LlmMessage[]): boolean {
   return (messages.at(-1)?.blocks ?? []).some((block) => block.type === "tool_use");
 }
 
-type WireMessage = { role: string; content: Array<Record<string, unknown>> };
-
-function wireBlocks(body: Record<string, unknown>): Array<{ role: string; block: Record<string, unknown> }> {
-  return (body.messages as WireMessage[]).flatMap((message) => message.content.map((block) => {
-    const { cache_control: _ignored, ...rest } = block;
-    return { role: message.role, block: rest };
-  }));
-}
-
-function breakpointIndex(body: Record<string, unknown>): number {
-  let index = -1;
-  (body.messages as WireMessage[]).flatMap((message) => message.content).forEach((block, position) => {
-    if (block.cache_control) index = position;
-  });
-  return index;
+function wireInput(body: Record<string, unknown>): Array<Record<string, unknown>> {
+  return body.input as Array<Record<string, unknown>>;
 }

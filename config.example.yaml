@@ -1,0 +1,147 @@
+# Copy this file to config.yaml and put real IDs, endpoints, credentials and
+# persona text there. config.yaml is ignored by Git; keep this example public-safe.
+# The monitor writes changes to config.yaml, never to this example.
+read_only: true
+holly_bootstrap:
+  enabled: true
+  reflection_enabled: false
+  qq_mode: offline
+  fallback_qq_mode: offline
+  reconsider_minutes: 60
+  min_reconsider_minutes: 15
+  max_reconsider_minutes: 360
+
+admin:
+  enabled: false
+  # Fill in your administrator QQ IDs only in config.yaml, or HOLLY_ADMIN_QQ_IDS.
+  user_ids: []
+  force_reply: true
+  immediate_reply: true
+  reply_while_observing: false
+  code_improvement:
+    enabled: false
+    command_prefixes: ["/改进代码", "/修改代码", "/self-improve"]
+    executable: codex
+    apply_when_clean: false
+    timeout_seconds: 1200
+
+llm:
+  active: codex_gpt61
+  decision_profile: codex_gpt61
+  context_limit_tokens: 475000
+  context_compress_threshold_tokens: 400000
+  context_compress_target_tokens: 240000
+  # Personalize this prompt in your ignored config.yaml.
+  system_prompt: |
+    你是 Holly，一个中文聊天机器人。自然、简短地回应；不确定时说明不确定。
+    尊重会话隐私，不向其他会话转述私人信息。
+  profiles:
+    codex_gpt61:
+      provider: codex
+      model: gpt-6.1-sol
+
+fetch:
+  # Leave empty unless you use a local HTTP proxy.
+  proxy_url: ""
+napcat:
+  ws_url: ws://127.0.0.1:8082
+  access_token: ""
+private_chat:
+  enabled: false
+  friends_only: true
+  history_message_count: 40
+  friend_refresh_minutes: 5
+  # Fill in Holly's QQ ID here, or set HOLLY_BOT_QQ_ID.
+  bot_user_id: ""
+
+# SQLite stores memory locally. To use Qdrant, change database.provider to
+# qdrant, enable qdrant below and fill in your own endpoint and API key locally.
+database:
+  enabled: true
+  provider: sqlite
+  url: file:./data/sqlite/holly.db
+  timeout_ms: 5000
+qdrant:
+  enabled: false
+  url: http://127.0.0.1:6333
+  api_key: "" # Or QDRANT_API_KEY in .env; the environment takes precedence.
+  collection: ws_incoming_messages
+  timeout_ms: 10000
+  on_disk_payload: true
+
+autonomy:
+  enabled: false
+  world_observation_enabled: false
+  world_observation_retry_minutes: 15
+  world_observation_broadcast_group_id: ""
+  world_observation_failure_group_id: ""
+  world_observation_broadcast_lull_minutes: 30
+  world_observation_dedup_hours: 168
+  world_topics: ["人工智能", "天文学", "数学", "GitHub 热门项目"]
+  world_topic_query_suffix_overrides:
+    GitHub 热门项目: ""
+  # Configure broadcast groups locally. Daily Trending sources are read directly without web search.
+  world_topic_broadcast_group_overrides: {}
+  world_topic_source_urls:
+    GitHub 热门项目:
+      - https://github.com/trending?since=daily
+  world_topic_briefs:
+    GitHub 热门项目: 查看 GitHub Trending 日榜的热门开源项目，关注项目用途、主要语言、总 Star、今日新增 Star 和仓库链接。今日上榜或 Star 增长不代表项目今天发布；不要混入旧榜单和无法核实的增长数字。
+  memory_reflection_enabled: false
+  memory_reflection_interval_minutes: 50
+  memory_reflection_retry_minutes: 15
+  memory_reflection_broadcast_group_id: ""
+  memory_reflection_broadcast_lull_minutes: 180
+  archive_writing_enabled: false
+  archive_writing_retry_minutes: 60
+
+proactive:
+  enabled: false
+  mode: shadow
+  live_group_allowlist: []
+  lull_min_minutes: 10
+  lull_deadzone_minutes: 180
+  interest_window_minutes: 45
+  per_group_daily_cap: 6
+  global_daily_cap: 20
+  cooldown_minutes: 30
+  observation_window_minutes: 10
+  success_window_minutes: 10
+  backoff_multiplier: 1.5
+  engaged_ttl_minutes: 10
+  max_reply_chars: 80
+  echo_only_groups: []
+
+# Optional local services; enable after setting them up.
+search:
+  enabled: false
+  top_k: 5
+  timeout_ms: 10000
+browser_agent:
+  enabled: false
+  search_top_k: 10
+  max_pages: 3
+  timeout_ms: 15000
+  launch_timeout_ms: 10000
+  content_max_chars: 1800
+  cooldown_minutes: 60
+  query_suffix: 最新 进展
+ai_tone:
+  enabled: false
+  threshold: 0.6
+nanojev:
+  enabled: false
+  url: http://127.0.0.1:8765
+  timeout_ms: 4000
+  threshold: 0.5
+openjev:
+  enabled: false
+  url: http://127.0.0.1:8791
+  timeout_ms: 30000
+  threshold: 0.1
+
+focus_mode:
+  # GPT profiles support the focus tool loop for both LLM roles.
+  enabled: true
+  max_rounds: 8
+  recent_turns_per_conversation: 30

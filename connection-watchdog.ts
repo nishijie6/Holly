@@ -68,7 +68,10 @@ export type ProviderRateLimitGateOptions = {
   provider: string;
   now?: () => number;
   fallbackPauseMs?: number;
+  recheckIntervalMs?: number;
 };
+
+export type ProviderQuotaAvailability = { available: boolean; retryAt: number | null };
 
 export class ProviderRateLimitGate {
   private readonly provider: string;
@@ -76,11 +79,15 @@ export class ProviderRateLimitGate {
   private readonly fallbackPauseMs: number;
   private pausedUntil: number | null = null;
   private revision = 0;
+  private readonly recheckIntervalMs: number;
+  private nextRecheckAt = 0;
+  private refreshInFlight: Promise<void> | null = null;
 
   constructor(options: ProviderRateLimitGateOptions) {
     this.provider = options.provider;
     this.now = options.now ?? (() => Date.now());
     this.fallbackPauseMs = Math.max(1_000, Math.floor(options.fallbackPauseMs ?? 5 * 60_000));
+    this.recheckIntervalMs = Math.max(1_000, Math.floor(options.recheckIntervalMs ?? 5 * 60_000));
   }
 
   assertOpen(): void {
@@ -97,6 +104,28 @@ export class ProviderRateLimitGate {
     return this.revision;
   }
 
+  getRevision(): number {
+    return this.revision;
+  }
+
+  // 额度查询不受生成暂停影响。自动查询限频，手动查询可提前触发；并发查询共用一个请求。
+  async refresh(read: (revision: number) => Promise<ProviderQuotaAvailability | null>, force = false): Promise<void> {
+    if (this.refreshInFlight) return this.refreshInFlight;
+    if (!force && (this.getPausedUntil() === null || this.now() < this.nextRecheckAt)) return;
+    const revision = this.revision;
+    this.nextRecheckAt = this.now() + this.recheckIntervalMs;
+    this.refreshInFlight = Promise.resolve().then(() => read(revision)).then((quota) => {
+      if (!quota || this.revision !== revision) return;
+      if (quota.available) this.recordSuccess(revision);
+      else {
+        // 新额度快照可以修正旧重置时间；没有有效新时间时继续保守保留原暂停。
+        if (quota.retryAt !== null && quota.retryAt > this.now()) this.pausedUntil = quota.retryAt;
+        this.pauseUntil(quota.retryAt);
+      }
+    }).finally(() => { this.refreshInFlight = null; });
+    return this.refreshInFlight;
+  }
+
   recordSuccess(requestRevision: number): void {
     if (requestRevision === this.revision) {
       this.pausedUntil = null;
@@ -110,6 +139,7 @@ export class ProviderRateLimitGate {
       : now + this.fallbackPauseMs;
     this.revision += 1;
     this.pausedUntil = Math.max(this.pausedUntil ?? 0, next);
+    this.nextRecheckAt = now + this.recheckIntervalMs;
     return this.pausedUntil;
   }
 
@@ -125,7 +155,7 @@ export class ProviderRateLimitGate {
  * Detects a long-running-but-silently-broken process: every LLM call fails
  * the same way while a brand-new process using the identical config/profile
  * succeeds immediately. This happened on 2026-08-24 — a two-day-old process
- * got HTTP 403 on every single Claude call for 2+ hours (most likely a dead
+ * got HTTP 403 on every single model call for 2+ hours (most likely a dead
  * pooled connection to the local proxy) while `npm run llm:test` succeeded
  * on the first try every time it was run fresh. The process never crashed,
  * so PM2's autorestart-on-exit never triggered.

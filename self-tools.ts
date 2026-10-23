@@ -20,6 +20,14 @@ export type SelfToolDeps = {
   observeWorld: (topic: string) => Promise<{ summary: string } | null>;
   /** 允许看的话题，来自配置。填了别的会被挡下并给出名单。 */
   worldTopics: () => readonly string[];
+  /**
+   * 这个话题平时说给哪几个会话，返回的就是 open_conversation 要的 id；空数组表示没配目标。
+   *
+   * 自动播报那条路退役之后，「哪个话题说给哪个群」只剩在配置里，她这边一无所知——于是看完
+   * 了也不知道该说给谁，只能放着。这里把这份对应关系当成一个事实摆到她眼前，发不发仍旧是
+   * 她的事：工具照样不替她发一个字。
+   */
+  worldTopicBroadcastTargets: (topic: string) => readonly string[];
   /** 写一条内部记忆。topic 是题目，content 是正文。 */
   writeMemory: (input: { topic: string; content: string; reason: string }) => Promise<void>;
   /** 写一篇文章或一首诗。 */
@@ -95,10 +103,15 @@ export function createSelfToolRunner(
         if (!observed) {
           return refuse("nothing found", "这次没看到什么新东西，过会儿再来吧。");
         }
+        // 看完是否说给谁听由她决定——这正是这个工具和以前那条自动播报路径的区别。告诉她这个
+        // 话题平时说给谁，省掉的只是「该发哪个群」那一步猜测；没配目标时就照旧不提，让她自己挑
+        // 人，而不是对着一句空话琢磨。
+        const targets = deps.worldTopicBroadcastTargets(topic);
         return ok({
           summary: observed.summary,
-          // 看完是否说给谁听由她决定——这正是这个工具和以前那条自动播报路径的区别。
-          note: "这些是刚看到的。想说给谁听，自己 open_conversation 再 send_message；觉得不值得说就放着。",
+          note: targets.length > 0
+            ? `这些是刚看到的。「${topic}」平时说给 ${targets.join("、")}（就是 open_conversation 要的 id）；值得说就打开它再 send_message，觉得不值得说就放着。`
+            : "这些是刚看到的。想说给谁听，自己 open_conversation 再 send_message；觉得不值得说就放着。",
         });
       }
 

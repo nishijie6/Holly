@@ -510,7 +510,7 @@ test("offset 递下去,写成字符串也认,看不懂的当从头读", async ()
 
 test("读不了的路径,原因原样交回模型", async () => {
   const { call } = harness({
-    readSource: async () => ({ ok: false, text: "点开头的文件和目录（.env、.git、.claude 这些）读不到。" }),
+    readSource: async () => ({ ok: false, text: "点开头的文件和目录（.env、.git、.codex 这些）读不到。" }),
   });
   const result = await call("read_source", { path: ".env" });
   assert.equal(result.ok, false);

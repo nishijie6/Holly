@@ -26,17 +26,16 @@ import { WebSocket, type RawData } from "ws";
 import YAML from "yaml";
 import {
   createLlmClient,
-  getLatestClaudeUsage,
-  probeClaudeUsage,
+  getLatestProviderUsage,
+  probeProviderUsage,
   listLlmProfiles,
   setActiveLlmProfile,
   type CachePrefixObserver,
-  type ClaudeUsage,
+  type ProviderUsage,
   type LlmClient,
   type LlmMessage,
   type LlmToolUseBlock,
 } from "./llm-client.js";
-import { CLAUDE_OAUTH_CALLBACK_PATH, CLAUDE_OAUTH_LOGIN_PATH, claudeOAuth } from "./claude-oauth.js";
 import {
   ConnectionWatchdog,
   shouldCountTowardConnectionWatchdog,
@@ -64,9 +63,11 @@ import {
 } from "./token-usage.js";
 import { describeCachePrefixDrift } from "./cache-prefix.js";
 import { renderMonitorPage } from "./monitor-page.js";
+import { createLocalRequestGuard } from "./local-request-guard.js";
 import { loadPromptText, renderPromptText } from "./prompt-text.js";
 import { RouteQueue } from "./route-queue.js";
 import { AgentEventQueue, coalesceAgentEvents, type AgentEvent } from "./agent-events.js";
+import { FocusContinuation } from "./focus-continuation.js";
 import { appendRetryFeedbackToVolatileTail, refineDecisionReply } from "./reply-routing.js";
 import {
   createIncomingMessageStore,
@@ -124,8 +125,9 @@ import { normalizeSearchQuery, resolveExplicitSearchRequest } from "./search-int
 import {
   browseTopicWithBrowserAgent,
   browseUrlsWithBrowserAgent,
+  canBrowseTopicWithBrowserAgent,
   formatObservationSummary,
-  isSafeExternalPageUrl,
+  resolvesToPublicAddress,
   type BrowserAgentConfig,
   type BrowserPageObservation,
   type BrowserTopicObservation,
@@ -158,6 +160,12 @@ import {
   modelContextWindowTokens,
 } from "./context-budget.js";
 import { selectObservationWindow } from "./world-observation-window.js";
+import { buildAutonomyContext } from "./autonomy-context.js";
+import {
+  GITHUB_TRENDING_BRIEF,
+  GITHUB_TRENDING_TOPIC,
+  GITHUB_TRENDING_URL,
+} from "./github-trending.js";
 import { ConversationLedger } from "./conversation-ledger.js";
 import { DEFAULT_LEDGER_STORE_OPTIONS, LedgerStore } from "./ledger-store.js";
 import { JsonlLog } from "./jsonl-log.js";
@@ -170,11 +178,13 @@ import {
 import {
   DEFAULT_LEDGER_COMPACTION_OPTIONS,
   LEDGER_COMPACTION_MAX_ROUNDS,
+  LEDGER_COMPACTION_TIMEOUT_MS,
+  LEDGER_COMPACTION_RETRY_MS,
   LEDGER_COMPACTION_TOOL_REFUSAL,
-  buildLedgerCompactionMessages,
+  LEDGER_COMPACTION_SYSTEM_PROMPT,
+  LedgerCompactor,
   buildStaleLedgerSummaryMessages,
   extractLedgerSummary,
-  planLedgerCompaction,
   renderLedgerSummaryTurn,
 } from "./ledger-compaction.js";
 import { decideFocus, type FocusDecision } from "./focus-policy.js";
@@ -207,6 +217,22 @@ import {
   type WorldObservationShareDecision,
 } from "./autonomy-prompts.js";
 import { loadAiToneClassifier, type AiToneClassifier } from "./ai-tone.js";
+import {
+  compareSearchJudgements,
+  type SearchJudgeShadowConfig,
+  type SearchJudgeShadowInput,
+  type SearchJudgeShadowJudgement,
+} from "./search-judge-shadow.js";
+import {
+  judgeSearchResultsWithNanoJev,
+  DEFAULT_NANOJEV_CONFIG,
+  type NanoJevRuntimeConfig,
+} from "./nanojev-judge.js";
+import {
+  judgeSearchResultsWithOpenJev,
+  DEFAULT_OPENJEV_CONFIG,
+  type OpenJevRuntimeConfig,
+} from "./openjev-judge.js";
 import {
   ThoughtHistoryStore,
   type ThoughtEntry,
@@ -433,7 +459,7 @@ type MonitorSnapshot = {
   history: MonitorEntry[];
   conversationPreview: MonitorConversationPreview | null;
   autonomySidebar: AutonomySidebarSnapshot;
-  claudeUsage: ClaudeUsage | null;
+  providerUsage: ProviderUsage | null;
   tokenStats: DailyTokenStats;
   readOnly: boolean;
   thoughts: ThoughtEntry[];
@@ -461,7 +487,7 @@ type MonitorEvent =
     }
   | {
       type: "usage";
-      claudeUsage: ClaudeUsage | null;
+      providerUsage: ProviderUsage | null;
     }
   | {
       type: "tokens";
@@ -750,7 +776,7 @@ const DEFAULT_PROACTIVE_CONFIG: ProactiveConfig = {
     "AI", "人工智能", "机器学习", "深度学习", "神经网络", "大模型", "算法", "llm", "gpt", "transformer",
     "天文", "星空", "星系", "宇宙", "行星", "恒星", "黑洞", "望远镜", "nasa", "卫星", "月球", "火星",
   ],
-  echoOnlyGroups: ["20000003"],
+  echoOnlyGroups: [],
 };
 
 const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
@@ -761,11 +787,11 @@ const DEFAULT_AUTONOMY_CONFIG: AutonomyConfig = {
   worldObservationFailureGroupId: null,
   worldObservationBroadcastLullMs: 30 * 60 * 1000,
   worldObservationDedupWindowMs: 7 * 24 * 60 * 60 * 1000,
-  worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems"],
-  worldTopicQuerySuffixOverrides: {},
+  worldTopics: ["AI latest updates", "astronomy latest discoveries", "interesting math problems", GITHUB_TRENDING_TOPIC],
+  worldTopicQuerySuffixOverrides: { [GITHUB_TRENDING_TOPIC]: "" },
   worldTopicBroadcastGroupOverrides: {},
-  worldTopicSourceUrls: {},
-  worldTopicBriefs: {},
+  worldTopicSourceUrls: { [GITHUB_TRENDING_TOPIC]: [GITHUB_TRENDING_URL] },
+  worldTopicBriefs: { [GITHUB_TRENDING_TOPIC]: GITHUB_TRENDING_BRIEF },
   memoryReflectionEnabled: false,
   // 50 分钟而不是 60：缓存 1 小时过期，60 分钟一次正好卡在过期边缘。09-09 到 09-12 的记录里，
   // 和上一次间隔不到 55 分钟的反思 42 次里有 31 次读到缓存，间隔 55–65 分钟的 50 次里只有 3 次。
@@ -873,6 +899,8 @@ let readOnlyPersistQueue: Promise<void> = Promise.resolve();
 let worldBroadcastPersistQueue: Promise<void> = Promise.resolve();
 let aiToneConfig: AiToneRuntimeConfig = DEFAULT_AI_TONE_CONFIG;
 let aiToneClassifier: AiToneClassifier | null = null;
+let nanojevConfig: NanoJevRuntimeConfig = DEFAULT_NANOJEV_CONFIG;
+let openjevConfig: OpenJevRuntimeConfig = DEFAULT_OPENJEV_CONFIG;
 let conversationHistoryByGroup = new Map<string, ConversationTurn[]>();
 // 每个群的「当天历史补齐」任务。存 Promise 而不是布尔标记，是为了让并发的
 // 第二个调用者能等同一次补齐，而不是各拉各的；按天记 key 则保证跨过零点后
@@ -1421,9 +1449,37 @@ async function loadAiToneConfig(configPath: string): Promise<AiToneRuntimeConfig
   };
 }
 
+// nanojev 和 openjev 两节形状完全一样（开关、地址、超时、判定线），共用一个读法，只是节名
+// 和默认值不同。
+async function loadSearchJudgeShadowConfig(
+  configPath: string,
+  section: "nanojev" | "openjev",
+  defaults: SearchJudgeShadowConfig,
+): Promise<SearchJudgeShadowConfig> {
+  const base = { ...defaults };
+  if (!existsSync(configPath)) return base;
+  let parsed: Record<string, unknown> | null = null;
+  try {
+    parsed = (YAML.parse(await readFile(configPath, "utf-8")) as Record<string, unknown> | null) ?? {};
+  } catch {
+    return base;
+  }
+  const n = parsed?.[section] as Record<string, unknown> | undefined;
+  if (!n || typeof n !== "object") return base;
+  const timeoutMs = Number(n.timeout_ms);
+  const threshold = Number(n.threshold);
+  const url = typeof n.url === "string" ? n.url.trim() : "";
+  return {
+    enabled: typeof n.enabled === "boolean" ? n.enabled : base.enabled,
+    url: url || base.url,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : base.timeoutMs,
+    threshold: Number.isFinite(threshold) && threshold > 0 && threshold < 1 ? threshold : base.threshold,
+  };
+}
+
 // 代理设置必须在任何一次 fetch 之前完成，所以它是 bootstrap 的第一步。
 // 这里改的是进程环境变量而不是某个 client 的参数——因为要影响的是所有出网调用
-// （Anthropic、Serper、Qdrant Cloud、网页抓取），它们分散在各个模块里，
+// （OpenAI、Serper、Qdrant Cloud、网页抓取），它们分散在各个模块里，
 // 各自持有自己的 fetch。
 async function applyProxyConfig(configPath: string): Promise<void> {
   if (!existsSync(configPath)) return;
@@ -1437,13 +1493,13 @@ async function applyProxyConfig(configPath: string): Promise<void> {
     process.env.http_proxy = proxyUrl;
     // Node's global fetch/undici only honors HTTP(S)_PROXY when NODE_USE_ENV_PROXY
     // is set. The npm scripts pass it, but a systemd/pm2/bare `node` launch may
-    // not — without it every outbound request (Qdrant Cloud, Anthropic, Serper)
+    // not — without it every outbound request (Qdrant Cloud, OpenAI, Serper)
     // bypasses the proxy and fails on a restricted host. Set it here before the
     // first fetch (this runs as bootstrap's first step); undici reads it lazily
     // when the global dispatcher is first created. Don't override an explicit
     // opt-out already in the environment.
     process.env.NODE_USE_ENV_PROXY ??= "1";
-    // The proxy is for outbound web fetches (Anthropic API, URL previews). Keep
+    // The proxy is for outbound web fetches (OpenAI API, URL previews). Keep
     // loopback services — Qdrant :6333, the NapCat WS, the local monitor — OFF
     // the proxy: routing 127.0.0.1 through Clash/Mihomo can reset the connection
     // ("other side closed"). Merge with any NO_PROXY the user already set.
@@ -1678,7 +1734,7 @@ function prepareModelRequest(
   };
 
   // Clamp the configured budget to the active model's input window so an 800K
-  // global context can't overflow a smaller window (e.g. Haiku's 200K).
+  // global context can't overflow a smaller Codex model window.
   const modelWindowTokens = modelContextWindowTokens(modelForBudget);
   const limitTokens = Math.min(
     contextBudgetConfig.limitTokens,
@@ -1913,6 +1969,8 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   const nextSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const nextBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const nextAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  const nextNanoJevConfig = await loadSearchJudgeShadowConfig(CONFIG_PATH, "nanojev", DEFAULT_NANOJEV_CONFIG);
+  const nextOpenJevConfig = await loadSearchJudgeShadowConfig(CONFIG_PATH, "openjev", DEFAULT_OPENJEV_CONFIG);
   const nextAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const nextPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
   const previousQqModePolicy = hollyBootstrapConfig.qqModePolicy;
@@ -1927,6 +1985,8 @@ async function reloadActiveProfileFromConfig(reason: string): Promise<void> {
   searchConfig = nextSearchConfig;
   browserAgentConfig = nextBrowserAgentConfig;
   aiToneConfig = nextAiToneConfig;
+  nanojevConfig = nextNanoJevConfig;
+  openjevConfig = nextOpenJevConfig;
   adminPolicyConfig = nextAdminPolicyConfig;
   privateChatConfig = nextPrivateChatConfig;
   adminCodeRunner?.setConfig(nextAdminPolicyConfig.codeImprovement);
@@ -2261,13 +2321,10 @@ function sendHtml(res: ServerResponse, html: string): void {
   res.end(html);
 }
 
-function sendText(res: ServerResponse, statusCode: number, text: string): void {
-  res.writeHead(statusCode, {
-    "Content-Type": "text/plain; charset=utf-8",
-    "Content-Length": Buffer.byteLength(text),
-  });
-  res.end(text);
-}
+const isTrustedLocalRequest = createLocalRequestGuard(HTTP_HOST, HTTP_PORT);
+
+// archive 里是模型写的 HTML，和监控页同源；不加限制的话里面的脚本能直接调监控页的 API。
+const ARCHIVE_CSP = "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; font-src data:";
 
 function getRequestUrl(req: IncomingMessage): URL {
   return new URL(req.url || "/", `http://${HTTP_HOST}:${HTTP_PORT}`);
@@ -3334,7 +3391,7 @@ function buildMonitorSnapshot(): MonitorSnapshot {
     history: monitorHistory,
     conversationPreview: latestConversationPreview,
     autonomySidebar: buildAutonomySidebarSnapshot(),
-    claudeUsage: getLatestClaudeUsage(),
+    providerUsage: getLatestProviderUsage(),
     tokenStats: getTodayTokenStats(),
     readOnly: readOnlyMode,
     thoughts: thoughtHistoryStore?.list(THOUGHT_HISTORY_LIMIT) ?? [],
@@ -4844,6 +4901,10 @@ function buildFocusToolRunner(
     // 看完之后发不发由她决定；发了的话，这里记一笔，监控上才数得到。
     onWorldObservationShared: recordWorldObservationShare,
     worldTopics: () => autonomyConfig.worldTopics,
+    // 和监控页上那些勾、和原先自动播报真正发送时走的是同一个函数，所以她看到的目标不会和
+    // 配置里写的岔开。这里只把结论递给工具，发不发是她自己那一轮的事。
+    worldTopicBroadcastTargets: (topic) =>
+      resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic),
     listConversations: async () => listConversationSummaries(),
     readConversation: async (id) =>
       renderConversationRecent(id, focusModeConfig.recentTurnsPerConversation),
@@ -4894,13 +4955,13 @@ function buildFocusToolRunner(
       return { ok: true, text };
     },
     // 只读一个页面：正文比搜索摘要具体得多，但要起一次浏览器，慢得多，所以值不值得点开
-    // 由模型自己判断。URL 是它自己写的，进浏览器之前先过 isSafeExternalPageUrl——本机的
+    // 由模型自己判断。URL 是它自己写的，进浏览器之前先过 resolvesToPublicAddress——本机的
     // SearxNG、NapCat、Qdrant 都在 localhost 上听着。
     readPage: async (url) => {
       if (!browserAgentConfig.enabled) {
         return { ok: false, text: "浏览器当前没有启用，打不开网页。跟对方直说，不要编内容。" };
       }
-      if (!isSafeExternalPageUrl(url)) {
+      if (!await resolvesToPublicAddress(url)) {
         return { ok: false, text: "这个地址不能打开：只支持公网的 http/https 网页。用搜索结果里给出的链接。" };
       }
       pushMonitorEntry("status", "Page Read", `url=${url}`);
@@ -5073,20 +5134,24 @@ async function summarizeStaleLedger(transcript: readonly LlmMessage[], archivedT
     // 取客户端也放进 try：这个任务是 void 提交进队列的，任何一处抛出来都没人接，会变成进程级的
     // unhandled rejection。
     client = getDecisionLlmClient();
-    const result = await client.runToolLoop({
-      messages: buildStaleLedgerSummaryMessages(transcript),
-      tools: [...FOCUS_TOOL_DEFINITIONS],
-      runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
-      purpose: "ledger-compaction",
-      cacheRoute: "ledger-stale-summary",
-      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
-      maxRounds: LEDGER_COMPACTION_MAX_ROUNDS,
-    });
-    broadcastLatestLlmUsage(client);
-    if (result.exhausted) {
-      throw new Error(`The model kept calling tools for ${result.rounds} rounds instead of writing the summary.`);
+    const restored = new ConversationLedger();
+    restored.restore(transcript);
+    const compactor = new LedgerCompactor();
+    const summaryBudget = DEFAULT_LEDGER_COMPACTION_OPTIONS.maxSummaryTokens!;
+    let alreadySummarizedAll = false;
+    // 旧账本也不能整本重发。所有批次在临时副本里整理，整本摘要成功前原始存档始终保留。
+    while (estimateMessagesTokens(buildStaleLedgerSummaryMessages(restored.snapshot())) > summaryBudget) {
+      const progress = await compactor.compact(restored, (messages) => requestLedgerSummary(client!, messages, "ledger-stale-summary"), {
+        ...DEFAULT_LEDGER_COMPACTION_OPTIONS,
+        thresholdTokens: 1,
+        summarizeAll: true,
+      });
+      if (progress.status !== "compacted" && progress.status !== "progress") throw new Error("The stale ledger could not be reduced safely.");
+      if (progress.status === "compacted" && restored.size === 1) alreadySummarizedAll = true;
     }
-    const summary = extractLedgerSummary(result.text);
+    const summary = extractLedgerSummary(alreadySummarizedAll
+      ? restored.snapshot()[0].content
+      : await requestLedgerSummary(client, buildStaleLedgerSummaryMessages(restored.snapshot()), "ledger-stale-summary"));
     if (!summary) {
       throw new Error("The summary came back empty.");
     }
@@ -5118,79 +5183,75 @@ async function summarizeStaleLedger(transcript: readonly LlmMessage[], archivedT
 /**
  * Compact the ledger if it has outgrown its budget.
  *
- * Returns true when the prefix was rebuilt, so the caller can tell the drift
- * detector this one was on purpose. Compaction is the only thing in the focus
- * pipeline that breaks the prefix, and it must never be mistaken for the bug
- * that detector exists to catch.
+ * Report whether a bounded summary actually replaced the prefix. Failed and
+ * deferred attempts leave the focus prefix intact.
  */
-// 这一轮有没有在焦点路由上发过压缩请求，结果如何。调用方真正关心的是「发过没有」：只要压缩请求
-// 发出去了，漂移检测记下的上一次请求就是它，而紧接着的焦点请求会把本轮注入当作易变尾部排除掉，
-// 前缀比压缩请求少一块，必然判成重建——压缩失败、账本原封未动时也一样。
-type LedgerCompactionOutcome = "not-needed" | "compacted" | "failed";
+// 整理走独立路由。只有成功替换账本才重建焦点前缀；失败和等待重试都不改焦点请求的历史。
+type LedgerCompactionOutcome = "not-needed" | "compacted" | "failed" | "deferred";
+const ledgerCompactor = new LedgerCompactor();
+
+async function requestLedgerSummary(client: LlmClient, messages: LlmMessage[], cacheRoute = "ledger-compaction"): Promise<string> {
+  const result = await client.runToolLoop({
+    messages,
+    tools: [],
+    runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
+    purpose: "ledger-compaction",
+    cacheRoute,
+    systemPrompt: LEDGER_COMPACTION_SYSTEM_PROMPT,
+    expectRebuild: true,
+    maxRounds: LEDGER_COMPACTION_MAX_ROUNDS,
+    timeoutMs: LEDGER_COMPACTION_TIMEOUT_MS,
+    maxAttempts: 1,
+    reasoningEffort: "low",
+  });
+  broadcastLatestLlmUsage(client);
+  if (result.exhausted) throw new Error("The memory summary did not finish without tools.");
+  return result.text;
+}
 
 async function compactLedgerIfNeeded(client: LlmClient): Promise<LedgerCompactionOutcome> {
-  const ledger = conversationLedger.snapshot();
-  const plan = planLedgerCompaction(ledger, DEFAULT_LEDGER_COMPACTION_OPTIONS);
-  if (!plan) {
-    return "not-needed";
-  }
-
   const startedAt = Date.now();
-  let summary: string;
   try {
-    // 和焦点循环共用前缀：同一份 system、同一套工具、整本账本原样照发，只在尾部多一条整理指令，
-    // 所以账本几乎全是缓存读取（见 ledger-compaction.ts）。工具必须带着，模型真去调就退回一句
-    // 「现在不能用」，只取它写出来的正文。cacheRoute 也用焦点那条：漂移检测会顺便验证这次请求
-    // 确实是在焦点前缀上往后接，哪天有人改坏了，监控里会出现 focus-loop 以外的 Prefix Drift。
-    const result = await client.runToolLoop({
-      messages: buildLedgerCompactionMessages(ledger, plan),
-      tools: [...FOCUS_TOOL_DEFINITIONS],
-      runTool: async () => LEDGER_COMPACTION_TOOL_REFUSAL,
-      purpose: "ledger-compaction",
-      cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
-      systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
-      maxRounds: LEDGER_COMPACTION_MAX_ROUNDS,
+    const fixedTokens = estimateSystemPromptTokens(buildFocusSystemPrompt(client.systemPrompt))
+      + estimateTextTokens(JSON.stringify(FOCUS_TOOL_DEFINITIONS));
+    const result = await ledgerCompactor.prepare(conversationLedger, (messages) => requestLedgerSummary(client, messages), {
+      ...DEFAULT_LEDGER_COMPACTION_OPTIONS,
+      thresholdTokens: Math.max(1, Math.min(
+        DEFAULT_LEDGER_COMPACTION_OPTIONS.thresholdTokens,
+        modelContextWindowTokens(client.model) - CONTEXT_MODEL_WINDOW_MARGIN_TOKENS - fixedTokens,
+      )),
+    }, {
+      shouldYield: () => unreadModelMessagesByGroup.size > 0,
+      onResult: async (part) => {
+        if (part.status === "progress") {
+          pushMonitorEntry("status", "Ledger Summary Progress", `parts=${part.parts} remaining_characters=${part.remainingCharacters}\nThe original turns are retained until every source slice has been summarized.`, client.model);
+        } else if (part.status === "compacted") {
+          await ledgerStore?.rewrite(conversationLedger.snapshot());
+          pushMonitorEntry(
+            "status",
+            `Ledger Compacted - ${formatElapsedDuration(startedAt, Date.now())}`,
+            `turns ${part.beforeTurns} -> ${part.afterTurns} (summarized ${part.summarizedTurns})\nAll planned history slices were summarized before replacing the prefix once. The next focus request rebuilds its cache.`,
+            client.model,
+          );
+        }
+      },
     });
-    broadcastLatestLlmUsage(client);
-    if (result.exhausted) {
-      throw new Error(`The model kept calling tools for ${result.rounds} rounds instead of writing the summary.`);
+    if (!result.ready) {
+      pushMonitorEntry("status", "Focus Waiting For Compaction", "The transcript is still over budget. Normal model requests are paused until summary work can finish.", client.model);
+      return "deferred";
     }
-    summary = extractLedgerSummary(result.text);
+    return result.compacted ? "compacted" : "not-needed";
   } catch (error) {
-    // A failed summary is not a reason to drop the transcript. Leaving it
-    // oversized costs tokens; discarding it unsummarized loses the conversation.
+    // Retain the transcript, but do not send it to the focus model while it is
+    // oversized. A later attempt resumes the pending summary after backoff.
     pushMonitorEntry(
       "error",
       "Ledger Compaction Failed",
-      `Kept the full transcript.\n${error instanceof Error ? error.message : String(error)}`,
+      `Kept the transcript. Focus requests are paused; compaction will wait before retrying.\n${error instanceof Error ? error.message : String(error)}`,
       client.model,
     );
     return "failed";
   }
-
-  if (!summary.trim()) {
-    pushMonitorEntry("error", "Ledger Compaction Failed", "The summary came back empty; kept the full transcript.");
-    return "failed";
-  }
-
-  const before = conversationLedger.size;
-  // 包进 <conversation_summary>：下一次压缩的指令靠这层标签认出上一份累计摘要，拿它当基线合并。
-  conversationLedger.replaceFrontWithSummary(renderLedgerSummaryTurn(summary), plan.keep);
-  // The log must match memory, and this is a rewrite, not an append.
-  await ledgerStore?.rewrite(conversationLedger.snapshot());
-
-  pushMonitorEntry(
-    "status",
-    `Ledger Compacted - ${formatElapsedDuration(startedAt, Date.now())}`,
-    [
-      `turns ${before} -> ${conversationLedger.size} (summarized ${plan.summarize.length})`,
-      "The summary call reused the focus prefix; its cache read shows under purpose=ledger-compaction.",
-      "The prompt-cache prefix is rebuilt from here; the next request pays full price once.",
-      summary.slice(0, 300),
-    ].join("\n"),
-    client.model,
-  );
-  return "compacted";
 }
 
 // 所有群共用一本账本，焦点循环一次只能跑一个。回复任务按群排队（reply:<群号>），不同群的批次会同时
@@ -5215,6 +5276,12 @@ const INNER_VOICE_TOOL_REFUSAL = JSON.stringify({
 // 正常一轮就写完；留两轮余量，给模型先调一次工具、被拒之后再写的情况。
 const INNER_VOICE_MAX_ROUNDS = 3;
 
+function yieldAutonomyToUnreadMessages(): boolean {
+  if (unreadModelMessagesByGroup.size === 0) return false;
+  pushMonitorEntry("status", "Autonomy Yielded", "Unread chat messages are waiting; returning to the event loop before starting more background work.");
+  return true;
+}
+
 /**
  * 冒一个念头，然后让她自己去处理它。
  *
@@ -5234,9 +5301,13 @@ const INNER_VOICE_MAX_ROUNDS = 3;
  */
 async function runInnerVoiceOnFocusQueue(): Promise<void> {
   await focusLoopQueue.submit(FOCUS_LEDGER_CACHE_ROUTE, async () => {
+    if (yieldAutonomyToUnreadMessages()) return;
     const client = getDecisionLlmClient();
     const compaction = await compactLedgerIfNeeded(client);
-    const thought = await requestInnerThought(client, compaction !== "not-needed");
+    if (compaction === "failed" || compaction === "deferred") return;
+    if (yieldAutonomyToUnreadMessages()) return;
+    const thought = await requestInnerThought(client, compaction === "compacted");
+    if (yieldAutonomyToUnreadMessages()) return;
     if (!thought) {
       pushMonitorEntry("status", "Inner Voice Empty", "这次没冒出什么念头。");
       return;
@@ -5245,15 +5316,43 @@ async function runInnerVoiceOnFocusQueue(): Promise<void> {
   });
 }
 
-/**
- * 问她一句「接下来去动哪个」，只要一句话。
- *
- * 复用焦点前缀：同一个 decision profile、同一份 system、同一套工具定义，整本账本原样照发，
- * 只在尾部追一条指令，所以账本几乎全是缓存读取。这三样少一样都不行——缓存条目是按模型分的
- * （llm-client 里前缀按 `${model}|${route}` 记账），工具定义又排在 system 之前参与前缀，所以
- * 换个 profile、或者图省事走不带工具的 generateText，前缀一个字节都对不上，整本账本全价重付。
- * 不带工具还有更硬的一条：账本里全是 tool_use / tool_result 块，没有 tools 的请求会被直接打回。
- */
+// 两步自主调用都看到同一组有界近况。这里不抓网页、不打开会话，只拼已经恢复或刚记录的事实。
+function currentAutonomyContext(): string {
+  const state = hollyStateStore?.getAutonomyState();
+  // 首次升级时 recentActions 还没有记录，从已经恢复的作品/记忆补回题目，避免又等几轮才看见重复。
+  const actions = [
+    ...(state?.recentActions ?? []),
+    ...archiveWorks.slice(-16).map((work) => ({
+      kind: "archive_writing" as const, at: Date.parse(work.ts), title: work.title,
+    })),
+    ...hollyMemorySidebarRecords.slice(-16).map((memory) => ({
+      kind: "memory_reflection" as const, at: Date.parse(memory.ts), title: memory.topic,
+    })),
+  ].filter((action) => Number.isFinite(action.at) && action.at > 0).sort((a, b) => a.at - b.at);
+  const recentActions = [...new Map(actions.map((action) => [`${action.kind}:${action.at}:${action.title}`, action])).values()].slice(-16);
+  return buildAutonomyContext({
+    nowMs: Date.now(),
+    lastAutonomousMessageAt: state?.lastAutonomousMessageAt,
+    lastWorldObservationAt: state?.lastWorldObservationAt,
+    lastWorldObservationShareAt: state?.lastWorldObservationShareAt,
+    recentActions,
+    worldObservationEnabled: autonomyConfig.worldTopics.some((topic) => canBrowseTopicWithBrowserAgent(
+      browserAgentConfig, searchConfig.enabled, autonomyConfig.worldTopicSourceUrls[topic] ?? [],
+    )),
+    topics: autonomyConfig.worldTopics.map((topic) => {
+      const outcome = worldTopicOutcomes.get(topic);
+      const latest = worldObservationMemory.filter((item) => item.topic === topic).at(-1);
+      return {
+        topic,
+        lastAt: Math.max(outcome?.atMs ?? 0, latest?.observedAtMs ?? 0),
+        outcome: outcome?.outcome ?? (latest ? "上次已读到内容" : ""),
+        targetConversationIds: resolveWorldObservationBroadcastGroupIds(autonomyConfig, topic),
+      };
+    }),
+  });
+}
+
+// 仍用焦点模型、系统和工具协议读取账本，只在尾部追加带近况的念头指令。
 async function requestInnerThought(client: LlmClient, expectRebuild: boolean): Promise<string> {
   const result = await client.runToolLoop({
     expectRebuild,
@@ -5261,7 +5360,10 @@ async function requestInnerThought(client: LlmClient, expectRebuild: boolean): P
       ...conversationLedger.snapshot(),
       // 念头这一路没有群消息带进来的 current_time：账本里最后一个时间可能是昨晚的，不告诉她
       // 现在几点，第二天早上她还会接着说「睡了、明天」。
-      { role: "user", content: renderPromptText("inner-voice", { now: formatLocalDateTimeForModel() }) },
+      { role: "user", content: renderPromptText("inner-voice", {
+        now: formatLocalDateTimeForModel(),
+        context: currentAutonomyContext(),
+      }) },
     ],
     tools: [...FOCUS_TOOL_DEFINITIONS],
     runTool: async () => INNER_VOICE_TOOL_REFUSAL,
@@ -5269,6 +5371,9 @@ async function requestInnerThought(client: LlmClient, expectRebuild: boolean): P
     cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
     systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
     maxRounds: INNER_VOICE_MAX_ROUNDS,
+    // 空闲工作失败后由自主引擎退避，不占着消费循环重试十几分钟。
+    maxAttempts: 1,
+    shouldYield: () => unreadModelMessagesByGroup.size > 0,
   });
   broadcastLatestLlmUsage(client);
   // 刻意不挂 onAssistantTurn / onToolResults：尾部那条指令本来就不在账本里，把它引出来的
@@ -5301,6 +5406,7 @@ async function runInnerThoughtRound(client: LlmClient, thought: string): Promise
     thought,
     now: formatLocalDateTimeForModel(),
     open: openConversationId ? formatConversationKey(openConversationId) : "无",
+    context: currentAutonomyContext(),
   }));
 
   const startedAt = Date.now();
@@ -5314,20 +5420,25 @@ async function runInnerThoughtRound(client: LlmClient, thought: string): Promise
     tools: [...FOCUS_TOOL_DEFINITIONS],
     runTool: buildFocusToolRunner(
       null,
-      (_conversationId, message) => sentMessages.push(message),
+      (_conversationId, message) => {
+        sentMessages.push(message);
+        recordAutonomyActivity("autonomous_message");
+      },
       (reason) => suppressedReasons.push(reason),
     ),
     purpose: "inner-thought",
     cacheRoute: FOCUS_LEDGER_CACHE_ROUTE,
     systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
     maxRounds: focusModeConfig.maxRounds,
-    onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
+    maxAttempts: 1,
+    shouldYield: () => unreadModelMessagesByGroup.size > 0,
+    onAssistantTurn: (text, toolUses, responseItems) => conversationLedger.appendAssistantTurn(text, toolUses, responseItems),
     onToolResults: (results) => conversationLedger.appendToolResults(results),
   });
   broadcastLatestLlmUsage(client);
   pushMonitorEntry(
     result.exhausted ? "error" : "status",
-    `Inner Thought Round ${result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
+    `Inner Thought Round ${result.yielded ? "Yielded" : result.exhausted ? "Exhausted" : "Done"} - ${formatElapsedDuration(startedAt, Date.now())}`,
     [
       thought,
       `rounds=${result.rounds} ledger=${conversationLedger.size} sent=${sentMessages.length}`,
@@ -5353,7 +5464,13 @@ type FocusInjectionOutcome = {
   decision: FocusDecision;
   unreadCount: number;
   isPrivate: boolean;
+  isAdminBatch: boolean;
 };
+
+const pendingFocusRound = new FocusContinuation<FocusInjectionOutcome>(
+  () => agentEvents.push({ type: "focus_retry_due" }),
+  LEDGER_COMPACTION_RETRY_MS,
+);
 
 // 把一个群的批次渲染成注入、追加进账本；前台那条顺带把焦点切过去。
 //
@@ -5429,6 +5546,7 @@ function appendFocusInjectionForBatch(
     decision,
     unreadCount: messages.length,
     isPrivate: latest.context.replyTargetType === "private",
+    isAdminBatch: isForcedAdminBatch(messages),
   };
 }
 
@@ -5438,12 +5556,15 @@ async function runFocusRoundForBatches(
 ): Promise<void> {
   const client = getDecisionLlmClient();
 
-  const injected: FocusInjectionOutcome[] = [];
   for (const batch of batches) {
     const outcome = appendFocusInjectionForBatch(batch);
-    if (outcome) injected.push(outcome);
+    if (outcome) pendingFocusRound.append(outcome);
   }
-  if (injected.length === 0) return;
+  const injected = pendingFocusRound.snapshot().filter((item) => isReplyEnabledForBatch(item.isAdminBatch));
+  if (injected.length === 0) {
+    pendingFocusRound.clear();
+    return;
+  }
 
   // 前台后台都算：有人直接找她是动静，群里只是有人说话也是动静——两种情况下她都在读群里的
   // 内容，都不是发呆。
@@ -5456,6 +5577,11 @@ async function runFocusRoundForBatches(
   const roundConversation = seizedFocus ?? injected[injected.length - 1];
 
   const compaction = await compactLedgerIfNeeded(client);
+  if (compaction === "failed" || compaction === "deferred") {
+    pendingFocusRound.defer();
+    return;
+  }
+  pendingFocusRound.clear();
 
   const startedAt = Date.now();
   // 本轮真正进了群的话。空数组就是「没开口」——但没开口分两种，见 suppressedReasons。
@@ -5464,10 +5590,8 @@ async function runFocusRoundForBatches(
   const suppressedReasons: string[] = [];
   try {
     const result = await client.runToolLoop({
-      // 只要这一轮在焦点路由上发过压缩请求（成败都算），紧接着的第一次请求就一定判成重建：成功时
-      // 账本前段换成了摘要，失败时前缀比压缩请求少了本轮注入那一块。以前只在成功时豁免，压缩失败会
-      // 在监控里留下一条假的 Prefix Drift。豁免只作用于这次循环的第一轮，见 llm-client 的 runToolLoop。
-      expectRebuild: compaction !== "not-needed",
+      // 整理在独立路由完成；只有成功替换历史才重建焦点前缀。
+      expectRebuild: compaction === "compacted",
       messages: [...conversationLedger.snapshot()],
       tools: [...FOCUS_TOOL_DEFINITIONS],
       runTool: buildFocusToolRunner(
@@ -5480,7 +5604,7 @@ async function runFocusRoundForBatches(
       // persona + focus 协议,不是 persona + 决策协议:见 focus-prompt.ts 开头。
       systemPrompt: buildFocusSystemPrompt(client.systemPrompt).trim(),
       maxRounds: focusModeConfig.maxRounds,
-      onAssistantTurn: (text, toolUses) => conversationLedger.appendAssistantTurn(text, toolUses),
+      onAssistantTurn: (text, toolUses, responseItems) => conversationLedger.appendAssistantTurn(text, toolUses, responseItems),
       onToolResults: (results) => conversationLedger.appendToolResults(results),
     });
     broadcastLatestLlmUsage(client);
@@ -5890,6 +6014,8 @@ async function runUnreadBatchForModel(messages: PendingModelMessage[]): Promise<
 // 先让它在真实流量上跑一段时间、能翻出记录来对比，再考虑让它有发言权。
 
 const AI_TONE_SHADOW_LOG_PATH = join(LOG_DIR, "ai-tone.jsonl");
+const NANOJEV_SHADOW_LOG_PATH = join(LOG_DIR, "nanojev-shadow.jsonl");
+const OPENJEV_SHADOW_LOG_PATH = join(LOG_DIR, "openjev-shadow.jsonl");
 
 // Shadow signal: score an outgoing reply's "AI tone" and log it. Never blocks
 // the send — observe-only while the model is calibrated for Holly's short,
@@ -5938,6 +6064,8 @@ const THOUGHT_HISTORY_LOG_PATH = join(LOG_DIR, "thought-history.jsonl");
 // One queue each. Three of these previously chained onto the proactive shadow
 // log's queue, which serialized four unrelated files behind one another.
 const aiToneShadowLog = new JsonlLog(AI_TONE_SHADOW_LOG_PATH, "ai-tone shadow log");
+const nanojevShadowLog = new JsonlLog(NANOJEV_SHADOW_LOG_PATH, "NanoJev shadow log");
+const openjevShadowLog = new JsonlLog(OPENJEV_SHADOW_LOG_PATH, "Open-Jev shadow log");
 const proactiveShadowLog = new JsonlLog(PROACTIVE_SHADOW_LOG_PATH, "proactive shadow log");
 const worldObservationLog = new JsonlLog(WORLD_OBSERVATION_LOG_PATH, "world observation log");
 const hollyMemoryLog = new JsonlLog(HOLLY_MEMORY_LOG_PATH, "Holly memory log");
@@ -6022,7 +6150,8 @@ function appendWorldObservationLog(record: Record<string, unknown>): void {
  * 只记账，不设闸：日上限已经撤掉（理由见 autonomy-engine 里那段说明），这几个数字只给人看。
  */
 function recordAutonomyActivity(
-  kind: "world_observation" | "memory_reflection" | "archive_writing" | "world_observation_share",
+  kind: "world_observation" | "memory_reflection" | "archive_writing" | "world_observation_share" | "autonomous_message",
+  creative?: { title: string; at: number },
 ): void {
   const state = hollyStateStore?.getAutonomyState();
   if (!state) return;
@@ -6038,9 +6167,15 @@ function recordAutonomyActivity(
   } else if (kind === "world_observation_share") {
     state.lastWorldObservationShareAt = now;
     state.worldObservationShareDailyCount += 1;
+  } else if (kind === "autonomous_message") {
+    state.lastAutonomousMessageAt = now;
   } else {
     state.lastArchiveWritingAt = now;
     state.archiveWritingDailyCount += 1;
+  }
+  if (creative && (kind === "memory_reflection" || kind === "archive_writing")) {
+    state.recentActions.push({ kind, at: creative.at, title: creative.title });
+    state.recentActions = state.recentActions.slice(-16);
   }
   void hollyStateStore?.save();
 }
@@ -6336,6 +6471,107 @@ function observeWorldForProactive(request: ProactiveWorldObservationRequest): Pr
   return Promise.resolve(findRelevantWorldObservation(request));
 }
 
+// 影子信号：同一批搜索结果，也让本地的决策模型（NanoJev、Open-Jev）答一遍，只记账、不采纳。
+//
+// 为什么挑这个调用点，而不是别的：它是 Holly 全部判断里唯一一个既装得进这类模型的上下文
+// （每次约一千五百 token，别的动辄六万到十万）、形状又对得上的——一批候选、每条一个布尔
+// 判断。而且它判错最便宜：这一步只决定打不打开网页，出错的兜底本来就是「照旧打开全部
+// 结果」，多读几页而已，不会让她说错话。
+//
+// 两边必须答同一道题、看同一批结果，分歧才有意义，所以问题文本照抄了主模型那边的
+// 判定标准（见 search-judge-shadow.ts 的 SEARCH_KEEP_INSTRUCTIONS）。
+//
+// 整个函数不抛也不等：调用方 void 掉它，任何失败都只是这一次没有影子数据。
+type SearchJudgeShadow = {
+  /** 监控标题里的名字。 */
+  label: string;
+  threshold: number;
+  log: JsonlLog;
+  judge: (input: SearchJudgeShadowInput) => Promise<SearchJudgeShadowJudgement | null>;
+};
+
+async function recordSearchJudgeShadow(
+  shadow: SearchJudgeShadow,
+  input: SearchJudgeShadowInput & {
+    results: readonly SearchResult[];
+    selection: { kept: SearchResult[]; dropped: Array<{ result: SearchResult; reason: string }> };
+  },
+): Promise<void> {
+  // 用对象引用而不是 url 来配对。同一次搜索里冒出两条相同 url 时，按 url 索引会把两
+  // 条判断叠成一条；selectJudgedSearchResults 还回来的本来就是原数组里那些对象，引用
+  // 比较既准又省事。
+  const keptSet = new Set(input.selection.kept);
+  const primaryKeptIndexes = new Set<number>();
+  input.results.forEach((result, offset) => {
+    if (keptSet.has(result)) primaryKeptIndexes.add(offset + 1);
+  });
+  const primaryReasons = new Map<number, string>();
+  for (const { result, reason } of input.selection.dropped) {
+    const offset = input.results.indexOf(result);
+    if (offset >= 0 && reason) primaryReasons.set(offset + 1, reason);
+  }
+
+  let judgement;
+  try {
+    judgement = await shadow.judge({
+      topic: input.topic,
+      topicBrief: input.topicBrief,
+      nowLabel: input.nowLabel,
+      sinceLabel: input.sinceLabel,
+      results: input.results,
+    });
+  } catch {
+    return;
+  }
+  if (!judgement) return;
+
+  const comparison = compareSearchJudgements({
+    results: input.results,
+    primaryKeptIndexes,
+    primaryReasons,
+    judgement,
+  });
+  const total = comparison.agree + comparison.disagree;
+
+  // inputs 连标题和摘要一起记。监控里那条「Search Judged」只有 url 和留丢，拿它做离线评测
+  // 时判断时效的那一半根本没法复现（见 openjev-eval.ts）；这里记全，攒下来的就是完整的成对
+  // 样本，以后换模型、换阈值都能原样重放。
+  shadow.log.append({
+    ts: new Date().toISOString(),
+    topic: input.topic,
+    topic_brief: input.topicBrief,
+    now: input.nowLabel,
+    since: input.sinceLabel,
+    results: input.results.length,
+    judged: total,
+    skipped: judgement.skipped,
+    agree: comparison.agree,
+    disagree: comparison.disagree,
+    shadow_only_keep: comparison.shadowOnlyKeep,
+    primary_only_keep: comparison.primaryOnlyKeep,
+    forward_passes: judgement.forwardPasses,
+    server_seconds: judgement.serverSeconds,
+    threshold: shadow.threshold,
+    inputs: input.results.map(({ title, url, snippet }) => ({ title, url, snippet })),
+    rows: comparison.rows,
+  });
+
+  // primary_only_keep 单独点出来：那是影子模型想丢掉、而主模型认为该看的页面，也就是
+  // 真让它接手之后 Holly 会漏掉的东西。另一个方向只是多读几页，不对称，不该混在一起看。
+  pushMonitorEntry(
+    "status",
+    `${shadow.label}(shadow) 一致 ${comparison.agree}/${total}`,
+    [
+      `topic=${input.topic}`,
+      `disagree=${comparison.disagree} (shadow_only_keep=${comparison.shadowOnlyKeep} primary_only_keep=${comparison.primaryOnlyKeep})`,
+      `forward_passes=${judgement.forwardPasses ?? "?"} server_seconds=${judgement.serverSeconds?.toFixed(3) ?? "?"}`,
+      ...comparison.rows.map((row) =>
+        `${row.primaryKeep === row.shadowKeep ? "同" : "异"} primary=${row.primaryKeep ? "keep" : "drop"}`
+        + ` shadow=${row.shadowKeep ? "keep" : "drop"} p=${row.pTrue.toFixed(3)} ${row.url}`),
+    ].join("\n"),
+  );
+}
+
 // 搜索结果先让模型挑一遍再打开，只读它认为可能是新闻或研究进展的页面。本地搜索对「数学」这类
 // 话题几乎只给百科和课程网站，打开了也必然被日期闸门挡掉，白读几页。用决策通道的模型：活很小，
 // 犯不上动主模型。这一步只决定打不打开，所以出了任何错都照旧打开全部搜索结果。
@@ -6376,6 +6612,34 @@ async function judgeWorldObservationSearchResults(
         ...selection.dropped.map(({ result, reason }) => `drop ${result.url} | ${reason}`),
       ].join("\n"),
     );
+    const shadowInput = {
+      topic,
+      topicBrief: autonomyConfig.worldTopicBriefs[topic] ?? "",
+      nowLabel: labels.now,
+      sinceLabel: labels.since,
+      results,
+      selection,
+    };
+    // 两个影子各问各的、各记各的，谁慢谁挂都不牵连另一个。配置快照在这里取一次：影子
+    // 调用可能要几秒，这期间 config.yaml 被改，也不该让同一次调用前后用两套阈值。
+    const nanojev = nanojevConfig;
+    const openjev = openjevConfig;
+    if (nanojev.enabled) {
+      void recordSearchJudgeShadow({
+        label: "NanoJev",
+        threshold: nanojev.threshold,
+        log: nanojevShadowLog,
+        judge: (judgeInput) => judgeSearchResultsWithNanoJev(nanojev, judgeInput),
+      }, shadowInput);
+    }
+    if (openjev.enabled) {
+      void recordSearchJudgeShadow({
+        label: "Open-Jev",
+        threshold: openjev.threshold,
+        log: openjevShadowLog,
+        judge: (judgeInput) => judgeSearchResultsWithOpenJev(openjev, judgeInput),
+      }, shadowInput);
+    }
     return selection.kept;
   } catch (error) {
     pushMonitorEntry(
@@ -6400,7 +6664,8 @@ async function observeWorldForAutonomy(
   options: { broadcast?: boolean } = {},
 ): Promise<ProactiveWorldObservation | null> {
   if (!browserAgentConfig.enabled) return null;
-  if (!searchConfig.enabled) {
+  const sourceUrls = autonomyConfig.worldTopicSourceUrls[request.topic] ?? [];
+  if (!canBrowseTopicWithBrowserAgent(browserAgentConfig, searchConfig.enabled, sourceUrls)) {
     pushMonitorEntry(
       "status",
       "Browser Agent Skipped",
@@ -6412,7 +6677,6 @@ async function observeWorldForAutonomy(
   const query = buildAutonomyBrowserQuery(request);
   const now = Date.now();
 
-  const sourceUrls = autonomyConfig.worldTopicSourceUrls[request.topic] ?? [];
   pushMonitorEntry(
     "status",
     "Browser Agent Start",
@@ -6511,7 +6775,7 @@ function compactReflectionText(text: string, maxChars: number): string {
 }
 
 function broadcastLatestLlmUsage(client: LlmClient): void {
-  broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+  broadcastMonitorEvent({ type: "usage", providerUsage: getLatestProviderUsage() });
   // 一次取空：工具循环跑了几轮就有几条。以前只取一条，剩下的积压下来，监控上每条命中率
   // 都晚一个多小时，小时柱也跟着错位，见 TokenUsageQueue.drain。
   const calls = client.drainTokenUsage();
@@ -6632,10 +6896,8 @@ function buildWorldObservationBroadcastSchema(candidateUrls: readonly string[]):
       intro: { type: "string" },
       items: {
         type: "array",
-        // maxItems is rejected by Claude's structured-output validator
-        // ("not supported" for array schemas); the cap is enforced by the
-        // prompt instruction plus the WORLD_OBSERVATION_BROADCAST_MAX_ITEMS
-        // check in the dedup loop below.
+        // The prompt instruction and WORLD_OBSERVATION_BROADCAST_MAX_ITEMS
+        // check in the dedup loop below enforce the item cap.
         items: {
           type: "object",
           additionalProperties: false,
@@ -7213,6 +7475,7 @@ async function maybeBroadcastWorldObservation(
 
     recordOutgoingAiTone(message, target.key);
     const sentMessageId = await sendGroupMessage(target.numericId, message);
+    recordAutonomyActivity("autonomous_message");
     appendConversationTurn({
       groupId: target.key,
       role: "assistant",
@@ -7370,6 +7633,7 @@ async function maybeBroadcastMemoryReflection(request: AutonomyMemoryWriteReques
   if (!message) return;
 
   const sentMessageId = await sendGroupMessage(numericGroupId, message);
+  recordAutonomyActivity("autonomous_message");
   appendConversationTurn({
     groupId: groupKey,
     role: "assistant",
@@ -7487,7 +7751,7 @@ async function writeMemoryForAutonomy(request: AutonomyMemoryWriteRequest): Prom
   };
   appendHollyMemoryLog(record);
   rememberHollyMemoryForSidebar(record);
-  recordAutonomyActivity("memory_reflection");
+  recordAutonomyActivity("memory_reflection", { title: topic, at: Date.parse(now) });
   broadcastAutonomySidebar();
   await persistInternalMemory({
     receivedAt: now,
@@ -7555,8 +7819,18 @@ async function requestBootOrientation(
   nowIso: string,
   previousBootAt: number,
   material: readonly string[],
-): Promise<BootOrientation | null> {
-  const client = activeLlmClient;
+): Promise<{ orientation: BootOrientation; model: string } | null> {
+  // 开机定向是她关起门来对自己说的一句话，不面向任何人，跟筛搜索结果是一类活，所以
+  // 跟那边一样走决策通道。
+  //
+  // 这次调用吃不上缓存，而且两层各堵死一半，缺一层都不至于。第一层：断点落在那句二十
+  // 来字的系统提示后面，实测可缓存前缀只有 45 token，远在模型下限之下，缓存条目压根
+  // 创建不出来——监控里那条 prefix-too-small 说的就是它。第二层：就算把断点挪到 material
+  // 后面、让那一万 token 有资格进缓存，一天三四次启动的间隔也远超缓存那一小时有效期，
+  // 下次开机时写进去的那条早过期了。所以这里没有前缀可救，能省的只剩单价。
+  //
+  // 没配决策档位就回落到主模型：宁可贵一次，也不能让她开机时一片空白。
+  const client = decisionLlmClient ?? activeLlmClient;
   if (!client || !hollyBootstrapConfig.reflectionEnabled) return null;
 
   const prompt = buildBootOrientationPrompt({
@@ -7579,7 +7853,10 @@ async function requestBootOrientation(
       cacheRoute: "boot-orientation",
     });
     recordBootstrapLlmUsage(client);
-    return parseBootOrientation(reply);
+    // 把实际出力的模型一并带出去。这条 thought 会进 thought-history 长期留着，上面
+    // 记的模型名要是还写着主模型，以后回头看这段记录就对不上账了。
+    const orientation = parseBootOrientation(reply);
+    return orientation ? { orientation, model: client.model } : null;
   } catch (error) {
     pushMonitorEntry(
       "error",
@@ -7590,7 +7867,11 @@ async function requestBootOrientation(
   }
 }
 
-async function persistBootOrientation(orientation: BootOrientation, nowIso: string): Promise<void> {
+async function persistBootOrientation(
+  orientation: BootOrientation,
+  nowIso: string,
+  model: string,
+): Promise<void> {
   const state = hollyStateStore?.getLifecycleState();
   if (state) {
     state.lastBootThoughtAt = Date.parse(nowIso);
@@ -7610,7 +7891,7 @@ async function persistBootOrientation(orientation: BootOrientation, nowIso: stri
     groupId: null,
     outcome: orientation.shouldWriteMemory ? "memory_written" : "no_memory",
     finalAnswer: "",
-    model: activeLlmClient?.model ?? "",
+    model,
     durationMs: null,
   });
   pushMonitorEntry(
@@ -7791,9 +8072,10 @@ async function runHollyBootstrap(): Promise<void> {
 
   let material = await buildHollyBootstrapMaterial();
   if (hollyBootstrapConfig.enabled && hollyBootstrapConfig.reflectionEnabled) {
-    const orientation = await requestBootOrientation(nowIso, previousBootAt, material);
-    if (orientation) {
-      await persistBootOrientation(orientation, nowIso);
+    const oriented = await requestBootOrientation(nowIso, previousBootAt, material);
+    if (oriented) {
+      const { orientation } = oriented;
+      await persistBootOrientation(orientation, nowIso, oriented.model);
       if (orientation.shouldWriteMemory) {
         material = [
           ...material,
@@ -8073,7 +8355,7 @@ async function writeArchiveForAutonomy(request: AutonomyArchiveWriteRequest): Pr
   await appendArchiveWorkLog(record, renderArchiveWorkHtml(record));
   archiveWorks.push(record);
   archiveWorks = archiveWorks.slice(-ARCHIVE_MEMORY_LIMIT);
-  recordAutonomyActivity("archive_writing");
+  recordAutonomyActivity("archive_writing", { title: record.title, at: Date.parse(record.ts) });
   broadcastMonitorEvent({ type: "archive", work: record });
   pushMonitorEntry(
     "status",
@@ -8243,7 +8525,9 @@ function runGroupProactiveOnModelQueue(): Promise<ProactiveTickResult> {
 
   return modelRouteQueue.submitExclusive(async () => {
     try {
-      return await runProactiveTick(deps);
+      const result = await runProactiveTick(deps);
+      if (result.actions.some((action) => action.mode === "live")) recordAutonomyActivity("autonomous_message");
+      return result;
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       pushMonitorEntry("error", "Proactive Tick Error", detail);
@@ -8461,7 +8745,7 @@ function flushUnreadMessagesToModel(): void {
 // 下游那几个 RouteQueue 暂时原样留着。它们现在只有一个调用方、而且调用方本就串行，
 // 已经是退化的；留着是为了这一步只改执行骨架、不动任何一条具体路径。
 async function handleAgentEvents(events: readonly AgentEvent[]): Promise<void> {
-  const { groupKeys, tickDue } = coalesceAgentEvents(events);
+  const { groupKeys, tickDue, focusRetryDue } = coalesceAgentEvents(events);
 
   const batches: PendingModelMessage[][] = [];
   for (const groupKey of groupKeys) {
@@ -8489,7 +8773,14 @@ async function handleAgentEvents(events: readonly AgentEvent[]): Promise<void> {
     }
   }
 
-  if (tickDue) await runAutonomyTick();
+  if ((focusRetryDue || tickDue) && batches.length === 0 && focusModeConfig.enabled) {
+    await runFocusBatchesFromLoop([]);
+  }
+
+  // A foreground request waiting for compaction takes priority over idle work.
+  if (focusModeConfig.enabled && pendingFocusRound.snapshot().length > 0) return;
+
+  if (tickDue && !yieldAutonomyToUnreadMessages()) await runAutonomyTick();
 }
 
 // 焦点管线的错误收口。runFocusRoundForBatches 内部已经接住了模型那一段，能漏到这里的是
@@ -8901,6 +9192,8 @@ async function bootstrap(): Promise<void> {
   const loadedSearchConfig = await loadSearchConfig(CONFIG_PATH);
   const loadedBrowserAgentConfig = await loadBrowserAgentConfig(CONFIG_PATH);
   const loadedAiToneConfig = await loadAiToneConfig(CONFIG_PATH);
+  const loadedNanoJevConfig = await loadSearchJudgeShadowConfig(CONFIG_PATH, "nanojev", DEFAULT_NANOJEV_CONFIG);
+  const loadedOpenJevConfig = await loadSearchJudgeShadowConfig(CONFIG_PATH, "openjev", DEFAULT_OPENJEV_CONFIG);
   const loadedHollyBootstrapConfig = await loadHollyBootstrapConfig(CONFIG_PATH);
   const loadedAdminPolicyConfig = await loadAdminPolicyConfig(CONFIG_PATH);
   const loadedPrivateChatConfig = await loadPrivateChatConfig(CONFIG_PATH);
@@ -8930,6 +9223,8 @@ async function bootstrap(): Promise<void> {
   focusModeConfig = loadedFocusModeConfig;
   aiToneConfig = loadedAiToneConfig;
   aiToneClassifier = loadAiToneClassifier(join(APP_ROOT, "ai-tone-model.json"));
+  nanojevConfig = loadedNanoJevConfig;
+  openjevConfig = loadedOpenJevConfig;
   hollyStateStore = await HollyStateStore.load(join(LOG_DIR, "holly-state.json"), loadedProactiveConfig.engagedTtlMs);
   domainReputationStore = await DomainReputationStore.load(join(LOG_DIR, "domain-reputation.json"));
   thoughtHistoryStore = await ThoughtHistoryStore.load(THOUGHT_HISTORY_LOG_PATH, THOUGHT_HISTORY_LIMIT);
@@ -9032,12 +9327,16 @@ async function bootstrap(): Promise<void> {
   // 每 5 分钟重新广播缓存用量和今日 token 统计，让稍后接入的客户端保持同步；即使群聊
   // 安静，也能让 token 面板跨到新的一天。按既定策略，该定时器不会主动探测模型。
   setInterval(() => {
-    broadcastMonitorEvent({ type: "usage", claudeUsage: getLatestClaudeUsage() });
+    broadcastMonitorEvent({ type: "usage", providerUsage: getLatestProviderUsage() });
     broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
   }, 5 * 60 * 1000);
 
   const server = createServer(async (req, res) => {
     try {
+      if (!isTrustedLocalRequest(req.headers.host, req.headers.origin)) {
+        sendJson(res, 403, { error: "Forbidden" });
+        return;
+      }
       const url = getRequestUrl(req);
 
       if (req.method === "GET" && url.pathname === "/vendor/vue.global.prod.js") {
@@ -9154,17 +9453,10 @@ async function bootstrap(): Promise<void> {
       }
 
       if (req.method === "POST" && url.pathname === "/api/usage/refresh") {
-        let usage = getLatestClaudeUsage();
-        // User-selected policy: only probe when there is no cached usage yet.
-        if (!usage) {
-          const current = getActiveLlmClient();
-          if (current.provider === "claude") {
-            usage = await probeClaudeUsage(current.model);
-            broadcastMonitorEvent({ type: "usage", claudeUsage: usage });
-            broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
-          }
-        }
-        sendJson(res, 200, { claudeUsage: usage, tokenStats: getTodayTokenStats() });
+        const usage = await probeProviderUsage(getActiveLlmClient().model);
+        broadcastMonitorEvent({ type: "usage", providerUsage: usage });
+        broadcastMonitorEvent({ type: "tokens", tokenStats: getTodayTokenStats() });
+        sendJson(res, 200, { providerUsage: usage, tokenStats: getTodayTokenStats() });
         return;
       }
 
@@ -9281,7 +9573,13 @@ async function bootstrap(): Promise<void> {
         }
         try {
           const html = await readFile(join(ARCHIVE_DIR, fileName), "utf-8");
-          sendHtml(res, html);
+          res.writeHead(200, {
+            "Content-Type": "text/html; charset=utf-8",
+            "Content-Length": Buffer.byteLength(html),
+            "Content-Security-Policy": ARCHIVE_CSP,
+            "X-Content-Type-Options": "nosniff",
+          });
+          res.end(html);
         } catch {
           sendJson(res, 404, { error: "Not found" });
         }
@@ -9304,39 +9602,6 @@ async function bootstrap(): Promise<void> {
         return;
       }
 
-      if (req.method === "GET" && url.pathname === CLAUDE_OAUTH_LOGIN_PATH) {
-        // 回调主机名照官方 CLI 写 localhost，授权服务器按登记的回环地址校验 redirect_uri。
-        const authorizeUrl = claudeOAuth.beginLogin(`http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_CALLBACK_PATH}`);
-        res.writeHead(302, { Location: authorizeUrl });
-        res.end();
-        return;
-      }
-
-      if (req.method === "GET" && url.pathname === CLAUDE_OAUTH_CALLBACK_PATH) {
-        const code = url.searchParams.get("code");
-        const state = url.searchParams.get("state");
-        if (!code || !state) {
-          const reason = url.searchParams.get("error_description") || url.searchParams.get("error") || "缺少 code 或 state";
-          sendText(res, 400, `Claude 登录未完成：${reason}`);
-          return;
-        }
-        try {
-          const creds = await claudeOAuth.completeLogin(code, state);
-          console.log(`Claude login completed${creds.email ? ` for ${creds.email}` : ""}; credentials at ${claudeOAuth.credentialsPath}`);
-          sendText(res, 200, `Holly 已登录 Claude${creds.email ? `（${creds.email}）` : ""}，可以关掉这个页面了。`);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          console.warn("Claude login failed.", error);
-          // 回调里的 state 已经用掉了，刷新这个页面只会得到「已过期」；直接给出重新登录的入口。
-          sendText(
-            res,
-            502,
-            `Claude 登录失败：${message}\n\n请重新打开 http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_LOGIN_PATH} 再授权一次（刷新本页没用）。`,
-          );
-        }
-        return;
-      }
-
       sendJson(res, 404, { error: "Not found" });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
@@ -9350,13 +9615,6 @@ async function bootstrap(): Promise<void> {
     console.log(`WebSocket client target is ${WS_TARGET_URL}`);
     console.log(`Response LLM profile: ${client.displayName}`);
     console.log(`Decision LLM profile: ${decisionClient.displayName}`);
-    if (client.provider === "claude" || decisionClient.provider === "claude") {
-      void claudeOAuth.hasCredentials().then((loggedIn) => {
-        if (!loggedIn) {
-          console.warn(`Claude 未登录：在浏览器打开 http://localhost:${HTTP_PORT}${CLAUDE_OAUTH_LOGIN_PATH}`);
-        }
-      });
-    }
     if (store) {
       console.log(`Qdrant store: ${store.description}`);
     }

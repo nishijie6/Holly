@@ -29,15 +29,9 @@ export type TokenUsageBreakdown = {
   cacheCreationInputTokens: number;
   cacheReadInputTokens: number;
   outputTokens: number;
-  // 最后一个 cache_control 断点之前的前缀估算大小，也是缓存条目唯一可能覆盖的部分。
-  // 不报告断点的提供方（Codex）以及开始记录该字段之前的旧数据没有此值，只能退回用
-  // 整个请求的大小判断；这正是过去把 1.1 万 token 请求里的 40-token 前缀误判为
-  // 前缀漂移的原因。
+  // 可复用前缀的估算大小；未报告该字段时按整个请求的大小判断。
   cacheablePrefixTokens?: number;
-  // cacheCreationInputTokens 按服务端实际采用的 TTL 拆开。请求里每个断点都写的是 1h，
-  // 所以 5m 这一格本该恒为 0；不为 0 就说明 1h 没生效，缓存五分钟没人读就会过期——
-  // 而空闲时的念头恰好是每五分钟一次，全落在过期边缘上。响应里没有这个拆分（Codex、
-  // 早于该字段的旧数据）时两项都不出现，不能当成 0 来理解。
+  // 兼容旧用量记录的 TTL 拆分；Codex 响应不报告这些字段。
   cacheCreation1hInputTokens?: number;
   cacheCreation5mInputTokens?: number;
 };
@@ -216,36 +210,15 @@ export function buildDailyTokenStats(
   return { date, models: list, totalTokens };
 }
 
-// Anthropic 会静默拒绝缓存短于模型下限的前缀：不报错，只会一直返回
-// cache_creation_input_tokens: 0。不同代际模型的下限并非单调变化，因此必须查表，
-// 不能靠经验规则推断。未知模型返回 null；只有明确知道调用低于哪个阈值时，才把它
-// 排除在命中率分母之外。
-const MINIMUM_CACHEABLE_PREFIX_TOKENS: ReadonlyArray<readonly [prefix: string, minimum: number]> = [
-  ["claude-opus-4-8", 1_024],
-  ["claude-opus-4-7", 2_048],
-  ["claude-opus-4-6", 4_096],
-  ["claude-opus-4-5", 4_096],
-  ["claude-opus-4-1", 1_024],
-  ["claude-opus-5", 512],
-  ["claude-opus-4", 1_024],
-  ["claude-fable-5", 512],
-  ["claude-mythos-5", 512],
-  ["claude-sonnet-5", 1_024],
-  ["claude-sonnet-4-6", 1_024],
-  ["claude-sonnet-4-5", 1_024],
-  ["claude-sonnet-4", 1_024],
-  ["claude-haiku-4-5", 4_096],
-  ["claude-haiku-3-5", 2_048],
-];
-
+// GPT-5.6 and later document a 1,024 visible-token minimum. Earlier GPT
+// thresholds depend on request settings, so leave them unknown rather than
+// misclassifying short calls as uncacheable using a provider-specific table.
 export function minimumCacheablePrefixTokens(model: string): number | null {
-  const normalized = model.trim().toLowerCase();
-  if (!normalized) return null;
-  // 必须优先匹配最长名称，避免 "claude-opus-4-7" 错配到 "claude-opus-4"。
-  for (const [prefix, minimum] of MINIMUM_CACHEABLE_PREFIX_TOKENS) {
-    if (normalized.startsWith(prefix)) return minimum;
-  }
-  return null;
+  const match = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/i.exec(model.trim());
+  if (!match) return null;
+  const major = Number(match[1]);
+  const minor = Number(match[2] ?? 0);
+  return major > 5 || (major === 5 && minor >= 6) ? 1_024 : null;
 }
 
 // 记录调用无法缓存的原因。下面两种问题对应不同修复方式，不能合并；混在一起曾让人

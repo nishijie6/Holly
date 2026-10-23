@@ -30,7 +30,11 @@ export type AutonomyIdlePolicy = {
 };
 
 export const AUTONOMY_IDLE_POLICY: AutonomyIdlePolicy = {
-  judgmentCooldownMs: 15 * 60 * 1000,
+  // 和下面的 focusIdleMs 取同一个值，这样两条信号说的是同一句话：安静满五分钟算闲下来了，
+  // 闲着就每五分钟可以想一次。取 15 分钟那阵子她一天只醒六十来次，绝大多数轮次都耗在「刚问过」
+  // 上，人看着就像她不在。调大省钱但更迟钝，调小更活络但每次都是一笔真实开销——判断调用虽然
+  // 复用焦点前缀、账本部分几乎全走缓存读取，尾部那条指令和输出仍按次全价。
+  judgmentCooldownMs: 5 * 60 * 1000,
   focusIdleMs: 5 * 60 * 1000,
   // 跟 kagami 一致：凌晨一点到早上九点不起这个念头。她也有作息。
   quietStartHour: 1,

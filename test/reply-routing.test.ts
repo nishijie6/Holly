@@ -49,8 +49,8 @@ test("silent decisions never invoke the response model", async () => {
 
   const result = await refineDecisionReply({
     decision: original,
-    decisionModel: "claude-sonnet-4-6",
-    responseModel: "claude-opus-4-7",
+    decisionModel: "gpt-5.4-mini",
+    responseModel: "gpt-5.4",
     generateFinalAnswer: async () => {
       calls += 1;
       return "不应生成";
@@ -59,7 +59,7 @@ test("silent decisions never invoke the response model", async () => {
 
   assert.equal(calls, 0);
   assert.equal(result.decision, original);
-  assert.equal(result.responseModel, "claude-sonnet-4-6");
+  assert.equal(result.responseModel, "gpt-5.4-mini");
 });
 
 test("a sendable Sonnet draft is refined once by the distinct response model", async () => {
@@ -67,8 +67,8 @@ test("a sendable Sonnet draft is refined once by the distinct response model", a
   let seenDraft = "";
   const result = await refineDecisionReply({
     decision: decision(),
-    decisionModel: "claude-sonnet-4-6",
-    responseModel: "claude-opus-4-7",
+    decisionModel: "gpt-5.4-mini",
+    responseModel: "gpt-5.4",
     generateFinalAnswer: async (input) => {
       seenDraft = input.messages[0].content;
       return "最终回复：我觉得这个结论最好再核对一下。";
@@ -77,7 +77,7 @@ test("a sendable Sonnet draft is refined once by the distinct response model", a
 
   assert.match(seenDraft, /我觉得这个结论还需要再核对一下/);
   assert.equal(result.decision.finalAnswer, "我觉得这个结论最好再核对一下。");
-  assert.equal(result.responseModel, "claude-opus-4-7");
+  assert.equal(result.responseModel, "gpt-5.4");
   assert.equal(result.usedFallback, false);
   assert.equal(result.error, null);
 });
@@ -88,8 +88,8 @@ test("the decision draft is used directly when both roles use the same model", a
   const original = decision();
   const result = await refineDecisionReply({
     decision: original,
-    decisionModel: "claude-sonnet-4-6",
-    responseModel: "claude-sonnet-4-6",
+    decisionModel: "gpt-5.4-mini",
+    responseModel: "gpt-5.4-mini",
     generateFinalAnswer: async () => {
       calls += 1;
       return "不应生成";
@@ -98,7 +98,7 @@ test("the decision draft is used directly when both roles use the same model", a
 
   assert.equal(calls, 0);
   assert.equal(result.decision, original);
-  assert.equal(result.responseModel, "claude-sonnet-4-6");
+  assert.equal(result.responseModel, "gpt-5.4-mini");
 });
 
 test("an empty, incomplete, or failed response-model result falls back to the decision draft", async () => {
@@ -112,8 +112,8 @@ test("an empty, incomplete, or failed response-model result falls back to the de
   ]) {
     const result = await refineDecisionReply({
       decision: original,
-      decisionModel: "claude-sonnet-4-6",
-      responseModel: "claude-opus-4-7",
+      decisionModel: "gpt-5.4-mini",
+      responseModel: "gpt-5.4",
       generateFinalAnswer,
     });
     assert.equal(result.decision.finalAnswer, original.finalAnswer);
@@ -147,8 +147,8 @@ test("administrator decisions keep the approved draft without response-model rew
   });
   const result = await refineDecisionReply({
     decision: original,
-    decisionModel: "claude-sonnet-4-6",
-    responseModel: "claude-opus-4-7",
+    decisionModel: "gpt-5.4-mini",
+    responseModel: "gpt-5.4",
     generateFinalAnswer: async () => {
       calls += 1;
       return "改写后的管理员承诺";
@@ -157,7 +157,7 @@ test("administrator decisions keep the approved draft without response-model rew
 
   assert.equal(calls, 0);
   assert.equal(result.decision, original);
-  assert.equal(result.responseModel, "claude-sonnet-4-6");
+  assert.equal(result.responseModel, "gpt-5.4-mini");
 });
 
 test("structured or meta response-model output falls back to the approved draft", async () => {
@@ -171,8 +171,8 @@ test("structured or meta response-model output falls back to the approved draft"
   ]) {
     const result = await refineDecisionReply({
       decision: original,
-      decisionModel: "claude-sonnet-4-6",
-      responseModel: "claude-opus-4-7",
+      decisionModel: "gpt-5.4-mini",
+      responseModel: "gpt-5.4",
       generateFinalAnswer: async () => output,
     });
     assert.equal(result.decision.finalAnswer, original.finalAnswer);
@@ -187,8 +187,8 @@ test("response-model rewriting must preserve every URL from the approved draft",
   });
   const result = await refineDecisionReply({
     decision: original,
-    decisionModel: "claude-sonnet-4-6",
-    responseModel: "claude-opus-4-7",
+    decisionModel: "gpt-5.4-mini",
+    responseModel: "gpt-5.4",
     generateFinalAnswer: async () => "可以看这个来源：https://example.com/a。",
   });
 

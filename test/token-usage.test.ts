@@ -176,10 +176,10 @@ test("daily token stats expose every input category and include output in the to
     outputTokens: 50,
   });
 
-  assert.deepEqual(buildDailyTokenStats("2026-09-02", new Map([["claude-opus-4-7", counts]])), {
+  assert.deepEqual(buildDailyTokenStats("2026-09-02", new Map([["gpt-5.6", counts]])), {
     date: "2026-09-02",
     models: [{
-      model: "claude-opus-4-7",
+      model: "gpt-5.6",
       inputTokens: 900,
       uncachedInputTokens: 200,
       cacheCreationInputTokens: 300,
@@ -197,8 +197,8 @@ test("daily token stats expose every input category and include output in the to
 
 test("per-client token queues cannot overwrite each other and preserve completion order", async () => {
   const { TokenUsageQueue } = await loadUsageModule();
-  const firstClient = new TokenUsageQueue("claude-sonnet-4-6", () => 1_000);
-  const secondClient = new TokenUsageQueue("claude-sonnet-4-6", () => 2_000);
+  const firstClient = new TokenUsageQueue("gpt-5.6", () => 1_000);
+  const secondClient = new TokenUsageQueue("gpt-5.6", () => 2_000);
   const first = {
     inputTokens: 10,
     uncachedInputTokens: 2,
@@ -219,19 +219,19 @@ test("per-client token queues cannot overwrite each other and preserve completio
   firstClient.record(second, "memory-reflection");
 
   assert.deepEqual(firstClient.consume(), {
-    model: "claude-sonnet-4-6",
+    model: "gpt-5.6",
     purpose: "reply-decision",
     ...first,
     capturedAt: 1_000,
   });
   assert.deepEqual(secondClient.consume(), {
-    model: "claude-sonnet-4-6",
+    model: "gpt-5.6",
     purpose: "focus-loop",
     ...second,
     capturedAt: 2_000,
   });
   assert.deepEqual(firstClient.consume(), {
-    model: "claude-sonnet-4-6",
+    model: "gpt-5.6",
     purpose: "memory-reflection",
     ...second,
     capturedAt: 1_000,
@@ -248,7 +248,7 @@ test("a call's cache hit rate is measured against the input it actually accounte
     cacheCreationInputTokens: 100,
     cacheReadInputTokens: 800,
     outputTokens: 50,
-  }, "claude-sonnet-4-6"), {
+  }, "gpt-5.6"), {
     cacheReadInputTokens: 800,
     cacheCreationInputTokens: 100,
     uncachedInputTokens: 100,
@@ -269,7 +269,7 @@ test("a call that only writes cache reports a 0% hit rather than nothing", async
     cacheCreationInputTokens: 54_643,
     cacheReadInputTokens: 0,
     outputTokens: 1,
-  }, "claude-sonnet-4-6"), {
+  }, "gpt-5.6"), {
     cacheReadInputTokens: 0,
     cacheCreationInputTokens: 54_643,
     uncachedInputTokens: 0,
@@ -285,17 +285,17 @@ test("a call that only writes cache reports a 0% hit rather than nothing", async
 test("a request shorter than the model's minimum reports no rate instead of a 0% miss", async () => {
   const { summarizePromptCacheCall } = await loadUsageModule();
   // The isolated final-reply call: a fixed instruction plus one approved draft,
-  // nowhere near opus-4-7's 2048-token minimum cacheable prefix.
+  // nowhere near GPT-5.6's 1024-token minimum cacheable prefix.
   const summary = summarizePromptCacheCall({
     inputTokens: 260,
     uncachedInputTokens: 260,
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 0,
     outputTokens: 40,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
 
   assert.equal(summary?.belowMinimum, true);
-  assert.equal(summary?.minimumPrefixTokens, 2_048);
+  assert.equal(summary?.minimumPrefixTokens, 1_024);
   assert.equal(summary?.hitRate, null);
 });
 
@@ -307,7 +307,7 @@ test("cache activity outweighs the table: a short request that did cache is meas
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 500,
     outputTokens: 10,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
 
   assert.equal(summary?.belowMinimum, false);
   assert.equal(summary?.hitRate, 500 / 600);
@@ -328,13 +328,13 @@ test("an unknown model is measured rather than excused", async () => {
   assert.equal(summary?.hitRate, 0);
 });
 
-test("model minimums are matched most-specific-first", async () => {
+test("cache minimums cover documented GPT families and leave older request-dependent limits unknown", async () => {
   const { minimumCacheablePrefixTokens } = await loadUsageModule();
-  assert.equal(minimumCacheablePrefixTokens("claude-opus-4-7"), 2_048);
-  assert.equal(minimumCacheablePrefixTokens("claude-opus-4-6"), 4_096);
-  assert.equal(minimumCacheablePrefixTokens("claude-opus-4-8"), 1_024);
-  assert.equal(minimumCacheablePrefixTokens("claude-opus-5"), 512);
-  assert.equal(minimumCacheablePrefixTokens("claude-sonnet-4-6"), 1_024);
+  assert.equal(minimumCacheablePrefixTokens("gpt-5.6"), 1_024);
+  assert.equal(minimumCacheablePrefixTokens("gpt-5.6-mini"), 1_024);
+  assert.equal(minimumCacheablePrefixTokens("gpt-6.1-sol"), 1_024);
+  assert.equal(minimumCacheablePrefixTokens("gpt-5.4"), null);
+  assert.equal(minimumCacheablePrefixTokens("gpt-5.5"), null);
 });
 
 test("a call with no reported breakdown is unmeasured, not a cache miss", async () => {
@@ -350,7 +350,7 @@ test("a call with no reported breakdown is unmeasured, not a cache miss", async 
 
 test("each queued call keeps the purpose it was made for, in completion order", async () => {
   const { TokenUsageQueue } = await loadUsageModule();
-  const client = new TokenUsageQueue("claude-sonnet-4-6", () => 1_000);
+  const client = new TokenUsageQueue("gpt-5.6", () => 1_000);
   const usage = {
     inputTokens: 10,
     uncachedInputTokens: 2,
@@ -372,7 +372,7 @@ test("each queued call keeps the purpose it was made for, in completion order", 
 test("draining returns every round of a tool loop, not just the first", async () => {
   const { TokenUsageQueue } = await loadUsageModule();
   let now = 1_000;
-  const client = new TokenUsageQueue("claude-sonnet-4-6", () => now);
+  const client = new TokenUsageQueue("gpt-5.6", () => now);
   const usage = (inputTokens: number) => ({
     inputTokens,
     uncachedInputTokens: 0,
@@ -441,14 +441,14 @@ test("the purpose rollup keeps a purpose that only writes apart from one that re
     cacheCreationInputTokens: 50_000,
     cacheReadInputTokens: 0,
     outputTokens: 1,
-  }, "claude-sonnet-4-6");
+  }, "gpt-5.6");
   const reply = summarizePromptCacheCall({
     inputTokens: 51_000,
     uncachedInputTokens: 1_000,
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 50_000,
     outputTokens: 200,
-  }, "claude-sonnet-4-6");
+  }, "gpt-5.6");
   assert.ok(writer && reply);
 
   const stats = buildPromptCachePurposeStats(new Map([
@@ -478,7 +478,7 @@ test("uncacheable calls are counted but never diluted into the rate", async () =
     cacheCreationInputTokens: 0,
     cacheReadInputTokens: 0,
     outputTokens: 40,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
   assert.ok(draft);
 
   const [stat] = buildPromptCachePurposeStats(new Map([
@@ -503,7 +503,7 @@ test("a large request with a tiny prefix is a fixable miss, not an excused one",
     cacheReadInputTokens: 0,
     outputTokens: 123,
     cacheablePrefixTokens: 40,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
 
   assert.equal(summary?.uncacheableReason, "prefix-too-small");
   assert.equal(summary?.cacheablePrefixTokens, 40);
@@ -515,7 +515,7 @@ test("a large request with a tiny prefix is a fixable miss, not an excused one",
 
 test("a request under the minimum stays excused even when the prefix is measured", async () => {
   const { summarizePromptCacheCall } = await loadUsageModule();
-  // autonomy-judgment: 711 tokens total, under sonnet-4-6's 1024. No breakpoint
+  // autonomy-judgment: 711 tokens total, under GPT-5.6's 1024. No breakpoint
   // placement could rescue this one.
   const summary = summarizePromptCacheCall({
     inputTokens: 711,
@@ -524,7 +524,7 @@ test("a request under the minimum stays excused even when the prefix is measured
     cacheReadInputTokens: 0,
     outputTokens: 47,
     cacheablePrefixTokens: 30,
-  }, "claude-sonnet-4-6");
+  }, "gpt-5.6");
 
   assert.equal(summary?.uncacheableReason, "request-too-small");
   assert.equal(summary?.belowMinimum, true);
@@ -540,7 +540,7 @@ test("a prefix that clears the minimum but missed is left as a plain miss", asyn
     cacheReadInputTokens: 0,
     outputTokens: 100,
     cacheablePrefixTokens: 8_000,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
 
   // Nothing structural excuses this one — the prefix was big enough, so it
   // really is drift, and the report should keep pointing there.
@@ -559,7 +559,7 @@ test("cache activity outranks the prefix estimate", async () => {
     cacheReadInputTokens: 4_000,
     outputTokens: 60,
     cacheablePrefixTokens: 100,
-  }, "claude-opus-4-7");
+  }, "gpt-5.6");
 
   assert.equal(summary?.uncacheableReason, null);
   assert.equal(summary?.hitRate, 0.8);

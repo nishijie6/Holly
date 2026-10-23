@@ -9,7 +9,7 @@
 //     scenario's intent. LLMs vary, so this informs rather than gates.
 //
 // Run:  npm run eval:proactive            (uses the active profile)
-//       npm run eval:proactive -- claude_haiku   (cheaper model)
+//       npm run eval:proactive -- codex_gpt61
 //
 // Spends real subscription tokens (5 calls). Needs the proxy/auth the bot uses.
 

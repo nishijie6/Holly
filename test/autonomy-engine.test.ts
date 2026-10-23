@@ -288,15 +288,35 @@ test("成功一次就把连败清零", async () => {
   assert.equal(state.judgmentFailureStreak, 0);
 });
 
-// 失败另有连败退避管着。要是失败不算数，一个每次都报错的调用就能绕开不应期，退回每分钟一次。
-test("失败了也算这一轮动过，一样要等不应期", async () => {
-  const state = baseState();
+// 这条原先是反过来的：失败也算动过，一样要等满不应期，理由是怕一个每次都报错的调用绕开节流、
+// 退回每分钟一次。那个担心由连败退避接住更合适——连失 JUDGMENT_FAILURE_BACKOFF_THRESHOLD 次
+// 就整轮短路 JUDGMENT_FAILURE_BACKOFF_MS，所以最坏也只是连试三次。换来的是一次网络抖动不再让
+// 她白白静默一整个窗口，而那正是实际发生过的事。
+test("失败不占不应期：时刻退回这一轮之前的值", async () => {
+  const before = NOW - 9 * MIN;
+  const state = baseState({ lastJudgmentAt: before });
   await runAutonomyLoop(baseDeps({
     state,
     emitInnerThought: async () => { throw new Error("boom"); },
   }));
 
-  assert.equal(state.lastJudgmentAt, NOW);
+  assert.equal(state.lastJudgmentAt, before);
+});
+
+// 失败放开了节流，就得确认兜底还在：连失到阈值之后，下一轮压根不该再问。
+test("失败放开不应期后，连败退避仍然拦得住", async () => {
+  let emitted = 0;
+  const state = baseState({
+    judgmentFailureStreak: JUDGMENT_FAILURE_BACKOFF_THRESHOLD,
+    lastJudgmentFailureAt: NOW - 1000,
+  });
+  const result = await runAutonomyLoop(baseDeps({
+    state,
+    emitInnerThought: async () => { emitted += 1; },
+  }));
+
+  assert.equal(emitted, 0);
+  assert.deepEqual([...new Set(result.checks.map((check) => check.status))], ["waiting"]);
 });
 
 // ---------- 播报目标群的解析（与这次改动无关，原样保留） ----------

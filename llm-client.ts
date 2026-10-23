@@ -1,5 +1,5 @@
-import { execSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { execFileSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { existsSync, realpathSync } from "node:fs";
 import { readFile, writeFile, mkdir } from "node:fs/promises";
 import os from "node:os";
@@ -7,11 +7,9 @@ import path from "node:path";
 
 import YAML from "yaml";
 
-import { claudeOAuth } from "./claude-oauth.js";
-import { LlmHttpError, ProviderRateLimitGate } from "./connection-watchdog.js";
+import { LlmHttpError, ProviderRateLimitGate, type ProviderQuotaAvailability } from "./connection-watchdog.js";
 import {
   TokenUsageQueue,
-  estimatePromptTokens,
   type LlmCallPurpose,
   type TokenUsageBreakdown,
 } from "./token-usage.js";
@@ -24,9 +22,8 @@ import {
 
 export type LlmMessageRole = "system" | "user" | "assistant";
 
-// A tool call the model asked for, and the result we feed back. The API pairs
-// them by id, so both halves must survive into the request together — see the
-// no-merge/no-trim rule in buildClaudeMessages.
+// A tool call and its result share an ID. Preserve both halves when translating
+// the transcript to Responses input items.
 export type LlmToolUseBlock = {
   type: "tool_use";
   id: string;
@@ -49,6 +46,8 @@ export type LlmMessage = {
   // Present only on tool turns. An assistant turn may carry prose in `content`
   // and its tool calls here at once, which is what the model actually returns.
   blocks?: LlmStructuralBlock[];
+  // Raw Responses output preserves encrypted reasoning and original call IDs.
+  responseItems?: Record<string, unknown>[];
 };
 
 export type LlmToolDefinition = {
@@ -61,7 +60,7 @@ export function messageHasStructuralBlocks(message: LlmMessage): boolean {
   return Array.isArray(message.blocks) && message.blocks.length > 0;
 }
 
-export type LlmProvider = "codex" | "claude";
+export type LlmProvider = "codex";
 
 type CodexProfileConfig = {
   provider: "codex";
@@ -69,13 +68,7 @@ type CodexProfileConfig = {
   system_prompt?: string;
 };
 
-type ClaudeProfileConfig = {
-  provider: "claude";
-  model?: string;
-  system_prompt?: string;
-};
-
-export type LlmProfileConfig = CodexProfileConfig | ClaudeProfileConfig;
+export type LlmProfileConfig = CodexProfileConfig;
 
 type LlmSectionConfig = {
   active?: string;
@@ -137,12 +130,18 @@ export type LlmClient = {
     // 循环自己的 assistant / tool 轮次，必须是延长。整次循环都豁免的话，第二轮以后真出现的漂移会被
     // 当成预期内的重建放过去。
     expectRebuild?: boolean;
-    onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[]) => void;
+    // 调用方可为整理摘要等任务显式指定超时；未指定时采用客户端默认窗口。
+    timeoutMs?: number;
+    maxAttempts?: number;
+    reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
+    // 只在没有悬空工具调用的边界让出执行权，调用方随后可安全处理新消息。
+    shouldYield?: () => boolean;
+    onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[], responseItems?: Record<string, unknown>[]) => void;
     onToolResults?: (results: LlmToolResultBlock[]) => void;
-  }): Promise<ClaudeToolLoopResult>;
+  }): Promise<ToolLoopResult>;
 };
 
-// Reported for every Claude request, including the ones that behaved. main.ts
+// Best-effort diagnostics for every Codex request. main.ts
 // decides what is worth showing; the client's job is that nothing goes
 // unmeasured.
 export type CachePrefixObserver = (event: CachePrefixInspection & {
@@ -169,143 +168,60 @@ type CodexCredentials = {
   rawTokens: Record<string, unknown>;
 };
 
-type CodexInputItem = {
-  role: "user" | "assistant";
-  content: string;
+export type CodexRequestOptions = {
+  tools?: LlmToolDefinition[];
+  jsonSchema?: Record<string, unknown>;
+  cacheRoute?: string;
+  volatileTailMessages?: number;
+  timeoutMs?: number;
+  maxAttempts?: number;
+  reasoningEffort?: "low" | "medium" | "high" | "xhigh" | "max";
 };
 
-type CodexRequestBody = {
+type CodexRequestBody = Record<string, unknown> & {
   model: string;
-  input: CodexInputItem[];
-  instructions?: string;
+  input: Record<string, unknown>[];
+  instructions: string;
   prompt_cache_key: string;
   store: false;
-  stream?: boolean;
-  reasoning?: {
-    effort: "none" | "low" | "medium" | "high" | "xhigh";
-  };
+  stream: true;
 };
 
 const DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant. Keep answers clear and concise.";
 const KEYCHAIN_SERVICE = "Codex Auth";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
+const CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const CODEX_AUTH_URL = "https://auth.openai.com/oauth/token";
 const CODEX_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_PROMPT_CACHE_NAMESPACE = "tsbot-group-chat";
 const PROJECT_AUTH_PATH = path.join(process.cwd(), ".codex", "auth.json");
 const HOME_AUTH_PATH = path.join(os.homedir(), ".codex", "auth.json");
 const TOKEN_REFRESH_BUFFER_MS = 300_000;
-const REQUEST_TIMEOUT_MS = 30_000;
+// Max reasoning can exceed 30 seconds even for ordinary decision requests.
+// Allow a complete response instead of repeatedly aborting and re-reading it.
+const REQUEST_TIMEOUT_MS = 120_000;
 const FETCH_FAILED_MAX_ATTEMPTS = 5;
 const FETCH_FAILED_RETRY_DELAY_MS = 3_000;
 const DEBUG_REQUEST = process.env.CODEX_DEBUG_REQUEST === "1";
 const codexRateLimitGate = new ProviderRateLimitGate({ provider: "Codex" });
 
-const CLAUDE_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
-const CLAUDE_ANTHROPIC_VERSION = "2023-06-01";
-const CLAUDE_OAUTH_BETA = "oauth-2025-04-20";
-const claudeRateLimitGate = new ProviderRateLimitGate({ provider: "Claude" });
-// OAuth 订阅 token 仅在第一个系统块与此字符串完全一致时才会被接受。
-const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
-// Opus 4.x 支持 128K 输出 token；Sonnet 4.6 / Haiku 4.5 的上限为 64K。
-function claudeMaxOutputTokens(model: string): number {
-  return /opus/i.test(model) ? 128_000 : 64_000;
-}
-
-type ClaudeRequestOptions = {
-  jsonSchema?: Record<string, unknown>;
-  maxTokens?: number;
-  // Put the cache breakpoint on the last byte-stable conversation block.
-  // The volatile request tail must remain after it so timestamps, retrieved
-  // memory, and the current scan never poison the reusable prefix hash.
-  cacheStablePrefix?: boolean;
-  volatileTailMessages?: number;
-  // Tools render before `system` on the wire, so they sit inside whatever the
-  // system breakpoint caches. Keep the list byte-stable for a process (see
-  // kagami's system-prompt.ts note on the same invariant) or every change to it
-  // rebuilds the prefix for every route.
-  tools?: LlmToolDefinition[];
-};
-
-// The cached prefix as the API will actually see it: everything from the start
-// of the request up to and including the last cache_control breakpoint. Reading
-// it off the built body (rather than off the caller's messages) means the
-// digest covers exactly what gets hashed on the other side, including the empty
-// blocks buildClaudeMessages drops and the assistant tail it trims.
-// A tool block carries its identity in fields other than `text`. Digesting it as
-// the empty string would make two different tool calls look byte-identical, and
-// the drift detector would report a rebuilt prefix as "unchanged" — the one
-// safety net this migration has, reading clean while it is broken.
-function describePrefixBlock(block: Record<string, unknown>): string {
-  if (block.type === "tool_use") {
-    return `tool_use:${String(block.id)}:${String(block.name)}:${JSON.stringify(block.input ?? null)}`;
+// Codex's transport uses session identity for cache routing in addition to the
+// prompt cache key. Keep each model/route on one identity across text calls,
+// tool rounds and retries; bound idle routes for the long-running process.
+const codexSessionIds = new Map<string, string>();
+const MAX_CODEX_SESSION_ROUTES = 64;
+function codexSessionId(cacheKey: string): string {
+  const id = codexSessionIds.get(cacheKey) ?? randomUUID();
+  codexSessionIds.delete(cacheKey);
+  codexSessionIds.set(cacheKey, id);
+  while (codexSessionIds.size > MAX_CODEX_SESSION_ROUTES) {
+    const oldest = codexSessionIds.keys().next();
+    if (oldest.done) break;
+    codexSessionIds.delete(oldest.value);
   }
-  if (block.type === "tool_result") {
-    return `tool_result:${String(block.tool_use_id)}:${String(block.content ?? "")}`;
-  }
-  return typeof block.text === "string" ? block.text : "";
+  return id;
 }
 
-function collectClaudeCachedPrefixTexts(
-  body: Record<string, unknown>,
-): { systemTexts: string[]; blockTexts: string[] } {
-  const systemTexts: string[] = [];
-  const system = Array.isArray(body.system) ? body.system : [];
-  for (const block of system) {
-    if (!block || typeof block !== "object") continue;
-    const record = block as Record<string, unknown>;
-    systemTexts.push(typeof record.text === "string" ? record.text : "");
-    if (record.cache_control) break;
-  }
-
-  const blockTexts: string[] = [];
-  const pending: string[] = [];
-  const messages = Array.isArray(body.messages) ? body.messages : [];
-  outer: for (const message of messages) {
-    if (!message || typeof message !== "object") continue;
-    const record = message as Record<string, unknown>;
-    const role = typeof record.role === "string" ? record.role : "user";
-    const content = Array.isArray(record.content) ? record.content : [];
-    for (const block of content) {
-      if (!block || typeof block !== "object") continue;
-      const inner = block as Record<string, unknown>;
-      pending.push(`${role}:${describePrefixBlock(inner)}`);
-      if (inner.cache_control) {
-        // Everything buffered so far is inside the breakpoint; anything after
-        // it is the volatile tail and deliberately not part of the identity.
-        blockTexts.push(...pending);
-        pending.length = 0;
-        break outer;
-      }
-    }
-  }
-
-  return { systemTexts, blockTexts };
-}
-
-export function digestClaudeCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
-  const { systemTexts, blockTexts } = collectClaudeCachedPrefixTexts(body);
-  return buildCachePrefixDigest(systemTexts, blockTexts);
-}
-
-// How much of this request a cache entry could cover at all. Everything past
-// the breakpoint is reread at full price no matter how stable it is, so this —
-// not the request size — is the number to compare against the model's minimum.
-export function measureClaudeCachedPrefixTokens(body: Record<string, unknown>): number {
-  const { systemTexts, blockTexts } = collectClaudeCachedPrefixTexts(body);
-  return estimatePromptTokens([...systemTexts, ...blockTexts].join("\n"));
-}
-
-// Two shapes of the same thing: the proxy dropped this attempt. undici reports a
-// refused or reset connection as "fetch failed"; a connection that opens and
-// then stalls surfaces instead as AbortSignal.timeout's TimeoutError. Only the
-// first was retried, so a stalled request died outright while a refused one
-// recovered — and the tool loop multiplies that exposure, since one agent turn
-// makes several requests and any of them can stall.
-// What actually went wrong, for a log line that can be correlated with anything.
-// "fetch failed" alone is undici's outer wrapper and says nothing: the cause
-// underneath distinguishes a refused connection from a dropped TLS handshake
-// from a stalled read, and those have different fixes.
 export function describeTransportError(error: unknown): string {
   if (!(error instanceof Error)) return String(error);
   const cause = (error as { cause?: unknown }).cause;
@@ -328,7 +244,11 @@ function retryDelayMs(attempt: number): number {
 function isRetryableTransportError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
   if (error.message.toLowerCase().includes("fetch failed")) return true;
-  return error.name === "TimeoutError";
+  if (error.name === "TimeoutError" || error.name === "AbortError") return true;
+  const cause = error.cause;
+  const code = (error as Error & { code?: unknown }).code
+    ?? (cause && typeof cause === "object" ? (cause as { code?: unknown }).code : undefined);
+  return ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT"].includes(String(code));
 }
 
 function delay(ms: number): Promise<void> {
@@ -337,7 +257,9 @@ function delay(ms: number): Promise<void> {
 
 async function loadConfig(configPath: string): Promise<AppConfig> {
   if (!existsSync(configPath)) {
-    throw new Error(`Config file not found: ${configPath}.`);
+    throw new Error(
+      `Config file not found: ${configPath}. Copy config.example.yaml to config.yaml and fill in your local settings before starting Holly.`,
+    );
   }
 
   const raw = await readFile(configPath, "utf-8");
@@ -349,23 +271,7 @@ async function saveConfig(configPath: string, config: AppConfig): Promise<void> 
   await writeFile(configPath, body, "utf-8");
 }
 
-// Hoist system-role turns into the system prompt and normalise the rest.
-//
-// The emptiness test has to match buildClaudeMessages': a turn is empty only
-// when it has neither prose NOR structural blocks. Testing `content` alone
-// predates tool calling and quietly destroyed every tool transcript that came
-// through here — a tool_result turn is `{content: "", blocks: [...]}`, so it was
-// dropped outright, and a turn that survived was rebuilt as `{role, content}`,
-// which threw its blocks away. runToolLoop feeds the ConversationLedger through
-// this function, so every focus loop began by flattening its own history:
-// the model lost which tools it had called and what came back, and the prompt
-// cache lost the prefix (the flattened shape can never match the structural one
-// the previous loop ended on, so every route rebuilt on the next call).
-//
-// It failed silently rather than as a 400 because the damage was symmetric:
-// tool_result turns are always empty and were dropped, and an assistant turn
-// that kept its prose lost its tool_use with it — so no orphaned id ever
-// reached the API to complain about.
+// Hoist system turns while preserving tool transcripts and Responses metadata.
 export function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: string): {
   systemPrompt: string;
   contents: LlmMessage[];
@@ -376,7 +282,8 @@ export function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: stri
   for (const message of messages) {
     const content = message.content.trim();
     const blocks = messageHasStructuralBlocks(message) ? message.blocks : undefined;
-    if (!content && !blocks) {
+    const responseItems = message.responseItems?.length ? message.responseItems : undefined;
+    if (!content && !blocks && !responseItems) {
       continue;
     }
 
@@ -391,6 +298,7 @@ export function splitSystemPrompt(messages: LlmMessage[], baseSystemPrompt: stri
       role: message.role,
       content,
       ...(blocks ? { blocks } : {}),
+      ...(responseItems ? { responseItems } : {}),
     });
   }
 
@@ -473,8 +381,8 @@ async function readCodexCredentials(): Promise<CodexCredentials> {
     try {
       const codexHome = resolveCodexHome();
       const account = computeKeychainAccount(codexHome);
-      const raw = execSync(
-        `security find-generic-password -s "${KEYCHAIN_SERVICE}" -a "${account}" -w`,
+      const raw = execFileSync(
+        "security", ["find-generic-password", "-s", KEYCHAIN_SERVICE, "-a", account, "-w"],
         { encoding: "utf8", timeout: 5000, stdio: ["pipe", "pipe", "pipe"] }
       );
       return parseTokensPayload(raw.trim(), "keychain");
@@ -587,176 +495,214 @@ async function logCodexResponse(res: Response): Promise<void> {
   }, null, 2));
 }
 
-function buildCodexRequest(model: string, systemPrompt: string, messages: LlmMessage[]): CodexRequestBody {
-  const input = messages
-    .filter((message) => message.content.trim())
-    .map((message) => {
-      const role: CodexInputItem["role"] = message.role === "assistant" ? "assistant" : "user";
-      return {
-        role,
-        content: message.content.trim(),
-      };
-    });
+// Codex chooses cache boundaries internally. Track only the caller's stable
+// prefix as a diagnostic; this is not a server-confirmed cache breakpoint.
+const stableInputCounts = new WeakMap<object, number>();
 
-  return {
-    model,
-    input,
-    instructions: systemPrompt || undefined,
-    // Keep repeated bot instructions and conversation prefixes on the same cache route.
-    prompt_cache_key: `${CODEX_PROMPT_CACHE_NAMESPACE}:${model}`,
-    store: false,
-    stream: true,
-    reasoning: model === "gpt-5.4" ? { effort: "medium" } : undefined,
-  };
+function codexMessageItems(message: LlmMessage): Record<string, unknown>[] {
+  if (message.responseItems?.length) return message.responseItems;
+  const items: Record<string, unknown>[] = [];
+  const content = message.content.trim();
+  if (content) items.push({ role: message.role === "assistant" ? "assistant" : "user", content });
+  for (const block of message.blocks ?? []) {
+    items.push(block.type === "tool_use"
+      ? { type: "function_call", call_id: block.id, name: block.name, arguments: JSON.stringify(block.input) }
+      : { type: "function_call_output", call_id: block.toolUseId, output: block.isError ? `Tool error: ${block.content}` : block.content });
+  }
+  return items;
 }
 
-async function readCodexStreamText(
-  res: Response,
-  recordUsage: (usage: TokenUsageBreakdown) => void,
-): Promise<string> {
-  const body = res.body;
-  if (!body) {
-    return "";
-  }
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  let latestText = "";
-  const accumulated: string[] = [];
-
-  for await (const chunk of body as unknown as AsyncIterable<Uint8Array>) {
-    buffer += decoder.decode(chunk, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() ?? "";
-
-    for (const line of lines) {
-      if (!line.startsWith("data: ")) continue;
-      const payload = line.slice(6).trim();
-      if (!payload || payload === "[DONE]") {
-        continue;
-      }
-
-      let event: Record<string, unknown>;
-      try {
-        event = JSON.parse(payload);
-      } catch {
-        continue;
-      }
-
-      if ((event.type === "response.completed" || event.type === "response.done") && event.response && typeof event.response === "object") {
-        const usage = (event.response as Record<string, unknown>).usage;
-        if (usage && typeof usage === "object") {
-          const u = usage as Record<string, unknown>;
-          const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-          const inputTokens = num(u.input_tokens);
-          const inputDetails = u.input_tokens_details && typeof u.input_tokens_details === "object"
-            ? u.input_tokens_details as Record<string, unknown>
-            : {};
-          const cacheReadInputTokens = Math.min(inputTokens, num(inputDetails.cached_tokens));
-          recordUsage({
-            inputTokens,
-            uncachedInputTokens: Math.max(0, inputTokens - cacheReadInputTokens),
-            cacheCreationInputTokens: 0,
-            cacheReadInputTokens,
-            outputTokens: num(u.output_tokens),
-          });
-        }
-      }
-
-      if (event.type === "response.output_text.delta") {
-        const delta = typeof event.delta === "string" ? event.delta : "";
-        accumulated.push(delta);
-        latestText = accumulated.join("");
-      } else if (event.type === "response.output_text.done") {
-        const text = typeof event.text === "string" ? event.text : "";
-        if (text && text.length >= latestText.length) {
-          latestText = text;
-        }
-      } else {
-        const parsed = extractCodexText(event);
-        if (parsed && parsed.length >= latestText.length) {
-          latestText = parsed;
-        }
-      }
-    }
-  }
-
-  return latestText.trim();
-}
-
-function extractCodexText(rawResult: unknown): string {
-  if (!rawResult || typeof rawResult !== "object") return "";
-  const root = rawResult as Record<string, unknown>;
-
-  if (typeof root.output_text === "string" && root.output_text.trim()) {
-    return root.output_text.trim();
-  }
-
-  const texts: string[] = [];
-
-  const visitMessage = (obj: unknown) => {
-    if (!obj || typeof obj !== "object") return;
-    const item = obj as Record<string, unknown>;
-    if (item.type !== "message" || !Array.isArray(item.content)) return;
-    for (const part of item.content) {
-      if (!part || typeof part !== "object") continue;
-      const piece = part as Record<string, unknown>;
-      if (typeof piece.text === "string") {
-        texts.push(piece.text);
-      }
-    }
-  };
-
-  visitMessage(root.item);
-  if (Array.isArray(root.output)) {
-    for (const item of root.output) visitMessage(item);
-  }
-
-  const response = root.response;
-  if (response && typeof response === "object") {
-    const responseObj = response as Record<string, unknown>;
-    if (typeof responseObj.output_text === "string" && responseObj.output_text.trim()) {
-      return responseObj.output_text.trim();
-    }
-    if (Array.isArray(responseObj.output)) {
-      for (const item of responseObj.output) visitMessage(item);
-    }
-  }
-
-  return texts.join("").trim();
-}
-
-async function requestCodexText(
+export function buildCodexRequestBody(
   model: string,
   systemPrompt: string,
   messages: LlmMessage[],
-  recordUsage: (usage: TokenUsageBreakdown) => void,
-): Promise<string> {
-  const rateLimitRevision = codexRateLimitGate.beginRequest();
-  let creds = await getCodexCredentials();
-  const body = buildCodexRequest(model, systemPrompt, messages);
-  let fetchAttempts = 0;
+  options: CodexRequestOptions = {},
+): CodexRequestBody {
+  assertGptModel(model);
+  const { systemPrompt: instructions, contents } = splitSystemPrompt(messages, systemPrompt);
+  const input = contents.flatMap(codexMessageItems);
+  const stableMessages = contents.slice(0, Math.max(0, contents.length - (options.volatileTailMessages ?? 0)));
+  const body: CodexRequestBody = {
+    model,
+    input,
+    instructions,
+    prompt_cache_key: `${CODEX_PROMPT_CACHE_NAMESPACE}:${model}:${options.cacheRoute ?? "default"}`,
+    store: false,
+    stream: true,
+    include: ["reasoning.encrypted_content"],
+    ...(options.reasoningEffort
+      ? { reasoning: { effort: options.reasoningEffort } }
+      : model === "gpt-6.1-sol"
+      ? { reasoning: { effort: "max" } }
+      : model === "gpt-5.4" ? { reasoning: { effort: "medium" } } : {}),
+    ...(options.tools?.length ? { tools: options.tools.map(tool => ({
+      type: "function", name: tool.name, description: tool.description,
+      parameters: tool.inputSchema, strict: false,
+    })) } : {}),
+    ...(options.jsonSchema ? { text: { format: {
+      type: "json_schema", name: "holly_response", strict: true, schema: options.jsonSchema,
+    } } } : {}),
+  };
+  stableInputCounts.set(body, stableMessages.flatMap(codexMessageItems).length);
+  return body;
+}
 
+export function digestCodexCachedPrefix(body: Record<string, unknown>): CachePrefixDigest {
+  const input = Array.isArray(body.input) ? body.input : [];
+  return buildCachePrefixDigest(
+    [String(body.instructions ?? ""), JSON.stringify(body.tools ?? []), JSON.stringify(body.text ?? null)],
+    input.slice(0, stableInputCounts.get(body) ?? input.length).map(item => JSON.stringify(item)),
+  );
+}
+
+export function readCodexUsageTokens(data: unknown): TokenUsageBreakdown | null {
+  if (!data || typeof data !== "object") return null;
+  const usage = (data as Record<string, unknown>).usage;
+  if (!usage || typeof usage !== "object") return null;
+  const u = usage as Record<string, unknown>;
+  const num = (value: unknown): number => typeof value === "number" && Number.isFinite(value) ? Math.max(0, value) : 0;
+  const inputTokens = num(u.input_tokens);
+  const details = u.input_tokens_details && typeof u.input_tokens_details === "object"
+    ? u.input_tokens_details as Record<string, unknown> : {};
+  const cacheReadInputTokens = Math.min(inputTokens, num(details.cached_tokens));
+  const cacheCreationInputTokens = Math.min(inputTokens - cacheReadInputTokens, num(details.cache_write_tokens));
+  const outputTokens = num(u.output_tokens);
+  if (!inputTokens && !outputTokens) return null;
+  return {
+    inputTokens, uncachedInputTokens: inputTokens - cacheReadInputTokens - cacheCreationInputTokens,
+    cacheCreationInputTokens, cacheReadInputTokens, outputTokens,
+  };
+}
+
+function responseError(response: Record<string, unknown>): Error {
+  const error = response.error as { message?: string } | undefined;
+  const details = response.incomplete_details as { reason?: string } | undefined;
+  return new Error(`Codex response ${String(response.status ?? "failed")}: ${error?.message ?? details?.reason ?? "stream did not complete"}`);
+}
+
+// Consume complete SSE frames, including the final frame without a newline.
+// Completed items replace their partial/delta form rather than duplicating it.
+async function readCodexResponse(res: Response): Promise<Record<string, unknown>> {
+  if (res.headers.get("content-type")?.includes("application/json")) {
+    const response = await res.json() as Record<string, unknown>;
+    if (response.status && response.status !== "completed") throw responseError(response);
+    return response;
+  }
+  if (!res.body) throw new Error("Codex response stream has no body.");
+  const items = new Map<number, Record<string, unknown>>();
+  const itemIndexes = new Map<string, number>();
+  const textDeltas = new Map<string, string>();
+  let completed: Record<string, unknown> | null = null;
+  const handleEvent = (payload: string): void => {
+    if (!payload.trim() || payload.trim() === "[DONE]") return;
+    const event = JSON.parse(payload) as Record<string, unknown>;
+    const type = String(event.type ?? "");
+    if (type === "error" || type === "response.failed" || type === "response.incomplete") {
+      const response = event.response && typeof event.response === "object"
+        ? event.response as Record<string, unknown> : { status: "failed", error: event.error ?? event };
+      throw responseError(response);
+    }
+    if ((type === "response.completed" || type === "response.done") && event.response && typeof event.response === "object") {
+      const response = event.response as Record<string, unknown>;
+      if (response.status && response.status !== "completed") throw responseError(response);
+      completed = response;
+      return;
+    }
+    if ((type === "response.output_item.added" || type === "response.output_item.done") && event.item && typeof event.item === "object") {
+      const item = event.item as Record<string, unknown>;
+      const index = typeof event.output_index === "number" ? event.output_index : items.size;
+      items.set(index, item);
+      if (typeof item.id === "string") itemIndexes.set(item.id, index);
+      return;
+    }
+    const index = typeof event.output_index === "number" ? event.output_index
+      : typeof event.item_id === "string" ? itemIndexes.get(event.item_id) : undefined;
+    if (type === "response.function_call_arguments.delta" || type === "response.function_call_arguments.done") {
+      const item = index === undefined ? undefined : items.get(index);
+      if (!item) throw new Error("Codex function arguments arrived without a function call item.");
+      item.arguments = type.endsWith(".done") ? String(event.arguments ?? "")
+        : String(item.arguments ?? "") + String(event.delta ?? "");
+    }
+    if (type === "response.output_text.delta" || type === "response.output_text.done") {
+      const key = `${index ?? 0}:${event.content_index ?? 0}`;
+      textDeltas.set(key, type.endsWith(".done") ? String(event.text ?? "")
+        : (textDeltas.get(key) ?? "") + String(event.delta ?? ""));
+    }
+  };
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let dataLines: string[] = [];
+  const flushEvent = (): void => {
+    if (dataLines.length) handleEvent(dataLines.join("\n"));
+    dataLines = [];
+  };
+  const consumeLine = (line: string): void => {
+    line = line.replace(/\r$/, "");
+    if (!line) flushEvent();
+    else if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
+  };
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    buffer += decoder.decode(chunk, { stream: true });
+    let newline: number;
+    while ((newline = buffer.indexOf("\n")) >= 0) {
+      consumeLine(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+    }
+  }
+  buffer += decoder.decode();
+  if (buffer) consumeLine(buffer);
+  flushEvent();
+  if (!completed) throw new Error("Codex response stream ended before completion.");
+  const response = completed as Record<string, unknown>;
+  if (!Array.isArray(response.output) || response.output.length === 0) {
+    response.output = [...items.entries()].sort(([a], [b]) => a - b).map(([, item]) => item);
+  }
+  if (!extractCodexText(response) && textDeltas.size) response.output_text = [...textDeltas.values()].join("");
+  return response;
+}
+
+function extractCodexText(response: Record<string, unknown>): string {
+  if (typeof response.output_text === "string") return response.output_text.trim();
+  const texts: string[] = [];
+  for (const item of Array.isArray(response.output) ? response.output : []) {
+    if (!item || typeof item !== "object" || item.type !== "message") continue;
+    for (const part of Array.isArray(item.content) ? item.content : []) {
+      if (part && typeof part.text === "string") texts.push(part.text);
+    }
+  }
+  return texts.join("").trim();
+}
+
+async function requestCodexResponse(
+  body: CodexRequestBody,
+  recordUsage: (usage: TokenUsageBreakdown) => void,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+  maxAttempts = FETCH_FAILED_MAX_ATTEMPTS,
+): Promise<Record<string, unknown>> {
+  if (codexRateLimitGate.getPausedUntil() !== null) {
+    // 仅查询额度，不生成探测回复；失败仍由原来的暂停闸拦下，不能当成额度已恢复。
+    await refreshCodexUsage(false).catch(() => null);
+  }
+  const rateLimitRevision = codexRateLimitGate.beginRequest();
+  const sessionId = codexSessionId(body.prompt_cache_key);
+  let creds = await getCodexCredentials();
+  let fetchAttempts = 0;
   let authAttempt = 0;
   while (authAttempt < 2) {
     const headers = buildCodexHeaders(creds);
+    headers.session_id = sessionId;
     headers.Accept = "text/event-stream";
     logCodexRequest(body, headers);
     let res: Response;
     try {
       fetchAttempts += 1;
       res = await fetch(CODEX_RESPONSES_URL, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+        method: "POST", headers, body: JSON.stringify(body), signal: AbortSignal.timeout(timeoutMs),
       });
     } catch (error) {
-      if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+      if (isRetryableTransportError(error) && fetchAttempts < maxAttempts) {
         const wait = retryDelayMs(fetchAttempts);
-        console.warn(
-          `[${new Date().toISOString()}] Codex transport failed (${fetchAttempts}/${FETCH_FAILED_MAX_ATTEMPTS}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`,
-        );
+        console.warn(`[${new Date().toISOString()}] Codex transport failed (${fetchAttempts}/${maxAttempts}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`);
         await delay(wait);
         continue;
       }
@@ -764,7 +710,6 @@ async function requestCodexText(
     }
     await logCodexResponse(res);
     captureCodexUsage(res);
-
     if ((res.status === 401 || res.status === 403) && authAttempt === 0 && creds.refreshToken) {
       const refreshed = await refreshCodexCredentials(creds).catch(() => null);
       if (refreshed) {
@@ -773,687 +718,286 @@ async function requestCodexText(
         continue;
       }
     }
-
     if (!res.ok) {
       const errorText = await res.text().catch(() => "");
       const retryAt = res.status === 429
-        ? codexRateLimitGate.pauseUntil(parseUsageResetMs(res.headers.get("x-codex-primary-reset-at")))
-        : null;
+        ? codexRateLimitGate.pauseUntil(parseUsageResetMs(res.headers.get("x-codex-primary-reset-at"))) : null;
       throw new LlmHttpError("Codex", res.status, (errorText || "<empty>").slice(0, 2_000), retryAt);
     }
-
-    codexRateLimitGate.recordSuccess(rateLimitRevision);
-    return readCodexStreamText(res, recordUsage);
-  }
-
-  throw new Error("Codex request failed after retry.");
-}
-
-function buildClaudeHeaders(accessToken: string): Record<string, string> {
-  return {
-    Authorization: `Bearer ${accessToken}`,
-    "Content-Type": "application/json",
-    "anthropic-version": CLAUDE_ANTHROPIC_VERSION,
-    "anthropic-beta": CLAUDE_OAUTH_BETA,
-  };
-}
-
-type ClaudeMessageBlock = { text: string; volatile: boolean };
-type ClaudeMergedMessage = {
-  role: "user" | "assistant";
-  blocks: ClaudeMessageBlock[];
-  // Tool turns are structural: the API matches each tool_use to its tool_result
-  // by id, so these must not merge into a neighbour and must not be trimmed away
-  // — losing either half of a pair is a 400, not a degraded prompt.
-  structural?: LlmStructuralBlock[];
-  // Structural blocks all come from one source message, so they share its
-  // volatility. Tracked because the cache breakpoint may legally sit on them.
-  structuralVolatile?: boolean;
-};
-
-function toClaudeStructuralBlock(block: LlmStructuralBlock): Record<string, unknown> {
-  if (block.type === "tool_use") {
-    return { type: "tool_use", id: block.id, name: block.name, input: block.input };
-  }
-  return {
-    type: "tool_result",
-    tool_use_id: block.toolUseId,
-    content: block.content,
-    ...(block.isError ? { is_error: true } : {}),
-  };
-}
-
-// One text block per source LlmMessage (conversation turn). Consecutive
-// same-role turns merge into one API message but keep their block boundaries,
-// allowing a cache marker to sit immediately before the volatile tail.
-function buildClaudeMessages(messages: LlmMessage[], volatileTailMessages = 0): ClaudeMergedMessage[] {
-  const merged: ClaudeMergedMessage[] = [];
-  const volatileFrom = messages.length - Math.max(0, volatileTailMessages);
-
-  for (const [index, message] of messages.entries()) {
-    const content = message.content.trim();
-    const structural = messageHasStructuralBlocks(message) ? message.blocks : undefined;
-    if (!content && !structural) {
-      continue;
-    }
-
-    const role: "user" | "assistant" = message.role === "assistant" ? "assistant" : "user";
-    const volatile = index >= volatileFrom;
-    const textBlocks: ClaudeMessageBlock[] = content ? [{ text: content, volatile }] : [];
-    const last = merged[merged.length - 1];
-    // 结构化轮次必须独立成一条消息，不能吸收后续轮次；否则合并会打乱 tool_use /
-    // tool_result 块与模型原本配对正文之间的顺序。
-    if (last && last.role === role && !structural && !last.structural) {
-      last.blocks.push(...textBlocks);
-    } else {
-      merged.push({
-        role,
-        blocks: textBlocks,
-        ...(structural ? { structural, structuralVolatile: volatile } : {}),
-      });
-    }
-  }
-
-  // Messages API 要求第一条消息必须是用户轮次。
-  while (merged.length > 0 && merged[0].role === "assistant" && !merged[0].structural) {
-    merged.shift();
-  }
-
-  // 最后一条消息也必须是用户轮次：末尾的助手消息会被当作预填充，而订阅/OAuth 模型
-  // 不支持助手消息预填充。如果调用方的当前消息为空并在上方被丢弃，机器人的上一条
-  // 回复就会落在末尾，因此需要移除。
-  // 结构化助手轮次除外：工具循环中它后面会紧跟对应的 tool_result；删除它会让结果 ID
-  // 失去所属的调用。
-  while (
-    merged.length > 0
-    && merged[merged.length - 1].role === "assistant"
-    && !merged[merged.length - 1].structural
-  ) {
-    merged.pop();
-  }
-
-  return merged;
-}
-
-function buildClaudeMessagesBody(
-  messages: LlmMessage[],
-  cacheStablePrefix: boolean,
-  volatileTailMessages: number,
-): Array<Record<string, unknown>> {
-  const merged = buildClaudeMessages(messages, volatileTailMessages);
-  const apiMessages = merged.map((message): Record<string, unknown> => ({
-    role: message.role,
-    content: [
-      ...message.blocks.map((block) => ({ type: "text", text: block.text })),
-      // 结构化块始终紧跟本轮正文，保持模型生成时的原始顺序。
-      ...(message.structural ?? []).map(toClaudeStructuralBlock),
-    ],
-  }));
-
-  if (cacheStablePrefix) {
-    // Walk the wire content backwards, not just the text blocks: in a tool loop
-    // the newest stable content is a tool_use/tool_result block, and skipping
-    // those pins the breakpoint to the last prose turn — the growing transcript
-    // would then never be cached at all.
-    outer: for (let i = merged.length - 1; i >= 0; i -= 1) {
-      const message = merged[i];
-      const structuralCount = message.structural?.length ?? 0;
-      const volatility = [
-        ...message.blocks.map((block) => block.volatile),
-        ...Array.from({ length: structuralCount }, () => message.structuralVolatile ?? false),
-      ];
-      for (let j = volatility.length - 1; j >= 0; j -= 1) {
-        if (!volatility[j]) {
-          const content = apiMessages[i].content as Array<Record<string, unknown>>;
-          content[j].cache_control = { type: "ephemeral", ttl: "1h" };
-          break outer;
-        }
-      }
-    }
-  }
-
-  return apiMessages;
-}
-
-export function buildClaudeRequestBody(
-  model: string,
-  systemPrompt: string,
-  messages: LlmMessage[],
-  options: ClaudeRequestOptions,
-): Record<string, unknown> {
-  const system: Array<Record<string, unknown>> = [
-    { type: "text", text: CLAUDE_CODE_IDENTITY },
-  ];
-  const trimmedSystem = systemPrompt.trim();
-  if (trimmedSystem) {
-    // cache_control on the last system block caches the identity + full system prefix together.
-    system.push({ type: "text", text: trimmedSystem, cache_control: { type: "ephemeral", ttl: "1h" } });
-  } else {
-    system[0].cache_control = { type: "ephemeral", ttl: "1h" };
-  }
-
-  const body: Record<string, unknown> = {
-    model,
-    max_tokens: options.maxTokens ?? claudeMaxOutputTokens(model),
-    system,
-    messages: buildClaudeMessagesBody(
-      messages,
-      options.cacheStablePrefix ?? false,
-      options.volatileTailMessages ?? 0,
-    ),
-  };
-
-  if (options.tools && options.tools.length > 0) {
-    body.tools = options.tools.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      input_schema: tool.inputSchema,
-    }));
-  }
-
-  if (options.jsonSchema) {
-    // Structured outputs guarantee the response is schema-valid JSON (GA on Opus 4.7 / Sonnet 4.6).
-    // Verified to coexist with `tools` on this transport.
-    body.output_config = { format: { type: "json_schema", schema: options.jsonSchema } };
-  }
-
-  return body;
-}
-
-function extractClaudeText(data: unknown): string {
-  if (!data || typeof data !== "object") {
-    return "";
-  }
-
-  const content = (data as Record<string, unknown>).content;
-  if (!Array.isArray(content)) {
-    return "";
-  }
-
-  const texts: string[] = [];
-  for (const block of content) {
-    if (block && typeof block === "object" && (block as Record<string, unknown>).type === "text") {
-      const text = (block as Record<string, unknown>).text;
-      if (typeof text === "string") {
-        texts.push(text);
-      }
-    }
-  }
-
-  return texts.join("").trim();
-}
-
-export type ClaudeUsage = {
-  fiveHourUtilization: number | null;
-  fiveHourResetAt: number | null;
-  fiveHourStatus: string | null;
-  sevenDayUtilization: number | null;
-  sevenDayResetAt: number | null;
-  sevenDayStatus: string | null;
-  capturedAt: number;
-};
-
-let latestClaudeUsage: ClaudeUsage | null = null;
-
-export function getLatestClaudeUsage(): ClaudeUsage | null {
-  return latestClaudeUsage;
-}
-
-export function readClaudeUsageTokens(data: unknown): TokenUsageBreakdown | null {
-  if (!data || typeof data !== "object") return null;
-  const usage = (data as Record<string, unknown>).usage;
-  if (!usage || typeof usage !== "object") return null;
-  const u = usage as Record<string, unknown>;
-  const num = (v: unknown) => (typeof v === "number" && Number.isFinite(v) ? v : 0);
-  const uncachedInputTokens = num(u.input_tokens);
-  const cacheCreationInputTokens = num(u.cache_creation_input_tokens);
-  const cacheReadInputTokens = num(u.cache_read_input_tokens);
-  const outputTokens = num(u.output_tokens);
-  const inputTokens = uncachedInputTokens + cacheCreationInputTokens + cacheReadInputTokens;
-  if (inputTokens === 0 && outputTokens === 0) return null;
-  // 只有响应真的带了 cache_creation 拆分才记，缺席时不补 0：「服务端没说」和「服务端说
-  // 没有 5m 写入」是两回事，后者才能证明 1h TTL 生效了。
-  const creation = u.cache_creation && typeof u.cache_creation === "object"
-    ? u.cache_creation as Record<string, unknown>
-    : null;
-  return {
-    inputTokens,
-    uncachedInputTokens,
-    cacheCreationInputTokens,
-    cacheReadInputTokens,
-    outputTokens,
-    ...(creation
-      ? {
-        cacheCreation1hInputTokens: num(creation.ephemeral_1h_input_tokens),
-        cacheCreation5mInputTokens: num(creation.ephemeral_5m_input_tokens),
-      }
-      : {}),
-  };
-}
-
-function parseUsageUtilization(value: string | null): number | null {
-  if (value === null) {
-    return null;
-  }
-  const numeric = Number(value);
-  return Number.isFinite(numeric) ? numeric : null;
-}
-
-function parseUsageResetMs(value: string | null): number | null {
-  if (value === null) {
-    return null;
-  }
-  const numeric = Number(value);
-  // The reset headers are unix epoch seconds.
-  return Number.isFinite(numeric) ? numeric * 1000 : null;
-}
-
-function captureClaudeUsage(res: Response): void {
-  const headers = res.headers;
-  const usage: ClaudeUsage = {
-    fiveHourUtilization: parseUsageUtilization(headers.get("anthropic-ratelimit-unified-5h-utilization")),
-    fiveHourResetAt: parseUsageResetMs(headers.get("anthropic-ratelimit-unified-5h-reset")),
-    fiveHourStatus: headers.get("anthropic-ratelimit-unified-5h-status"),
-    sevenDayUtilization: parseUsageUtilization(headers.get("anthropic-ratelimit-unified-7d-utilization")),
-    sevenDayResetAt: parseUsageResetMs(headers.get("anthropic-ratelimit-unified-7d-reset")),
-    sevenDayStatus: headers.get("anthropic-ratelimit-unified-7d-status"),
-    capturedAt: Date.now(),
-  };
-
-  if (usage.fiveHourUtilization !== null || usage.sevenDayUtilization !== null) {
-    latestClaudeUsage = usage;
-  }
-}
-
-function parseUsagePercent(value: string | null): number | null {
-  if (value === null || value.trim() === "") {
-    return null;
-  }
-  const numeric = Number(value);
-  // Codex reports an integer percent (0-100); normalize to a 0-1 fraction.
-  return Number.isFinite(numeric) ? numeric / 100 : null;
-}
-
-function codexUsageStatus(utilization: number | null): string | null {
-  if (utilization === null) {
-    return null;
-  }
-  return utilization >= 1 ? "limited" : "allowed";
-}
-
-// Codex exposes 5h (primary) / 7d (secondary) rate-limit windows via x-codex-* headers.
-function captureCodexUsage(res: Response): void {
-  const headers = res.headers;
-  const fiveHourUtilization = parseUsagePercent(headers.get("x-codex-primary-used-percent"));
-  const sevenDayUtilization = parseUsagePercent(headers.get("x-codex-secondary-used-percent"));
-  const usage: ClaudeUsage = {
-    fiveHourUtilization,
-    fiveHourResetAt: parseUsageResetMs(headers.get("x-codex-primary-reset-at")),
-    fiveHourStatus: codexUsageStatus(fiveHourUtilization),
-    sevenDayUtilization,
-    sevenDayResetAt: parseUsageResetMs(headers.get("x-codex-secondary-reset-at")),
-    sevenDayStatus: codexUsageStatus(sevenDayUtilization),
-    capturedAt: Date.now(),
-  };
-
-  if (fiveHourUtilization !== null || sevenDayUtilization !== null) {
-    latestClaudeUsage = usage;
-  }
-}
-
-async function requestClaudeText(
-  model: string,
-  systemPrompt: string,
-  messages: LlmMessage[],
-  options: ClaudeRequestOptions = {},
-  recordUsage: (usage: TokenUsageBreakdown) => void,
-  inspectBody: (body: Record<string, unknown>) => void = () => {},
-): Promise<string> {
-  const data = await requestClaudeMessage(model, systemPrompt, messages, options, recordUsage, inspectBody);
-  return extractClaudeText(data);
-}
-
-// The whole transport — auth retry, credential rotation, fetch retry, rate-limit
-// gate, usage capture — in one place, returning the raw message so both the
-// text path and the tool loop get identical handling.
-async function requestClaudeMessage(
-  model: string,
-  systemPrompt: string,
-  messages: LlmMessage[],
-  options: ClaudeRequestOptions = {},
-  recordUsage: (usage: TokenUsageBreakdown) => void,
-  inspectBody: (body: Record<string, unknown>) => void = () => {},
-): Promise<Record<string, unknown>> {
-  const rateLimitRevision = claudeRateLimitGate.beginRequest();
-  let creds = await claudeOAuth.getCredentials();
-  const body = buildClaudeRequestBody(model, systemPrompt, messages, options);
-  // Before the wire, and before any retry: the prefix is a property of the
-  // request we built, not of whether it happened to succeed.
-  inspectBody(body);
-  let fetchAttempts = 0;
-
-  let authAttempt = 0;
-  while (authAttempt < 2) {
-    let res: Response;
+    // A response is successful only after the streamed completion arrives.
+    let data: Record<string, unknown>;
     try {
-      fetchAttempts += 1;
-      res = await fetch(CLAUDE_MESSAGES_URL, {
-        method: "POST",
-        headers: buildClaudeHeaders(creds.accessToken),
-        body: JSON.stringify(body),
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      });
+      data = await readCodexResponse(res);
     } catch (error) {
-      if (isRetryableTransportError(error) && fetchAttempts < FETCH_FAILED_MAX_ATTEMPTS) {
+      if (isRetryableTransportError(error) && fetchAttempts < maxAttempts) {
         const wait = retryDelayMs(fetchAttempts);
-        console.warn(
-          `[${new Date().toISOString()}] Claude transport failed (${fetchAttempts}/${FETCH_FAILED_MAX_ATTEMPTS}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`,
-        );
+        console.warn(`[${new Date().toISOString()}] Codex response stream failed (${fetchAttempts}/${maxAttempts}), retrying in ${Math.round(wait / 100) / 10}s: ${describeTransportError(error)}`);
         await delay(wait);
         continue;
       }
-      if (isRetryableTransportError(error)) {
-        // Out of attempts. Say so explicitly: the alternative is a bare stack
-        // trace that looks identical to a code defect.
-        console.error(
-          `[${new Date().toISOString()}] Claude transport gave up after ${fetchAttempts} attempts: ${describeTransportError(error)}`,
-        );
-      }
       throw error;
     }
-
-    // Usage/reset headers can be present on 429 responses too. Capture them
-    // before any auth retry or error throw so the monitor retains the reset.
-    captureClaudeUsage(res);
-
-    if ((res.status === 401 || res.status === 403) && authAttempt === 0) {
-      // 票据是 Holly 独占的，被拒只可能是 access token 提前失效；换一次再试。并发的其他
-      // 请求若已经换过，forceRefresh 会直接交回那份新的，不会再花一次刷新。
-      const refreshed = await claudeOAuth.forceRefresh(creds);
-      if (refreshed) {
-        creds = refreshed;
-        authAttempt += 1;
-        continue;
-      }
-    }
-
-    if (!res.ok) {
-      const errorText = await res.text().catch(() => "");
-      const retryAt = res.status === 429
-        ? claudeRateLimitGate.pauseUntil(
-            parseUsageResetMs(res.headers.get("anthropic-ratelimit-unified-5h-reset")),
-          )
-        : null;
-      throw new LlmHttpError("Claude", res.status, (errorText || "<empty>").slice(0, 2_000), retryAt);
-    }
-
-    claudeRateLimitGate.recordSuccess(rateLimitRevision);
-    const data = await res.json() as Record<string, unknown>;
-    const tokens = readClaudeUsageTokens(data);
-    if (tokens) {
-      recordUsage({ ...tokens, cacheablePrefixTokens: measureClaudeCachedPrefixTokens(body) });
-    }
+    const usage = readCodexUsageTokens(data);
+    if (usage) recordUsage(usage);
+    codexRateLimitGate.recordSuccess(rateLimitRevision);
     return data;
   }
-
-  throw new Error("Claude request failed after retry.");
+  throw new Error("Codex request failed after retry.");
 }
 
-// A loop with no ceiling is a loop that can spend the whole budget on one
-// confused turn. Each round is a full request carrying the whole transcript, so
-// the cost of a runaway grows quadratically, not linearly.
-const CLAUDE_TOOL_LOOP_MAX_ROUNDS = 12;
-
-export type ClaudeToolLoopResult = {
-  text: string;
-  messages: LlmMessage[];
-  rounds: number;
-  // True when the ceiling cut the loop off with the model still asking for
-  // tools. The caller has a partial answer, not a finished one — never present
-  // it as complete.
-  exhausted: boolean;
+export type ProviderUsageWindow = {
+  id: "primary" | "secondary";
+  windowDurationMins: number | null;
+  utilization: number | null;
+  resetAt: number | null;
+  status: string | null;
 };
+export type ProviderUsage = {
+  windows: ProviderUsageWindow[];
+  capturedAt: number;
+};
+let latestProviderUsage: ProviderUsage | null = null;
+export function getLatestProviderUsage(): ProviderUsage | null { return latestProviderUsage; }
 
-export function parseClaudeToolUses(data: Record<string, unknown>): LlmToolUseBlock[] {
-  const content = Array.isArray(data.content) ? data.content : [];
-  const uses: LlmToolUseBlock[] = [];
-  for (const block of content) {
-    if (!block || typeof block !== "object") continue;
-    const record = block as Record<string, unknown>;
-    if (record.type !== "tool_use") continue;
-    if (typeof record.id !== "string" || typeof record.name !== "string") continue;
-    uses.push({
-      type: "tool_use",
-      id: record.id,
-      name: record.name,
-      input: (record.input && typeof record.input === "object" ? record.input : {}) as Record<string, unknown>,
-    });
+function parseUsageNumber(value: unknown): number | null {
+  if ((typeof value !== "string" && typeof value !== "number") || String(value).trim() === "") return null;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : null;
+}
+function parseUsageResetMs(value: unknown): number | null {
+  const numeric = parseUsageNumber(value);
+  if (numeric === null) return null;
+  const milliseconds = numeric * 1000;
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+function parseUsagePercent(value: unknown): number | null {
+  const numeric = parseUsageNumber(value);
+  return numeric === null ? null : numeric / 100;
+}
+function codexUsageStatus(utilization: number | null): string | null {
+  return utilization === null ? null : utilization >= 1 ? "limited" : "allowed";
+}
+function readCodexUsageWindows(headers: Headers): ProviderUsageWindow[] {
+  const windows: ProviderUsageWindow[] = [];
+  for (const id of ["primary", "secondary"] as const) {
+    const windowDurationMins = parseUsageNumber(headers.get(`x-codex-${id}-window-minutes`));
+    // Codex uses a zero-minute window to signal that this quota is disabled.
+    if (windowDurationMins === 0) continue;
+    const utilization = parseUsagePercent(headers.get(`x-codex-${id}-used-percent`));
+    const resetAt = parseUsageResetMs(headers.get(`x-codex-${id}-reset-at`));
+    if (windowDurationMins === null && utilization === null && resetAt === null) continue;
+    windows.push({ id, windowDurationMins, utilization, resetAt, status: codexUsageStatus(utilization) });
   }
-  return uses;
+  return windows;
+}
+function captureCodexUsage(res: Response): void {
+  const hasQuotaHeaders = ["primary", "secondary"].some(id =>
+    ["window-minutes", "used-percent", "reset-at"].some(field => res.headers.has(`x-codex-${id}-${field}`)),
+  );
+  if (!hasQuotaHeaders) return;
+  const windows = readCodexUsageWindows(res.headers);
+  latestProviderUsage = { windows, capturedAt: Date.now() };
 }
 
-// Drives tool_use -> tool_result -> end_turn against the same transport as every
-// other Claude call. `messages` is grown, never rewritten: each round appends the
-// assistant turn and one user turn holding every result, which is both what the
-// API requires and what keeps the prompt-cache prefix extending instead of
-// rebuilding.
-export async function runClaudeToolLoop(input: {
+function parseCodexQuota(data: unknown): { usage: ProviderUsage; availability: ProviderQuotaAvailability | null } | null {
+  if (!data || typeof data !== "object") return null;
+  const rate = (data as Record<string, unknown>).rate_limit;
+  if (!rate || typeof rate !== "object") return null;
+  const limit = rate as Record<string, unknown>;
+  const windows: ProviderUsageWindow[] = [];
+  let malformedWindow = false;
+  for (const id of ["primary", "secondary"] as const) {
+    const value = limit[`${id}_window`];
+    if (value === null || value === undefined) continue;
+    if (typeof value !== "object" || Array.isArray(value)) {
+      malformedWindow = true;
+      windows.push({ id, windowDurationMins: null, utilization: null, resetAt: null, status: null });
+      continue;
+    }
+    const window = value as Record<string, unknown>;
+    const seconds = parseUsageNumber(window.limit_window_seconds);
+    if (seconds === 0) continue;
+    const utilization = parseUsagePercent(window.used_percent);
+    const resetAt = parseUsageResetMs(window.reset_at == null ? null : String(window.reset_at));
+    windows.push({ id, windowDurationMins: seconds === null ? null : seconds / 60, utilization, resetAt, status: codexUsageStatus(utilization) });
+  }
+  const exhausted = windows.filter(window => window.utilization !== null && window.utilization >= 1);
+  let availability: ProviderQuotaAvailability | null = null;
+  if (limit.allowed === false || limit.limit_reached === true || exhausted.length > 0) {
+    const resets = exhausted.flatMap(window => window.resetAt !== null && window.resetAt > Date.now() ? [window.resetAt] : []);
+    availability = { available: false, retryAt: resets.length ? Math.max(...resets) : null };
+  } else if (!malformedWindow && (limit.allowed === true || (windows.length > 0 && windows.every(window => window.utilization !== null && window.utilization < 1)))) {
+    availability = { available: true, retryAt: null };
+  }
+  return { usage: { windows, capturedAt: Date.now() }, availability };
+}
+
+async function refreshCodexUsage(force: boolean): Promise<ProviderUsage | null> {
+  await codexRateLimitGate.refresh(async (revision) => {
+    let creds = await getCodexCredentials();
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const res = await fetch(CODEX_USAGE_URL, {
+        headers: buildCodexHeaders(creds), signal: AbortSignal.timeout(10_000),
+      });
+      if ((res.status === 401 || res.status === 403) && attempt === 0 && creds.refreshToken) {
+        const refreshed = await refreshCodexCredentials(creds).catch(() => null);
+        if (refreshed) { creds = refreshed; continue; }
+      }
+      if (!res.ok) throw new LlmHttpError("Codex usage", res.status, "Could not refresh usage limits.", null);
+      const quota = parseCodexQuota(await res.json());
+      if (!quota) throw new Error("Codex usage endpoint returned no recognizable quota information.");
+      // 正在查询时若来了新的 429，旧查询不得覆盖新额度快照或解除新暂停。
+      if (codexRateLimitGate.getRevision() === revision) latestProviderUsage = quota.usage;
+      return quota.availability;
+    }
+    return null;
+  }, force);
+  return getLatestProviderUsage();
+}
+
+export type ToolLoopResult = { text: string; messages: LlmMessage[]; rounds: number; exhausted: boolean; yielded?: boolean };
+const TOOL_LOOP_MAX_ROUNDS = 12;
+
+function parseFunctionArguments(item: Record<string, unknown>): Record<string, unknown> {
+  try {
+    const value = JSON.parse(String(item.arguments ?? ""));
+    if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("Expected an object.");
+    return value as Record<string, unknown>;
+  } catch {
+    throw new Error(`Invalid function arguments for tool '${String(item.name)}'.`);
+  }
+}
+
+export function parseCodexToolUses(data: Record<string, unknown>): LlmToolUseBlock[] {
+  return (Array.isArray(data.output) ? data.output : []).filter(item => item?.type === "function_call").map(item => {
+    if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) {
+      throw new Error("Codex function call is missing its call_id or name.");
+    }
+    return { type: "tool_use", id: item.call_id, name: item.name, input: parseFunctionArguments(item) };
+  });
+}
+
+export async function runToolLoop(input: {
   model: string;
   systemPrompt: string;
   messages: LlmMessage[];
   tools: LlmToolDefinition[];
   runTool: (call: LlmToolUseBlock) => Promise<string>;
-  options?: ClaudeRequestOptions;
+  options?: CodexRequestOptions;
   recordUsage: (usage: TokenUsageBreakdown) => void;
-  // round 从 1 开始。调用方靠它区分「内容来自调用方的第一轮」和「循环自己追加出来的后续轮次」。
   inspectBody?: (body: Record<string, unknown>, round: number) => void;
   maxRounds?: number;
-  // Called as each turn is decided, before the next request goes out. This is
-  // the seam for an owner of the transcript (ConversationLedger): the loop stays
-  // transport-level and ledger-agnostic, while the ledger still sees every turn
-  // in order rather than being reconciled against a returned array afterwards.
-  onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[]) => void;
+  shouldYield?: () => boolean;
+  onAssistantTurn?: (text: string, toolUses: LlmToolUseBlock[], responseItems?: Record<string, unknown>[]) => void;
   onToolResults?: (results: LlmToolResultBlock[]) => void;
-}): Promise<ClaudeToolLoopResult> {
-  const maxRounds = Math.max(1, input.maxRounds ?? CLAUDE_TOOL_LOOP_MAX_ROUNDS);
-  const messages: LlmMessage[] = [...input.messages];
-  const inspectBody = input.inspectBody;
+}): Promise<ToolLoopResult> {
+  const maxRounds = Math.max(1, Math.floor(input.maxRounds ?? TOOL_LOOP_MAX_ROUNDS));
+  if (!Number.isFinite(maxRounds)) throw new Error("maxRounds must be finite.");
+  const messages = [...input.messages];
+  const availableTools = new Set(input.tools.map(tool => tool.name));
   let lastText = "";
-
-  for (let round = 1; round <= maxRounds; round += 1) {
-    const data = await requestClaudeMessage(
-      input.model,
-      input.systemPrompt,
-      messages,
-      { ...input.options, tools: input.tools },
-      input.recordUsage,
-      inspectBody ? (body) => inspectBody(body, round) : undefined,
-    );
-
-    const text = extractClaudeText(data);
+  for (let round = 1; round <= maxRounds; round++) {
+    if (input.shouldYield?.()) {
+      return { text: lastText, messages, rounds: round - 1, exhausted: false, yielded: true };
+    }
+    const body = buildCodexRequestBody(input.model, input.systemPrompt, messages, { ...input.options, tools: input.tools });
+    input.inspectBody?.(body, round);
+    const data = await requestCodexResponse(body, input.recordUsage, input.options?.timeoutMs, input.options?.maxAttempts);
+    const text = extractCodexText(data);
     if (text) lastText = text;
-
-    const toolUses = parseClaudeToolUses(data);
-    if (toolUses.length === 0) {
-      // 一个字都不调工具就收尾，是这条管线上最常见的一轮：大多数群消息本来就不需要她
-      // 出声，FOCUS_LOOP_PROMPT 也明写这是合法选择。但这一轮她通常不是什么都没干——
-      // 她看了消息、想了一遍、决定不接话。以前这段话只作为 lastText 进监控页，account
-      // 里一个字都不留，于是下一轮她看到的是同一批消息和一片空白：不知道自己已经看过，
-      // 也不知道当时为什么决定放着。留下来，她才接得上自己的上一个念头。
-      //
-      // 代价是账本长得更快、压缩来得更勤。这是想清楚之后认的：planLedgerCompaction 本来
-      // 就按 token 阈值走，多出来的这些字只是让那条线早一点到。
-      //
-      // 空 text 要跳过。appendAssistantTurn 对「既没有话也没有工具调用」是直接 throw 的，
-      // 那种空轮确实没有任何东西值得留。
-      if (text) {
-        messages.push({ role: "assistant", content: text });
-        input.onAssistantTurn?.(text, []);
+    const responseItems = (Array.isArray(data.output) ? data.output : []) as Record<string, unknown>[];
+    const calls = responseItems.filter(item => item?.type === "function_call");
+    const invalid = new Map<string, string>();
+    const toolUses: LlmToolUseBlock[] = calls.map(item => {
+      if (typeof item.call_id !== "string" || !item.call_id || typeof item.name !== "string" || !item.name) {
+        throw new Error("Codex function call is missing its call_id or name.");
+      }
+      let args: Record<string, unknown> = {};
+      try { args = parseFunctionArguments(item); }
+      catch (error) { invalid.set(item.call_id, (error as Error).message); }
+      if (!availableTools.has(item.name)) invalid.set(item.call_id, `Unknown tool '${item.name}'.`);
+      return { type: "tool_use", id: item.call_id, name: item.name, input: args };
+    });
+    if (!toolUses.length) {
+      if (text || responseItems.length) {
+        messages.push({ role: "assistant", content: text, ...(responseItems.length ? { responseItems } : {}) });
+        input.onAssistantTurn?.(text, [], responseItems);
       }
       return { text: lastText, messages, rounds: round, exhausted: false };
     }
-
-    messages.push({ role: "assistant", content: text, blocks: toolUses });
-    input.onAssistantTurn?.(text, toolUses);
-
-    // Every result rides in ONE user turn. Splitting them across turns is
-    // accepted by the API but teaches the model to stop calling tools in
-    // parallel, which costs a round trip on every later multi-tool turn.
+    messages.push({ role: "assistant", content: text, blocks: toolUses, responseItems });
+    input.onAssistantTurn?.(text, toolUses, responseItems);
     const results: LlmToolResultBlock[] = [];
     for (const call of toolUses) {
       try {
+        const invalidReason = invalid.get(call.id);
+        if (invalidReason) throw new Error(invalidReason);
         results.push({ type: "tool_result", toolUseId: call.id, content: await input.runTool(call) });
       } catch (error) {
-        // A thrown tool still owes the model a result: an unanswered tool_use id
-        // is a 400 on the next round, turning one tool bug into a dead loop.
-        results.push({
-          type: "tool_result",
-          toolUseId: call.id,
-          content: error instanceof Error ? error.message : String(error),
-          isError: true,
-        });
+        results.push({ type: "tool_result", toolUseId: call.id, content: error instanceof Error ? error.message : String(error), isError: true });
       }
     }
     messages.push({ role: "user", content: "", blocks: results });
     input.onToolResults?.(results);
+    if (input.shouldYield?.()) {
+      return { text: lastText, messages, rounds: round, exhausted: false, yielded: true };
+    }
   }
-
   return { text: lastText, messages, rounds: maxRounds, exhausted: true };
 }
 
-// Minimal request whose only purpose is to capture the rate-limit headers so the
-// usage panel can show data before the first real chat happens.
-export async function probeClaudeUsage(model: string): Promise<ClaudeUsage | null> {
-  try {
-    const rateLimitRevision = claudeRateLimitGate.beginRequest();
-    const creds = await claudeOAuth.getCredentials();
-    const body = {
-      model,
-      max_tokens: 1,
-      system: [{ type: "text", text: CLAUDE_CODE_IDENTITY }],
-      messages: [{ role: "user", content: "ping" }],
-    };
-    const res = await fetch(CLAUDE_MESSAGES_URL, {
-      method: "POST",
-      headers: buildClaudeHeaders(creds.accessToken),
-      body: JSON.stringify(body),
-      signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
-    // 429 responses still carry the unified rate-limit headers.
-    if (res.ok || res.status === 429) {
-      captureClaudeUsage(res);
-    }
-    if (res.status === 429) {
-      claudeRateLimitGate.pauseUntil(
-        parseUsageResetMs(res.headers.get("anthropic-ratelimit-unified-5h-reset")),
-      );
-    }
-    if (res.ok) {
-      claudeRateLimitGate.recordSuccess(rateLimitRevision);
-      await res.json().catch(() => null);
-    }
-  } catch {
-    // Best-effort probe; fall back to whatever is cached.
-  }
-  return getLatestClaudeUsage();
+export async function probeProviderUsage(model: string): Promise<ProviderUsage | null> {
+  assertGptModel(model);
+  return refreshCodexUsage(true);
+}
+
+function assertGptModel(model: string): void {
+  if (!/^gpt-\d[\w.-]*$/.test(model)) throw new Error(`Unsupported GPT model '${model}'. Configure a gpt-* model with provider 'codex'.`);
+}
+
+function validateProfile(profile: LlmProfileConfig, name: string, configPath: string): string {
+  if (profile.provider !== "codex") throw new Error(`Unsupported provider '${(profile as { provider?: string }).provider}' for '${name}'. Only 'codex' is supported.`);
+  const model = profile.model?.trim();
+  if (!model) throw new Error(`Missing 'model' for llm profile '${name}' in ${configPath}.`);
+  assertGptModel(model);
+  return model;
 }
 
 export async function resolveLlmProfile(configPath: string, requestedProfileName?: string): Promise<ResolvedLlmProfile> {
   const config = await loadConfig(configPath);
   const llm = config.llm;
-  if (!llm?.profiles || Object.keys(llm.profiles).length === 0) {
-    throw new Error(`Missing 'llm.profiles' in ${configPath}.`);
-  }
-
-  const profileName = requestedProfileName?.trim() || llm.active?.trim();
-  if (!profileName) {
-    throw new Error(`Missing 'llm.active' in ${configPath}.`);
-  }
-
-  const profile = llm.profiles[profileName];
-  if (!profile) {
-    throw new Error(`LLM profile '${profileName}' not found in ${configPath}.`);
-  }
-
-  if (profile.provider !== "codex" && profile.provider !== "claude") {
-    throw new Error(`Unsupported provider '${(profile as { provider?: string }).provider}' for '${profileName}'.`);
-  }
-
-  const model = profile.model?.trim();
-  if (!model) {
-    throw new Error(`Missing 'model' for llm profile '${profileName}' in ${configPath}.`);
-  }
-
-  return {
-    name: profileName,
-    provider: profile.provider,
-    model,
-    systemPrompt: profile.system_prompt ?? llm.system_prompt ?? DEFAULT_SYSTEM_PROMPT,
-  };
+  if (!llm?.profiles || !Object.keys(llm.profiles).length) throw new Error(`Missing 'llm.profiles' in ${configPath}.`);
+  const name = requestedProfileName?.trim() || llm.active?.trim();
+  if (!name) throw new Error(`Missing 'llm.active' in ${configPath}.`);
+  const profile = llm.profiles[name];
+  if (!profile) throw new Error(`LLM profile '${name}' not found in ${configPath}.`);
+  return { name, provider: "codex", model: validateProfile(profile, name, configPath), systemPrompt: profile.system_prompt ?? llm.system_prompt ?? DEFAULT_SYSTEM_PROMPT };
 }
 
-export async function listLlmProfiles(configPath: string): Promise<{
-  active: string;
-  decision: string;
-  profiles: LlmProfileSummary[];
-}> {
+export async function listLlmProfiles(configPath: string): Promise<{ active: string; decision: string; profiles: LlmProfileSummary[] }> {
   const config = await loadConfig(configPath);
   const llm = config.llm;
-  if (!llm?.profiles || Object.keys(llm.profiles).length === 0) {
-    throw new Error(`Missing 'llm.profiles' in ${configPath}.`);
-  }
-
+  if (!llm?.profiles || !Object.keys(llm.profiles).length) throw new Error(`Missing 'llm.profiles' in ${configPath}.`);
   const active = llm.active?.trim();
-  if (!active) {
-    throw new Error(`Missing 'llm.active' in ${configPath}.`);
-  }
+  if (!active) throw new Error(`Missing 'llm.active' in ${configPath}.`);
+  if (!llm.profiles[active]) throw new Error(`LLM profile '${active}' not found in ${configPath}.`);
   const decision = llm.decision_profile?.trim() || active;
-  if (!llm.profiles[decision]) {
-    throw new Error(`LLM decision profile '${decision}' not found in ${configPath}.`);
-  }
-
-  const profiles = Object.entries(llm.profiles).map(([name, profile]) => {
-    const model = profile.model?.trim();
-    if (!model) {
-      throw new Error(`Missing 'model' for llm profile '${name}' in ${configPath}.`);
-    }
-
-    if (profile.provider !== "codex" && profile.provider !== "claude") {
-      throw new Error(`Unsupported provider '${(profile as { provider?: string }).provider}' for '${name}'.`);
-    }
-
-    return {
-      name,
-      provider: profile.provider,
-      model,
-      displayName: `${name} (${model})`,
-    };
+  if (!llm.profiles[decision]) throw new Error(`LLM decision profile '${decision}' not found in ${configPath}.`);
+  const profiles = Object.entries(llm.profiles).map(([name, profile]): LlmProfileSummary => {
+    const model = validateProfile(profile, name, configPath);
+    return { name, provider: "codex", model, displayName: `${name} (${model})` };
   });
-
-  return {
-    active,
-    decision,
-    profiles,
-  };
+  return { active, decision, profiles };
 }
 
 export async function setActiveLlmProfile(configPath: string, profileName: string): Promise<void> {
   const config = await loadConfig(configPath);
   const llm = config.llm;
   const target = profileName.trim();
-  if (!target) {
-    throw new Error("profileName is required.");
-  }
-
-  if (!llm?.profiles || !llm.profiles[target]) {
-    throw new Error(`LLM profile '${target}' not found in ${configPath}.`);
-  }
-
-  config.llm = {
-    ...llm,
-    active: target,
-  };
-
+  if (!target) throw new Error("profileName is required.");
+  if (!llm?.profiles?.[target]) throw new Error(`LLM profile '${target}' not found in ${configPath}.`);
+  validateProfile(llm.profiles[target], target, configPath);
+  config.llm = { ...llm, active: target };
   await saveConfig(configPath, config);
 }
 
@@ -1464,91 +1008,35 @@ export async function createLlmClient(
 ): Promise<LlmClient> {
   const profile = await resolveLlmProfile(configPath, requestedProfileName);
   const usageQueue = new TokenUsageQueue(profile.model);
-  // Bound per call rather than once per client: the purpose belongs to the
-  // request that produced the usage, and concurrent calls must not share it.
-  const recordUsageFor = (purpose: LlmCallPurpose) => (usage: TokenUsageBreakdown): void =>
-    usageQueue.record(usage, purpose);
-
-  // Per client, so two profiles pointed at different models never compare
-  // prefixes with each other: a cache entry belongs to one model.
   const prefixTracker = new CachePrefixTracker();
-  const inspectPrefixFor = (
-    purpose: LlmCallPurpose,
-    cacheRoute: string,
-    expectRebuild: boolean,
-  ) => (body: Record<string, unknown>): void => {
-    const observer = options.cachePrefixObserver;
-    if (!observer) return;
-    const inspection = prefixTracker.inspect(
-      `${profile.model}|${cacheRoute}`,
-      digestClaudeCachedPrefix(body),
-    );
-    observer({ ...inspection, model: profile.model, purpose, expectRebuild });
+  const recordUsageFor = (purpose: LlmCallPurpose) => (usage: TokenUsageBreakdown): void => usageQueue.record(usage, purpose);
+  const inspectPrefix = (body: Record<string, unknown>, purpose: LlmCallPurpose, cacheRoute: string, expectRebuild: boolean): void => {
+    if (!options.cachePrefixObserver) return;
+    const inspection = prefixTracker.inspect(`${profile.model}|${cacheRoute}`, digestCodexCachedPrefix(body));
+    options.cachePrefixObserver({ ...inspection, model: profile.model, purpose, expectRebuild });
   };
-
   return {
-    profileName: profile.name,
-    provider: profile.provider,
-    model: profile.model,
-    systemPrompt: profile.systemPrompt,
-    displayName: `${profile.name} (${profile.model})`,
-    drainTokenUsage: () => usageQueue.drain(),
-    async runToolLoop(input): Promise<ClaudeToolLoopResult> {
-      if (profile.provider !== "claude") {
-        // Tool use here is the Anthropic Messages shape; Codex would need its
-        // own translation. Fail loudly rather than silently answering without
-        // the tools the caller depends on.
-        throw new Error(`runToolLoop is not implemented for provider '${profile.provider}'.`);
-      }
-      const { systemPrompt, contents } = splitSystemPrompt(
-        input.messages,
-        input.systemPrompt ?? profile.systemPrompt,
-      );
-      return runClaudeToolLoop({
-        model: profile.model,
-        systemPrompt,
-        messages: contents,
-        tools: input.tools,
-        runTool: input.runTool,
-        options: { cacheStablePrefix: true, volatileTailMessages: 1 },
+    profileName: profile.name, provider: "codex", model: profile.model, systemPrompt: profile.systemPrompt,
+    displayName: `${profile.name} (${profile.model})`, drainTokenUsage: () => usageQueue.drain(),
+    async runToolLoop(input): Promise<ToolLoopResult> {
+      const { systemPrompt, contents } = splitSystemPrompt(input.messages, input.systemPrompt ?? profile.systemPrompt);
+      return runToolLoop({
+        model: profile.model, systemPrompt, messages: contents, tools: input.tools, runTool: input.runTool,
+        options: {
+          cacheRoute: input.cacheRoute, volatileTailMessages: 1, timeoutMs: input.timeoutMs,
+          maxAttempts: input.maxAttempts, reasoningEffort: input.reasoningEffort,
+        },
         recordUsage: recordUsageFor(input.purpose),
-        // 按循环轮数而不是消息轮次检查：每轮循环都是独立请求，而循环途中前缀停止延长
-        // 正是账本设计要阻止的回归。
-        // expectRebuild 只交给第一轮，原因见 LlmClient.runToolLoop 的类型说明。
-        inspectBody: (body, round) =>
-          inspectPrefixFor(input.purpose, input.cacheRoute, round === 1 && (input.expectRebuild ?? false))(body),
-        maxRounds: input.maxRounds,
-        onAssistantTurn: input.onAssistantTurn,
-        onToolResults: input.onToolResults,
+        inspectBody: (body, round) => inspectPrefix(body, input.purpose, input.cacheRoute, round === 1 && (input.expectRebuild ?? false)),
+        maxRounds: input.maxRounds, shouldYield: input.shouldYield,
+        onAssistantTurn: input.onAssistantTurn, onToolResults: input.onToolResults,
       });
     },
     async generateText(input): Promise<string> {
-      const recordUsage = recordUsageFor(input.purpose);
-      const { systemPrompt, contents } = splitSystemPrompt(
-        input.messages,
-        input.systemPrompt ?? profile.systemPrompt,
-      );
-
-      if (profile.provider === "claude") {
-        return requestClaudeText(
-          profile.model,
-          systemPrompt,
-          contents,
-          {
-            jsonSchema: input.jsonSchema,
-            cacheStablePrefix: true,
-            // 生产环境中每个 generateText 调用方都会把本次请求输入放在最后一条
-            // LlmMessage 中，因此缓存它前面的稳定历史。
-            volatileTailMessages: 1,
-          },
-          recordUsage,
-          inspectPrefixFor(input.purpose, input.cacheRoute, input.expectRebuild ?? false),
-        );
-      }
-
-      // Codex 按 prompt_cache_key 及自身前缀规则缓存，且不报告可供摘要的断点，
-      // 因此这里没有可检查内容。
-      return requestCodexText(profile.model, systemPrompt, contents, recordUsage);
+      const { systemPrompt, contents } = splitSystemPrompt(input.messages, input.systemPrompt ?? profile.systemPrompt);
+      const body = buildCodexRequestBody(profile.model, systemPrompt, contents, { jsonSchema: input.jsonSchema, cacheRoute: input.cacheRoute, volatileTailMessages: 1 });
+      inspectPrefix(body, input.purpose, input.cacheRoute, input.expectRebuild ?? false);
+      return extractCodexText(await requestCodexResponse(body, recordUsageFor(input.purpose)));
     },
   };
 }

@@ -6,7 +6,7 @@
 // cases it then runs the real searchWeb + re-ask and prints the final answer.
 //
 // Run:  npm run search-flow:test            (active profile)
-//       npm run search-flow:test -- claude_haiku
+//       npm run search-flow:test -- codex_gpt61
 //
 // Spends real tokens (1 call per non-search scenario, 2 per search scenario) and
 // a few local SearXNG queries.

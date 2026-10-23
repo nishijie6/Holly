@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -160,47 +160,50 @@ test("restore keeps a transcript that ends on a settled turn", () => {
 // --- the seam Phase 3 depends on -------------------------------------------
 
 test("the tool loop's turn hooks keep a ledger in step, in order", async (t) => {
-  // 传输层要先拿到 Holly 自己的登录票据；给一份临时的假票据，别读到本机真实的登录。
-  const oauthStoreDir = await mkdtemp(join(tmpdir(), "holly-ledger-oauth-"));
-  t.after(() => rm(oauthStoreDir, { recursive: true, force: true }));
-  process.env.HOLLY_CLAUDE_OAUTH_STORE = join(oauthStoreDir, "credentials.json");
-  await writeFile(
-    process.env.HOLLY_CLAUDE_OAUTH_STORE,
-    JSON.stringify({ accessToken: "test-access", refreshToken: "test-refresh", expiresAt: Date.now() + 86_400_000 }),
-  );
-  const { runClaudeToolLoop } = await import("../llm-client.js");
+  // Resolve the transport in an isolated project so tests never read real auth.
+  const authDir = await mkdtemp(join(tmpdir(), "holly-ledger-codex-"));
+  t.after(() => rm(authDir, { recursive: true, force: true }));
+  await mkdir(join(authDir, ".codex"));
+  await writeFile(join(authDir, ".codex", "auth.json"), JSON.stringify({ tokens: { access_token: "test-access" } }));
+  const originalCwd = process.cwd();
+  let llm;
+  try {
+    process.chdir(authDir);
+    llm = await import("../llm-client.js");
+  } finally {
+    process.chdir(originalCwd);
+  }
+  const { runToolLoop } = llm;
   const original = globalThis.fetch;
   const responses: Array<Record<string, unknown>> = [
     {
-      stop_reason: "tool_use",
-      content: [
-        { type: "text", text: "checking" },
-        { type: "tool_use", id: "tu_1", name: "get_weather", input: {} },
+      status: "completed",
+      output: [
+        { type: "reasoning", id: "rs_1", encrypted_content: "opaque-state", summary: [] },
+        { type: "message", role: "assistant", content: [{ type: "output_text", text: "checking" }] },
+        { type: "function_call", id: "fc_1", call_id: "tu_1", name: "get_weather", arguments: "{}" },
       ],
     },
-    { stop_reason: "end_turn", content: [{ type: "text", text: "18C" }] },
+    { status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "18C" }] }] },
   ];
   let call = 0;
   globalThis.fetch = (async () => {
     const body = responses[Math.min(call, responses.length - 1)];
     call += 1;
-    return {
-      ok: true, status: 200, headers: new Headers(),
-      json: async () => body, text: async () => JSON.stringify(body),
-    } as unknown as Response;
+    return new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
   }) as typeof fetch;
 
   const ledger = new ConversationLedger();
   ledger.appendUserText("weather?");
   try {
-    await runClaudeToolLoop({
-      model: "claude-sonnet-4-6",
+    await runToolLoop({
+      model: "gpt-6.1-sol",
       systemPrompt: "sys",
       messages: [...ledger.snapshot()],
       tools: [{ name: "get_weather", description: "w", inputSchema: { type: "object" } }],
       runTool: async () => "18C",
       recordUsage: () => {},
-      onAssistantTurn: (text, toolUses) => ledger.appendAssistantTurn(text, toolUses),
+      onAssistantTurn: (text, toolUses, responseItems) => ledger.appendAssistantTurn(text, toolUses, responseItems),
       onToolResults: (results) => ledger.appendToolResults(results),
     });
   } finally {
@@ -210,6 +213,7 @@ test("the tool loop's turn hooks keep a ledger in step, in order", async (t) => 
   // The ledger's own pairing checks did not fire, which is the point: the loop
   // hands it turns in an order the ledger considers legal.
   assert.equal(ledger.size, 4);
+  assert.equal(ledger.snapshot()[1].responseItems?.[0].type, "reasoning");
   assert.deepEqual([...ledger.pendingToolUses], []);
   assert.equal(ledger.snapshot()[1].blocks?.[0].type, "tool_use");
   assert.equal(ledger.snapshot()[2].blocks?.[0].type, "tool_result");
@@ -266,4 +270,25 @@ test("compaction refuses a tail that starts with an orphaned tool_result", () =>
     ]),
     /orphaned tool_result/,
   );
+});
+
+test("assistant turns retain Responses output for later GPT tool rounds", () => {
+  const ledger = new ConversationLedger();
+  const responseItems = [
+    { type: "reasoning", id: "rs_1", encrypted_content: "opaque-state", summary: [] },
+    { type: "function_call", id: "fc_1", call_id: "tu_1", name: "get_weather", arguments: "{}" },
+  ];
+  ledger.appendAssistantTurn("", [use("tu_1")], responseItems);
+  assert.deepEqual(ledger.snapshot()[0].responseItems, responseItems);
+  ledger.appendToolResults([result("tu_1")]);
+  assert.deepEqual(ledger.snapshot()[0].responseItems, responseItems);
+});
+
+test("a completed GPT reasoning-only turn can be retained without inventing prose", () => {
+  const ledger = new ConversationLedger();
+  const responseItems = [{ type: "reasoning", id: "rs_1", summary: [], encrypted_content: "opaque" }];
+  ledger.appendAssistantTurn("", [], responseItems);
+  assert.deepEqual(ledger.snapshot()[0].responseItems, responseItems);
+  ledger.appendUserText("next turn");
+  assert.equal(ledger.size, 2);
 });

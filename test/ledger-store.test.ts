@@ -220,3 +220,20 @@ test("restore does not re-notify the sink, so the log does not double each boot"
   ledger.appendUserText("新的");
   assert.deepEqual(seen, ["新的"]);
 });
+
+test("Responses reasoning and function call items survive durable ledger restore", async () => {
+  const path = tmpPath();
+  const responseItems = [
+    { type: "reasoning", id: "rs_1", encrypted_content: "opaque-state", summary: [] },
+    { type: "function_call", id: "fc_1", call_id: "tu_1", name: "open_conversation", arguments: '{"id":"20000001"}' },
+  ];
+  try {
+    const { store } = await LedgerStore.load(path, OPTS);
+    await store.append({ ...toolTurn, responseItems });
+    await store.append(resultTurn);
+    const { outcome } = await LedgerStore.load(path, OPTS);
+    assert.deepEqual(outcome.messages[0].responseItems, responseItems);
+  } finally {
+    await rm(path, { force: true });
+  }
+});

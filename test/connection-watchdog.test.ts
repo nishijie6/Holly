@@ -77,23 +77,23 @@ test("HTTP responses and local rate-limit pauses never count as broken connectio
   } = failurePolicy();
 
   assert.equal(
-    shouldCountTowardConnectionWatchdog(new LlmHttpError("claude", 429, "limited", 2_000)),
+    shouldCountTowardConnectionWatchdog(new LlmHttpError("codex", 429, "limited", 2_000)),
     false,
   );
   assert.equal(
-    shouldCountTowardConnectionWatchdog(new LlmHttpError("claude", 401, "expired", null)),
+    shouldCountTowardConnectionWatchdog(new LlmHttpError("codex", 401, "expired", null)),
     false,
   );
   assert.equal(
-    shouldCountTowardConnectionWatchdog(new LlmHttpError("claude", 529, "overloaded", null)),
+    shouldCountTowardConnectionWatchdog(new LlmHttpError("codex", 503, "overloaded", null)),
     false,
   );
   assert.equal(
-    shouldCountTowardConnectionWatchdog(new LlmRateLimitPauseError("claude", 2_000)),
+    shouldCountTowardConnectionWatchdog(new LlmRateLimitPauseError("codex", 2_000)),
     false,
   );
   assert.equal(shouldCountTowardConnectionWatchdog(new TypeError("fetch failed")), true);
-  assert.equal(shouldCountTowardConnectionWatchdog(new Error("Claude credentials not found")), false);
+  assert.equal(shouldCountTowardConnectionWatchdog(new Error("Codex credentials not found")), false);
   assert.equal(shouldCountTowardConnectionWatchdog(new SyntaxError("bad config")), false);
   const timeout = new Error("The operation was aborted due to timeout");
   timeout.name = "TimeoutError";
@@ -104,7 +104,7 @@ test("rate-limit gate suppresses requests until the server reset time", () => {
   const { LlmRateLimitPauseError, ProviderRateLimitGate } = failurePolicy();
   let now = 1_000;
   const gate = new ProviderRateLimitGate({
-    provider: "claude",
+    provider: "codex",
     now: () => now,
     fallbackPauseMs: 500,
   });
@@ -125,7 +125,7 @@ test("rate-limit gate suppresses requests until the server reset time", () => {
 test("rate-limit gate applies a bounded fallback when reset headers are missing", () => {
   const { ProviderRateLimitGate } = failurePolicy();
   const gate = new ProviderRateLimitGate({
-    provider: "claude",
+    provider: "codex",
     now: () => 10_000,
     fallbackPauseMs: 300_000,
   });
@@ -136,7 +136,7 @@ test("rate-limit gate applies a bounded fallback when reset headers are missing"
 test("a success from an older overlapping request cannot clear a newer rate-limit pause", () => {
   const { LlmRateLimitPauseError, ProviderRateLimitGate } = failurePolicy();
   let now = 1_000;
-  const gate = new ProviderRateLimitGate({ provider: "claude", now: () => now, fallbackPauseMs: 500 });
+  const gate = new ProviderRateLimitGate({ provider: "codex", now: () => now, fallbackPauseMs: 500 });
   const olderRequest = gate.beginRequest();
   gate.beginRequest();
 
@@ -154,10 +154,72 @@ test("a success from an older overlapping request cannot clear a newer rate-limi
 test("quota and authentication failures skip in-place retries while transient failures may retry", () => {
   const { LlmHttpError, LlmRateLimitPauseError, shouldRetryLlmCall } = failurePolicy();
 
-  assert.equal(shouldRetryLlmCall(new LlmHttpError("claude", 429, "limited", 2_000)), false);
-  assert.equal(shouldRetryLlmCall(new LlmHttpError("claude", 401, "expired", null)), false);
-  assert.equal(shouldRetryLlmCall(new LlmHttpError("claude", 403, "forbidden", null)), false);
-  assert.equal(shouldRetryLlmCall(new LlmRateLimitPauseError("claude", 2_000)), false);
-  assert.equal(shouldRetryLlmCall(new LlmHttpError("claude", 529, "overloaded", null)), true);
+  assert.equal(shouldRetryLlmCall(new LlmHttpError("codex", 429, "limited", 2_000)), false);
+  assert.equal(shouldRetryLlmCall(new LlmHttpError("codex", 401, "expired", null)), false);
+  assert.equal(shouldRetryLlmCall(new LlmHttpError("codex", 403, "forbidden", null)), false);
+  assert.equal(shouldRetryLlmCall(new LlmRateLimitPauseError("codex", 2_000)), false);
+  assert.equal(shouldRetryLlmCall(new LlmHttpError("codex", 503, "overloaded", null)), true);
   assert.equal(shouldRetryLlmCall(new TypeError("fetch failed")), true);
+});
+
+test("paused requests recheck quota at most once per interval and resume when it is available", async () => {
+  let now = 1_000;
+  const gate = new watchdogModule.ProviderRateLimitGate({ provider: "codex", now: () => now, recheckIntervalMs: 1_000 });
+  assert.equal(typeof gate.refresh, "function");
+  gate.pauseUntil(100_000);
+  let checks = 0;
+  const limited = async () => { checks++; return { available: false, retryAt: 100_000 }; };
+  await gate.refresh(limited);
+  assert.equal(checks, 0);
+  now += 1_000;
+  await gate.refresh(limited);
+  assert.equal(checks, 1);
+  assert.throws(() => gate.assertOpen(), /requests are paused/);
+  await gate.refresh(limited);
+  assert.equal(checks, 1);
+  now += 1_000;
+  await gate.refresh(async () => ({ available: true, retryAt: null }));
+  assert.doesNotThrow(() => gate.assertOpen());
+});
+
+test("failed or unknown quota checks keep the pause, while a manual refresh can bypass the check interval", async () => {
+  let now = 1_000;
+  const gate = new watchdogModule.ProviderRateLimitGate({ provider: "codex", now: () => now, recheckIntervalMs: 1_000 });
+  assert.equal(typeof gate.refresh, "function");
+  gate.pauseUntil(100_000);
+  now += 1_000;
+  await assert.rejects(gate.refresh(async () => { throw new Error("quota endpoint offline"); }), /offline/);
+  assert.throws(() => gate.assertOpen(), /requests are paused/);
+  let checks = 0;
+  await gate.refresh(async () => { checks++; return { available: true, retryAt: null }; });
+  assert.equal(checks, 0, "a failed quota query must also be throttled");
+  await gate.refresh(async () => null, true);
+  assert.throws(() => gate.assertOpen(), /requests are paused/);
+  await gate.refresh(async () => ({ available: true, retryAt: null }), true);
+  assert.doesNotThrow(() => gate.assertOpen());
+});
+
+test("overlapping quota checks share one request and an old result cannot clear a newer 429", async () => {
+  const gate = new watchdogModule.ProviderRateLimitGate({ provider: "codex" });
+  assert.equal(typeof gate.refresh, "function");
+  gate.pauseUntil(Date.now() + 100_000);
+  let resolve!: (value: { available: boolean; retryAt: null }) => void;
+  const waiting = new Promise<{ available: boolean; retryAt: null }>(r => { resolve = r; });
+  let checks = 0;
+  const check = async () => { checks++; return waiting; };
+  const first = gate.refresh(check, true);
+  const second = gate.refresh(check, true);
+  await Promise.resolve();
+  assert.equal(checks, 1);
+  gate.pauseUntil(Date.now() + 200_000);
+  resolve({ available: true, retryAt: null });
+  await Promise.all([first, second]);
+  assert.throws(() => gate.assertOpen(), /requests are paused/);
+});
+
+test("a fresh exhausted window replaces an obsolete longer reset deadline", async () => {
+  const gate = new watchdogModule.ProviderRateLimitGate({ provider: "codex", now: () => 1_000 });
+  gate.pauseUntil(100_000);
+  await gate.refresh(async () => ({ available: false, retryAt: 2_000 }), true);
+  assert.equal(gate.getPausedUntil(), 2_000);
 });

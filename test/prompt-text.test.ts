@@ -42,13 +42,16 @@ test("同一段 prompt 只从磁盘读一次", () => {
 
 // 念头那一路没有群消息带进来的 current_time，时间只能靠这两段模板自己带。占位符被谁顺手删掉，
 // 她就又回到「早上还以为是昨晚」。末行必须是本轮元数据：账本压缩靠首尾两行认出这一条。
-test("念头两段模板都带上现在的时间，注入末行是本轮元数据", () => {
+test("念头两段模板都带上现在的时间和近况，注入末行是本轮元数据", () => {
   const now = "2026-09-23 09:00 星期三";
-  const voice = renderPromptText("inner-voice", { now });
+  const context = "上次真实自主发送：未知；配置话题：GitHub Trending。";
+  const voice = renderPromptText("inner-voice", { now, context });
   assert.ok(voice.includes(now));
+  assert.ok(voice.includes(context));
   assert.doesNotMatch(voice, /\{\{/);
 
-  const injection = renderPromptText("inner-thought-injection", { thought: "去看看数学", now, open: "群20000002" });
+  const injection = renderPromptText("inner-thought-injection", { thought: "去看看数学", now, open: "群20000002", context });
+  assert.ok(injection.includes(context));
   assert.doesNotMatch(injection, /\{\{/);
   assert.equal(injection.split("\n").at(-1), `[本轮 current_time: ${now} | 当前打开: 群20000002]`);
 });

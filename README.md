@@ -1,24 +1,25 @@
-# tsbot
+# Holly
 
-`tsbot` is a local TypeScript service for receiving upstream chat events, deciding whether to reply with an LLM, and keeping a searchable memory trail in Qdrant.
+Holly is a local TypeScript service for receiving upstream chat events, deciding whether to reply with an LLM, and keeping a searchable memory trail in SQLite or Qdrant.
 
-This README intentionally avoids repository-specific personal details such as account names, target group identifiers, and custom persona text.
+Real account IDs, service endpoints, credentials and persona text belong in the ignored local `config.yaml` and `.env` files. Only sanitized examples are tracked by Git.
 
 ## 中文说明
 
-`tsbot` 是一个本地运行的 TypeScript 消息服务，用来接收上游 WebSocket 消息、调用 LLM 判断是否需要回复，并把消息写入 Qdrant 以便后续检索和上下文记忆。
+Holly 是一个本地运行的 TypeScript 消息服务，用来接收上游 WebSocket 消息、调用 LLM 判断是否需要回复，并把消息写入 SQLite 或 Qdrant 以便后续检索和上下文记忆。
 
 当前项目主要能力：
 
 - 连接上游 WebSocket 消息源并处理收到的事件。
 - 解析文本消息和部分媒体相关元数据。
-- 将消息写入 Qdrant，支持按会话条件筛选查询。
-- 基于可配置的 Codex 模型配置判断是否需要自动回复。
+- 将消息写入 SQLite 或 Qdrant，支持按会话条件筛选查询。
+- 通过 Codex 调用可配置的 GPT 模型判断是否需要自动回复。
 - QQ 对话遇到最新或不确定的外部事实时可调用本地 SearXNG 联网搜索；“搜一下/查一下”等明确请求会强制走搜索链路，并可沿用上一条话题。
 - 通过 OneBot `user_id` 白名单认证管理员；管理员私聊强制回复，群聊中按普通消息规则判断是否回复。
 - 支持管理员用 `/改进代码 <要求>` 创建隔离、可审计的代码改进任务。
 - 提供本地监控页面，查看连接状态、消息流和模型调用情况。
 - 提供思考时间线；每分钟自主检查都会展示检查项目、结果和未行动原因。
+- 世界观察支持 GitHub Trending 日榜，读取热门项目的用途、语言、总 Star、今日新增 Star 和仓库链接，由 Holly 自己决定是否分享。
 - 提供本地记忆浏览页面，查看最近存储的消息记录。
 
 本地启动后可访问：
@@ -29,14 +30,16 @@ This README intentionally avoids repository-specific personal details such as ac
 
 说明：
 
-- 这个 README 有意不写账号名、群号、自定义人设提示词等个人或环境敏感信息。
+- 首次运行先执行 `cp config.example.yaml config.yaml`，再把真实 QQ 号、群号、服务地址、凭据和人设填入本地 `config.yaml`。需要环境变量时再执行 `cp .env.example .env`；已有配置不要覆盖。
+- `config.yaml` 和 `.env` 不提交 Git；只提交 `.example` 模板。监控页的设置仍写回本地 `config.yaml`。
+- 示例默认只读、QQ 离线，管理员、自修改和自主任务均关闭。配置好账号与服务后，再按需启用各项能力。
 
 ## What the Project Does
 
 - Connects to an upstream WebSocket message source.
 - Parses incoming text and supported media metadata.
-- Stores incoming messages in Qdrant for short-term memory and lookup.
-- Uses a configurable Codex-backed LLM profile to decide whether a reply is needed.
+- Stores incoming messages in SQLite or Qdrant for short-term memory and lookup.
+- Uses a configurable Codex-backed GPT profile to decide whether a reply is needed.
 - Sends generated replies back through the upstream WebSocket bridge.
 - Exposes a local monitor page for connection state, message flow, model activity, and reconnect actions.
 - Exposes a local memory browser for filtering and inspecting stored message records.
@@ -48,7 +51,7 @@ The primary runtime is the TypeScript service in `main.ts`.
 The service starts:
 
 - An HTTP server on `127.0.0.1:5000`
-- A WebSocket client that connects to `ws://127.0.0.1:8082`
+- A WebSocket client that connects to the configured NapCat/OneBot endpoint when QQ mode is `observe` or `active` (the example starts `offline`)
 
 Available local pages and APIs:
 
@@ -67,12 +70,12 @@ LLM configuration is loaded from `config.yaml`.
 
 Current TypeScript implementation supports:
 
-- `codex` as the LLM provider
+- `codex` as the LLM provider for GPT models
 - Multiple named profiles
 - Runtime profile switching
 - Config reload when `config.yaml` changes
 
-Message memory is backed by Qdrant. When enabled, the service:
+The example uses local SQLite memory; see [local database configuration](LOCAL_DATABASE.md). Qdrant is optional. When Qdrant is selected and enabled, the service:
 
 - Creates the target collection if needed
 - Stores each incoming message with payload metadata
@@ -83,18 +86,39 @@ Message memory is backed by Qdrant. When enabled, the service:
 
 ## Requirements
 
-- Node.js
+- Node.js 26 or newer
 - npm
-- A reachable Qdrant instance if memory is enabled
-- Valid Codex authentication available to the runtime
+- A NapCat/OneBot WebSocket endpoint for QQ participation
+- A reachable Qdrant instance only if that memory backend is selected
+- Local Codex authentication before enabling model calls
 
 ## Install and Run
 
-Install dependencies:
+Install dependencies and create local configuration files (skip the copy commands if you already have local files):
 
 ```powershell
-npm install
+npm ci
+cp config.example.yaml config.yaml
+# Optional environment variables:
+cp .env.example .env
 ```
+
+Edit `config.yaml` with your own settings. It is the only YAML file the runtime
+loads and the monitor updates; `config.example.yaml` is never loaded as a fallback.
+If the local file is missing, startup stops with a setup hint.
+
+The example uses local SQLite and keeps QQ offline and read-only. Before joining
+QQ, configure `napcat.ws_url`, `napcat.access_token` and `private_chat.bot_user_id`.
+Set `holly_bootstrap.qq_mode` to `observe` to receive without replying, or to
+`active` with `read_only: false` when you want replies. Enable ordinary private
+chat, administrator actions and autonomous tasks separately as needed. Add real
+administrator IDs, group targets and custom persona text only to `config.yaml`.
+
+Choose a Codex-backed GPT profile for `llm.active` / `llm.decision_profile`.
+The example uses `codex_gpt61` (GPT-6.1 Sol) for both roles and supports the focus-mode tool
+loop through GPT. Configure local Codex authentication before enabling model
+calls. Search and browser observation require separate local services; keep
+those services disabled until configured.
 
 Run in development mode:
 
@@ -132,56 +156,39 @@ Relevant `config.yaml` sections include:
 - `admin`: QQ administrator allowlist, private-chat mandatory-reply policy, and controlled code-improvement runner
 - `private_chat`: ordinary friend-private-chat ingestion, friend verification, history depth, and Holly's own QQ id
 - `llm`: active profile, provider, model, and prompt configuration
+- `napcat`: OneBot WebSocket endpoint and access token
+- `database`: memory backend selection; SQLite is the example default
 - `qdrant`: memory store settings such as URL, collection, and timeout
 - `holly_bootstrap`: startup reflection and QQ lifecycle policy
 
-A minimal example shape:
+The complete public templates are [config.example.yaml](config.example.yaml)
+and [.env.example](.env.example). Numeric IDs in source examples and tests are
+synthetic fixtures, not deployment defaults.
 
-```yaml
-admin:
-  enabled: true
-  # Or set HOLLY_ADMIN_QQ_IDS=12345678,87654321 outside the repository.
-  user_ids: ["12345678"]
-  force_reply: true # Applies only to authenticated administrator private chats.
-  immediate_reply: true
-  reply_while_observing: true
-  code_improvement:
-    enabled: true
-    command_prefixes: ["/改进代码"]
-    executable: codex
-    apply_when_clean: true
-    timeout_seconds: 1200
+Optional environment variables in `.env`:
 
-private_chat:
-  enabled: true
-  friends_only: true
-  history_message_count: 40
-  friend_refresh_minutes: 5
-  # Or set HOLLY_BOT_QQ_ID outside the repository.
-  bot_user_id: "10000002"
+- `QDRANT_API_KEY`: overrides `qdrant.api_key` in the local YAML file.
+- `HOLLY_ADMIN_QQ_IDS`: comma-separated administrator IDs, added to `admin.user_ids`.
+- `HOLLY_BOT_QQ_ID`: overrides `private_chat.bot_user_id`.
+- `SEARXNG_URL`: search endpoint, defaulting to `http://127.0.0.1:8888`.
 
-holly_bootstrap:
-  enabled: true
-  reflection_enabled: true
-  # auto asks Holly after memory restoration; a fixed offline/observe/active
-  # value acts as an operator override.
-  qq_mode: auto
-  fallback_qq_mode: observe
-  reconsider_minutes: 60
+`npm run dev`, `npm start` and PM2 load `.env` automatically. Never put real
+credentials or deployment identifiers into the templates, test fixtures or
+documentation. Do not force-add the ignored local files. Existing installations
+keep using their current `config.yaml` without copying the template again.
 
-llm:
-  active: default
-  profiles:
-    default:
-      provider: codex
-      model: gpt-5.4
-
-qdrant:
-  enabled: true
-  url: http://127.0.0.1:6333
-  collection: ws_incoming_messages
-  timeout_ms: 10000
-```
+To let Holly browse GitHub's daily trending projects, add `GitHub 热门项目` to
+`autonomy.world_topics`, set its `world_topic_source_urls` entry to
+`["https://github.com/trending?since=daily"]`, and its
+`world_topic_query_suffix_overrides` entry to `""` (see the example). Enable
+`autonomy.enabled`, `autonomy.world_observation_enabled`, and
+`browser_agent.enabled` locally. This topic reads the leaderboard directly, so
+SearXNG and `search.enabled` are optional for it. Each observation contains up to
+ten repositories with descriptions, languages, total stars, daily star gains,
+and repository links when available. Trending describes current popularity;
+it does not mean a repository was created today. Topic availability and recent
+observations appear in the existing monitor; sharing follows the existing
+conversation settings and Holly's decision.
 
 Administrator identity is taken only from the numeric `user_id` in the
 incoming OneBot event. Nicknames and text claiming to be an administrator do
@@ -220,3 +227,4 @@ or storage failures fall back to the configured mode instead of blocking startup
 - Session logs are written to the `logs/` directory.
 - The repository also contains a Python file (`main.py`), but the active service described here is the TypeScript implementation.
 - If you plan to share this repository, keep custom prompts, tokens, and environment-specific identifiers out of version control.
+- Ignoring a file protects future commits; it does not remove data from existing Git history. Historical cleanup is a separate operation.

@@ -14,7 +14,8 @@
 // 「只有一条时间线」成为结构保证而不是队列约定，消费必须先从生产里分出来。
 export type AgentEvent =
   | { type: "message_batch_ready"; groupKey: string }
-  | { type: "autonomy_tick_due" };
+  | { type: "autonomy_tick_due" }
+  | { type: "focus_retry_due" };
 
 export type AgentEventLogEntry = {
   event: AgentEvent;
@@ -86,6 +87,7 @@ export type CoalescedAgentEvents = {
   groupKeys: string[];
   /** 这一批里有没有自主轮次到期。多个只算一次。 */
   tickDue: boolean;
+  focusRetryDue: boolean;
 };
 
 /**
@@ -103,14 +105,19 @@ export function coalesceAgentEvents(events: readonly AgentEvent[]): CoalescedAge
   const groupKeys: string[] = [];
   const seen = new Set<string>();
   let tickDue = false;
+  let focusRetryDue = false;
   for (const event of events) {
     if (event.type === "autonomy_tick_due") {
       tickDue = true;
+      continue;
+    }
+    if (event.type === "focus_retry_due") {
+      focusRetryDue = true;
       continue;
     }
     if (seen.has(event.groupKey)) continue;
     seen.add(event.groupKey);
     groupKeys.push(event.groupKey);
   }
-  return { groupKeys, tickDue };
+  return { groupKeys, tickDue, focusRetryDue };
 }

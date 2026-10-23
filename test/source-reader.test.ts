@@ -42,7 +42,7 @@ test("凭据、日志、运行时数据和仓库外的路径一律读不到", as
     "dist/main.js",
     "../Holly/.env",
     "/etc/passwd",
-    ".claude/settings.local.json",
+    ".codex/settings.local.json",
   ]) {
     const result = await readSourceEntry(ROOT, path);
     assert.equal(result.ok, false, `${path} 该被拒`);

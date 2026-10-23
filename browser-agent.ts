@@ -1,7 +1,9 @@
 import { spawn, type ChildProcessByStdio } from "node:child_process";
+import { lookup } from "node:dns/promises";
 import { existsSync } from "node:fs";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
+import { isIP } from "node:net";
 import { join } from "node:path";
 import type { Readable } from "node:stream";
 
@@ -9,6 +11,11 @@ import { WebSocket } from "ws";
 
 import { searchWeb, type SearchResult } from "./web-search.js";
 import { rankUrlsByDomainReputation, type DomainReputationTracker } from "./domain-reputation.js";
+import {
+  formatGitHubTrendingRepositories,
+  isGitHubTrendingSourceList,
+  isGitHubTrendingUrl,
+} from "./github-trending.js";
 
 export type BrowserAgentConfig = {
   enabled: boolean;
@@ -20,6 +27,14 @@ export type BrowserAgentConfig = {
   launchTimeoutMs: number;
   contentMaxChars: number;
 };
+
+export function canBrowseTopicWithBrowserAgent(
+  config: Pick<BrowserAgentConfig, "enabled">,
+  searchEnabled: boolean,
+  sourceUrls: readonly string[],
+): boolean {
+  return config.enabled && (searchEnabled || isGitHubTrendingSourceList(sourceUrls));
+}
 
 export type BrowserPageLink = {
   text: string;
@@ -87,6 +102,20 @@ const STEALTH_SCRIPT = [
 // 删页面框架时留下文章卡片自己的 <header>/<footer>：Space.com 把每一条的 <time> 放在
 // article > header 里，按标签名一刀切会把列表上的日期连同标题一起删光。
 const CONTENT_EXTRACTION_EXPRESSION = `(() => {
+  if ((${isGitHubTrendingUrl.toString()})(location.href)) {
+    const repositories = Array.from(document.querySelectorAll('article.Box-row')).map((card) => {
+      const read = (selector) => ((card.querySelector(selector) || {}).textContent || '').replace(/\\s+/g, ' ').trim();
+      const anchor = card.querySelector('h2 a[href]');
+      return {
+        url: anchor ? anchor.href : '',
+        description: read('p'),
+        language: read('[itemprop="programmingLanguage"]'),
+        stars: read('a[href$="/stargazers"]'),
+        starsToday: read('span.float-sm-right'),
+      };
+    });
+    return JSON.stringify({ title: document.title || '', url: location.href, githubTrendingRepositories: repositories });
+  }
   let publishedAt = "";
   try {
     const selectors = [
@@ -469,8 +498,20 @@ async function readPageWithBrowser(
     const parsed = raw ? JSON.parse(raw) as Record<string, unknown> : {};
     const title = typeof parsed.title === "string" ? parsed.title.trim() : "";
     const finalUrl = typeof parsed.url === "string" ? parsed.url.trim() : navUrl;
-    const text = typeof parsed.text === "string" ? parsed.text : "";
-    const links = (Array.isArray(parsed.links) ? parsed.links : [])
+    // 重定向可能把一个公网地址带到内网：落地页不是公网就丢掉正文。
+    if (!finalUrl.startsWith("chrome-error://") && !await resolvesToPublicAddress(finalUrl)) {
+      return {
+        title: "",
+        url,
+        excerpt: "",
+        error: "redirected to a non-public address",
+      };
+    }
+    const trending = isGitHubTrendingUrl(url) || isGitHubTrendingUrl(finalUrl)
+      ? formatGitHubTrendingRepositories(parsed.githubTrendingRepositories, finalUrl)
+      : null;
+    const text = trending ? trending.text : typeof parsed.text === "string" ? parsed.text : "";
+    const links = (trending?.links ?? (Array.isArray(parsed.links) ? parsed.links : []))
       .map((item): BrowserPageLink | null => {
         if (!item || typeof item !== "object") return null;
         const record = item as Record<string, unknown>;
@@ -648,6 +689,15 @@ export async function browseTopicWithBrowserAgent(
   if (!config.enabled || !cleanQuery) return null;
   const sourceUrls = options.sourceUrls ?? [];
 
+  // 日榜本身就是这次要看的内容，搜索排名和新闻日期都不能替代它；SearXNG 关着也照样可读。
+  if (isGitHubTrendingSourceList(sourceUrls)) {
+    return browseUrlsWithBrowserAgent(cleanQuery, sourceUrls, {
+      ...config,
+      maxPages: sourceUrls.length,
+      contentMaxChars: Math.max(config.contentMaxChars, 6000),
+    }, logger, reputation);
+  }
+
   // 有固定来源时，搜索挂了也不该让这一轮白跑：固定来源照样读。
   let results: SearchResult[] = [];
   try {
@@ -673,8 +723,45 @@ export async function browseTopicWithBrowserAgent(
 // NapCat、Qdrant，一个内网地址就能让 Holly 把自家后台读出来发进群；file:// 更是直接
 // 读本地文件。所以只放行公网的 http/https，其余一律拒绝。搜索和世界观察的 URL 来自
 // 搜索引擎，不走这里；这道闸是给「模型说读哪个就读哪个」的路径准备的。
-const PRIVATE_HOST_PATTERN =
-  /^(localhost|127\.|0\.0\.0\.0$|10\.|169\.254\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.|\[?::1\]?$|\[?f[cd])/i;
+// 主机名字符串匹配挡不住「解析到内网的域名」和 IPv4 映射的 IPv6 写法，所以字面 IP 按地址段判，
+// 域名另有 resolvesToPublicAddress 解析后再判一次。new URL 会把十进制、十六进制的 IPv4 写法
+// 规整成点分形式，::ffff:127.0.0.1 则规整成 ::ffff:7f00:1，两种都在这里处理。
+function isPrivateIPv4(address: string): boolean {
+  const parts = address.split(".").map(Number);
+  if (parts.length !== 4 || parts.some((part) => !Number.isInteger(part) || part < 0 || part > 255)) return true;
+  const [a, b] = parts;
+  return a === 0
+    || a === 10
+    || a === 127
+    || (a === 100 && b >= 64 && b <= 127)
+    || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31)
+    || (a === 192 && b === 168)
+    || (a === 192 && b === 0)
+    || (a === 198 && (b === 18 || b === 19))
+    || a >= 224;
+}
+
+function isPrivateIPv6(address: string): boolean {
+  const lower = address.toLowerCase().split("%")[0];
+  if (lower === "::" || lower === "::1") return true;
+  const mapped = /^::ffff:(?:(\d+\.\d+\.\d+\.\d+)|([0-9a-f]{1,4}):([0-9a-f]{1,4}))$/.exec(lower);
+  if (mapped) {
+    if (mapped[1]) return isPrivateIPv4(mapped[1]);
+    const high = Number.parseInt(mapped[2], 16);
+    const low = Number.parseInt(mapped[3], 16);
+    return isPrivateIPv4(`${high >> 8}.${high & 255}.${low >> 8}.${low & 255}`);
+  }
+  const first = Number.parseInt(lower.split(":")[0] || "0", 16);
+  return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80 || (first & 0xff00) === 0xff00;
+}
+
+function isPrivateAddress(address: string): boolean {
+  const family = isIP(address);
+  if (family === 4) return isPrivateIPv4(address);
+  if (family === 6) return isPrivateIPv6(address);
+  return true;
+}
 
 export function isSafeExternalPageUrl(rawUrl: string): boolean {
   let url: URL;
@@ -684,10 +771,72 @@ export function isSafeExternalPageUrl(rawUrl: string): boolean {
     return false;
   }
   if (url.protocol !== "http:" && url.protocol !== "https:") return false;
-  const hostname = url.hostname.toLowerCase();
+  const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "");
   if (!hostname) return false;
+  if (isIP(hostname)) return !isPrivateAddress(hostname);
+  if (hostname === "localhost" || hostname.endsWith(".localhost")) return false;
   if (hostname.endsWith(".local") || hostname.endsWith(".internal")) return false;
-  return !PRIVATE_HOST_PATTERN.test(hostname);
+  return true;
+}
+
+type PublicAddressResolvers = {
+  lookup?: (hostname: string) => Promise<readonly { address: string }[]>;
+  fetch?: typeof fetch;
+};
+
+// Clash/Mihomo 的默认 Fake-IP 段。本机 DNS 返回的是代理映射，不能把它本身当作公网放行。
+function isProxyFakeAddress(address: string): boolean {
+  return isIP(address) === 4 && address.startsWith("198.18.");
+}
+
+async function resolveRealAddresses(hostname: string, fetchDns: typeof fetch): Promise<string[]> {
+  // HTTPS DNS 经现有出网代理查询，避开系统 DNS 的 Fake-IP；两种地址族都查，不能漏过内网 AAAA。
+  const signal = AbortSignal.timeout(5_000);
+  const results = await Promise.all(([1, 28] as const).map(async (type) => {
+    const endpoint = new URL("https://dns.alidns.com/resolve");
+    endpoint.searchParams.set("name", hostname);
+    endpoint.searchParams.set("type", type === 1 ? "A" : "AAAA");
+    const response = await fetchDns(endpoint, {
+      headers: { accept: "application/dns-json" },
+      redirect: "error",
+      signal,
+    });
+    if (!response.ok) throw new Error(`Public DNS request failed: ${response.status}`);
+    const body = await response.json() as { Status?: unknown; TC?: unknown; Answer?: unknown };
+    if (body.Status !== 0 || body.TC === true) throw new Error("Public DNS response failed or was truncated");
+    if (body.Answer === undefined) return [];
+    if (!Array.isArray(body.Answer)) throw new Error("Invalid public DNS answers");
+    const addresses: string[] = [];
+    for (const answer of body.Answer) {
+      if (!answer || typeof answer !== "object") throw new Error("Invalid public DNS answer");
+      const record = answer as { type?: unknown; data?: unknown };
+      if (record.type !== 1 && record.type !== 28) continue; // CNAME 本身不算地址。
+      if (record.type !== type || typeof record.data !== "string" || isIP(record.data) !== (type === 1 ? 4 : 6)) {
+        throw new Error("Invalid public DNS address");
+      }
+      addresses.push(record.data);
+    }
+    return addresses;
+  }));
+  return results.flat();
+}
+
+/** 域名解析后每一个地址都得是公网的；代理 Fake-IP 则核对真实 DNS，失败仍然拒绝。 */
+export async function resolvesToPublicAddress(rawUrl: string, resolvers: PublicAddressResolvers = {}): Promise<boolean> {
+  if (!isSafeExternalPageUrl(rawUrl)) return false;
+  const hostname = new URL(rawUrl.trim()).hostname.replace(/^\[|\]$/g, "");
+  if (isIP(hostname)) return true;
+  try {
+    const addresses = await (resolvers.lookup ?? ((host) => lookup(host, { all: true })))(hostname);
+    if (addresses.length === 0) return false;
+    // Fake-IP 和真实内网地址同时出现时直接拒绝，不能用公网 DoH 结果覆盖掉本地内网解析。
+    if (addresses.some((entry) => isPrivateAddress(entry.address) && !isProxyFakeAddress(entry.address))) return false;
+    if (!addresses.some((entry) => isProxyFakeAddress(entry.address))) return true;
+    const realAddresses = await resolveRealAddresses(hostname, resolvers.fetch ?? fetch);
+    return realAddresses.length > 0 && realAddresses.every((address) => !isPrivateAddress(address));
+  } catch {
+    return false;
+  }
 }
 
 // Walks candidate URLs (a superset of maxPages, typically all of

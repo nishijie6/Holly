@@ -125,9 +125,8 @@ async function resolveQdrantConfig(configPath: string): Promise<ResolvedQdrantCo
   return {
     enabled,
     url,
-    // config.yaml is committed, so the cluster key must NOT live there. Prefer
-    // QDRANT_API_KEY from the environment (like SERPER_API_KEY); fall back to the
-    // config value only for a purely local, keyless instance.
+    // Both .env and config.yaml are local, ignored files. An environment key
+    // takes precedence over qdrant.api_key in the local config.
     apiKey: process.env.QDRANT_API_KEY?.trim() || section.api_key?.trim() || undefined,
     collectionName,
     timeoutMs,

@@ -98,12 +98,17 @@ function coerceRecord(value: unknown): LedgerRecord | null {
   // its prose alone would silently change what the model was answering.
   if (Array.isArray(m.blocks) && blocks.length !== m.blocks.length) return null;
 
+  const responseItems = Array.isArray(m.responseItems) ? m.responseItems : [];
+  if (responseItems.some((item) => !item || typeof item !== "object" || Array.isArray(item) || typeof item.type !== "string")) {
+    return null;
+  }
   return {
     at: typeof v.at === "string" ? v.at : "",
     message: {
       role: m.role,
       content: typeof m.content === "string" ? m.content : "",
       ...(blocks.length > 0 ? { blocks } : {}),
+      ...(responseItems.length > 0 ? { responseItems: responseItems as Record<string, unknown>[] } : {}),
     },
   };
 }

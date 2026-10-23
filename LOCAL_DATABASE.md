@@ -5,7 +5,8 @@ Qdrant 后端作为可切换选项。
 
 ## 配置
 
-SQLite 需要 Node.js 22.5 或更新版本。数据库路径相对于 `config.yaml` 所在目录
+项目要求 Node.js 26 或更新版本。首次运行将 `config.example.yaml` 复制为本地 `config.yaml`；
+真实配置和运行时数据均被 Git 忽略。数据库路径相对于 `config.yaml` 所在目录
 解析，不受启动命令当前工作目录影响；运行时 `data/` 目录不会提交到 Git。
 
 ```yaml

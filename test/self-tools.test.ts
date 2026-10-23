@@ -13,6 +13,7 @@ function harness(overrides: Partial<SelfToolDeps> = {}) {
     writeArchive: async ({ kind, title, content }) => { archives.push({ kind, title, content }); },
     observeWorld: async (topic) => { observed.push(topic); return { summary: `[${topic}] 最近有这些` }; },
     worldTopics: () => ["人工智能", "天文学"],
+    worldTopicBroadcastTargets: () => ["20000002"],
     ...overrides,
   };
   const run = createSelfToolRunner(deps);
@@ -79,6 +80,26 @@ test("看完不替她发，提示她自己决定", async () => {
   const result = await call("observe_world", { topic: "天文学" });
   assert.match(result.note, /send_message/);
   assert.match(result.note, /不值得说就放着/);
+});
+
+// 自动播报退役之后，话题和目标群的对应关系只剩在配置里。不把它递到她手上，她看完了也不知道
+// 该说给谁——这条测的就是那句提示真的带上了 open_conversation 要的 id。
+test("看完会告诉她这个话题平时说给谁", async () => {
+  const { call } = harness();
+  const result = await call("observe_world", { topic: "天文学" });
+  assert.match(result.note, /20000002/);
+  assert.match(result.note, /天文学/);
+  assert.match(result.note, /open_conversation/);
+});
+
+// 一个目标都没配时不能硬编一句「说给谁」出来：那会把她引向一个不存在的会话。退回原来那句
+// 「自己挑人」即可。
+test("没配目标就不提群号，只说自己挑人", async () => {
+  const { call } = harness({ worldTopicBroadcastTargets: () => [] });
+  const result = await call("observe_world", { topic: "天文学" });
+  assert.equal(result.ok, true);
+  assert.doesNotMatch(result.note, /\d{6,}/);
+  assert.match(result.note, /send_message/);
 });
 
 // 话题按原文逐字匹配配置：每个话题的固定来源页是按名字配的，编一个名字就没有来源可读。

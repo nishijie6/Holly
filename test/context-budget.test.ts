@@ -152,9 +152,20 @@ test("formatTopicTimestamp renders a timestamp as MM-DD HH:mm", () => {
 
 // --- modelContextWindowTokens ---
 
-test("modelContextWindowTokens gives Haiku a 200K window and everything else 1M", () => {
-  assert.equal(modelContextWindowTokens("claude-haiku-4-5"), 200_000);
-  assert.equal(modelContextWindowTokens("HAIKU"), 200_000);
-  assert.equal(modelContextWindowTokens("claude-opus-5"), 1_000_000);
-  assert.equal(modelContextWindowTokens(""), 1_000_000);
+test("model context budgets use Codex client windows rather than larger API windows", () => {
+  assert.equal(modelContextWindowTokens("gpt-6.1-sol"), 475_000);
+  assert.equal(modelContextWindowTokens("GPT-6.1-SOL"), 475_000);
+  assert.equal(modelContextWindowTokens("gpt-6-sol"), 258_400);
+  assert.equal(modelContextWindowTokens("gpt-6-luna"), 258_400);
+  assert.equal(modelContextWindowTokens("unknown"), 128_000);
+});
+
+test("response item state counts toward message budgets without duplicating mirrored tool blocks", () => {
+  const blocks = [{ type: "tool_use" as const, id: "call_1", name: "read", input: {} }];
+  const message = { role: "assistant" as const, content: "", blocks };
+  const responseItems = [{ type: "reasoning", encrypted_content: "x".repeat(4000), summary: [] },
+    { type: "function_call", call_id: "call_1", name: "read", arguments: "{}" }];
+  const withState = estimateMessageTokens({ ...message, responseItems });
+  assert.ok(withState > estimateMessageTokens(message) + 900);
+  assert.equal(withState, estimateMessageTokens({ role: "assistant", content: "", responseItems }));
 });

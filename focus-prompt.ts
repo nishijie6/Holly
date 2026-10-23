@@ -6,7 +6,7 @@ import type { FocusDecision } from "./focus-policy.js";
 // 为什么不能沿用 decision-prompt.ts:那份 MODEL_DECISION_PROMPT 是为「一次调用出
 // 一个 JSON 决定」的老管线写的,通篇在讲 should_reply / final_answer / need_search
 // 该怎么填。focus 管线是 tool loop——发消息的唯一途径是调 send_message,模型直接
-// 写出来的文字在 runClaudeToolLoop 里只会变成 lastText 进 monitor,一个字都到不了
+// 写出来的文字在 runToolLoop 里只会变成 lastText 进 monitor,一个字都到不了
 // 群里。把决策协议交给 tool loop,结果不是「回复质量差一点」,而是 Holly 彻底沉默。
 // 两条管线的协议因此必须分开,就像 focus-mode-config.ts 里说的,它们半路上并不兼容。
 //
@@ -81,7 +81,7 @@ function renderBatchLine(message: FocusBatchMessage, maxChars: number): string |
 //
 // 会话必须拆成「消息来自」和「当前打开」两项写。这里原本只有一个 conversation: 群X,
 // 后台通知里它指的是消息来自哪,模型却读成了「我现在在 X」,没打开就 send_message,
-// 话进了焦点实际停着的另一个群(2026-09-10,20000003 的复读发进了 20000001)。
+// 话进了焦点实际停着的另一个群。
 // 前台路径里两项相同也照写:同一个字段在两种注入里意思不同,正是那次误读的来源。
 function renderRoundMetadata(input: FocusInjectionInput): string[] {
   const lines = [

@@ -28,6 +28,8 @@ export type HollyAutonomyRecentAction = {
 };
 
 export type HollyAutonomyState = {
+  /** 最近一次真正发出的自主消息；0 表示没有记录，不等于从未发过。 */
+  lastAutonomousMessageAt: number;
   lastWorldObservationAt: number;
   lastWorldObservationAttemptAt: number;
   worldObservationDailyDate: string;
@@ -111,6 +113,7 @@ function freshGroupState(dateKey: string): HollyGroupState {
 
 function freshAutonomyState(dateKey: string): HollyAutonomyState {
   return {
+    lastAutonomousMessageAt: 0,
     lastWorldObservationAt: 0,
     lastWorldObservationAttemptAt: 0,
     worldObservationDailyDate: dateKey,
@@ -161,6 +164,7 @@ function coerceAutonomyState(value: unknown, dateKey: string): HollyAutonomyStat
   }
   const v = value as Record<string, unknown>;
   return {
+    lastAutonomousMessageAt: isFiniteNumber(v.lastAutonomousMessageAt) ? v.lastAutonomousMessageAt : 0,
     lastWorldObservationAt: isFiniteNumber(v.lastWorldObservationAt) ? v.lastWorldObservationAt : 0,
     lastWorldObservationAttemptAt: isFiniteNumber(v.lastWorldObservationAttemptAt)
       ? v.lastWorldObservationAttemptAt

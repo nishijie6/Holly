@@ -166,6 +166,8 @@ export const JUDGMENT_FAILURE_BACKOFF_THRESHOLD = 3;
 export const JUDGMENT_FAILURE_BACKOFF_MS = 10 * 60 * 1000;
 
 export type AutonomyLoopState = {
+  /** 最近一次真正发出的自主消息；老状态没有记录时为 0 或缺失。 */
+  lastAutonomousMessageAt?: number;
   lastWorldObservationAt: number;
   lastWorldObservationAttemptAt: number;
   worldObservationDailyDate: string;
@@ -367,7 +369,9 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     };
   }
 
-  // 这一轮真的要动了。先记下时刻——不应期从发起算，不从结果算。
+  // 这一轮真的要动了，先记下时刻。仍然记在发起处，是为了让下面主动开口那条早退分支也照样
+  // 消耗掉一次——那种情况下她确实做了事。唯一的例外是压根没问成，见下面 catch 里的回滚。
+  const judgmentAtBeforeThisRound = state.lastJudgmentAt;
   state.lastJudgmentAt = now;
   await deps.saveState();
 
@@ -432,6 +436,10 @@ export async function runAutonomyLoop(deps: AutonomyDeps): Promise<AutonomyLoopR
     };
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error);
+    // 没问成就不该占掉一整个不应期：把时刻退回这一轮之前的值，下一分钟还能再试。网络抖一下
+    // 就让她白白静默十几分钟，这个代价买不到任何东西。拦住「连着每分钟重试同一个故障」的是
+    // 下面那个失败退避，不是不应期——那才是为系统性故障准备的闸。
+    state.lastJudgmentAt = judgmentAtBeforeThisRound;
     state.judgmentFailureStreak = (state.judgmentFailureStreak ?? 0) + 1;
     state.lastJudgmentFailureAt = now;
     const streak = state.judgmentFailureStreak;

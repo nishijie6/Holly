@@ -95,6 +95,38 @@ test("autonomy state: persists world observation cadence", async () => {
   await rm(path, { force: true });
 });
 
+test("autonomy state: real autonomous send time survives a restart", async () => {
+  const path = tmpPath();
+  const store = await HollyStateStore.load(path, TTL);
+  store.getAutonomyState().lastAutonomousMessageAt = 1_792_540_800_000;
+  await store.save();
+
+  const reloaded = await HollyStateStore.load(path, TTL);
+  assert.equal(reloaded.getAutonomyState().lastAutonomousMessageAt, 1_792_540_800_000);
+  await rm(path, { force: true });
+});
+
+test("autonomy state: older snapshots keep their facts with unknown autonomous send time", async () => {
+  const path = tmpPath();
+  await writeFile(path, JSON.stringify({
+    autonomy: {
+      lastArchiveWritingAt: 1100,
+      archiveWritingDailyCount: 2,
+      lastWorldObservationShareAt: 1200,
+      recentActions: [{ kind: "archive_writing", at: 1100, title: "星尘" }],
+    },
+  }), "utf-8");
+
+  const store = await HollyStateStore.load(path, TTL);
+  const autonomy = store.getAutonomyState();
+  assert.equal(autonomy.lastAutonomousMessageAt, 0);
+  assert.equal(autonomy.lastArchiveWritingAt, 1100);
+  assert.equal(autonomy.archiveWritingDailyCount, 2);
+  assert.equal(autonomy.lastWorldObservationShareAt, 1200);
+  assert.deepEqual(autonomy.recentActions, [{ kind: "archive_writing", at: 1100, title: "星尘" }]);
+  await rm(path, { force: true });
+});
+
 test("autonomy state: 最近写过的题目存得住、读得回", async () => {
   const path = tmpPath();
   const store = await HollyStateStore.load(path, TTL);

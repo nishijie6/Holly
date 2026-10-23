@@ -62,9 +62,13 @@ export class ConversationLedger {
     return this.push({ role: "user", content: text });
   }
 
-  public appendAssistantTurn(content: string, toolUses: readonly LlmToolUseBlock[] = []): LedgerAppendResult {
+  public appendAssistantTurn(
+    content: string,
+    toolUses: readonly LlmToolUseBlock[] = [],
+    responseItems?: readonly Record<string, unknown>[],
+  ): LedgerAppendResult {
     const text = content.trim();
-    if (!text && toolUses.length === 0) {
+    if (!text && toolUses.length === 0 && !responseItems?.length) {
       throw new Error("ConversationLedger: refusing to append an empty assistant turn.");
     }
     if (this.pendingToolUseIds.length > 0) {
@@ -75,6 +79,7 @@ export class ConversationLedger {
       role: "assistant",
       content: text,
       ...(toolUses.length > 0 ? { blocks: [...toolUses] } : {}),
+      ...(responseItems?.length ? { responseItems: structuredClone([...responseItems]) } : {}),
     });
   }
 

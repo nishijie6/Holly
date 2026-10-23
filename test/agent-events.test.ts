@@ -157,5 +157,12 @@ test("没有 tick 就是没有", () => {
 });
 
 test("空输入不炸", () => {
-  assert.deepEqual(coalesceAgentEvents([]), { groupKeys: [], tickDue: false });
+  assert.deepEqual(coalesceAgentEvents([]), { groupKeys: [], tickDue: false, focusRetryDue: false });
+});
+
+test("focus retry signals coalesce independently of autonomy ticks and incoming messages", () => {
+  const result = coalesceAgentEvents([{ type: "focus_retry_due" }, { type: "focus_retry_due" }]);
+  assert.equal(result.focusRetryDue, true);
+  assert.equal(result.tickDue, false);
+  assert.deepEqual(result.groupKeys, []);
 });

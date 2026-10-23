@@ -11,6 +11,17 @@
 // 注意：整页是一个模板字符串。往里写注释时不能出现反引号，也不能出现 ${ 开头的序列，
 // 否则会提前结束字符串或者变成一次插值。
 
+// Rate-limit slots are not fixed periods: Pro can report a weekly primary
+// window with no secondary window. Use only the server-reported duration.
+export function formatProviderUsageWindow(windowDurationMins: number | null, id: "primary" | "secondary"): string {
+  if (typeof windowDurationMins !== "number" || !Number.isFinite(windowDurationMins) || windowDurationMins <= 0) {
+    return id === "primary" ? "Primary" : "Secondary";
+  }
+  if (windowDurationMins % 1440 === 0) return String(windowDurationMins / 1440) + "d";
+  if (windowDurationMins % 60 === 0) return String(windowDurationMins / 60) + "h";
+  return String(windowDurationMins) + "m";
+}
+
 export function renderMonitorPage(wsTargetUrl: string): string {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -632,7 +643,12 @@ export function renderMonitorPage(wsTargetUrl: string): string {
     .bc-table td { padding: 6px 10px; border-top: 1px solid hsl(var(--edge-soft-c) / var(--edge-soft-a)); }
     .bc-name span { display: block; }
     .bc-name small { opacity: 0.55; font-size: 11px; }
-    .bc-cell { padding: 4px 8px; }
+    /* 格子是 <button>，但看上去只该是一枚拨杆。inline-flex 让里面的 span.mode-switch 成为
+       flex 项目，宽高才生效——侧栏 .mode-row 本来就是 flex，所以同一枚拨杆在那里正常，
+       到了普通按钮里却是行内元素，轨道塌成 0 宽，旋钮飘到外面。其余几条是摘掉全局按钮的
+       底色、边框和悬停色；color 要继承，因为夜间拨杆的描边用的是 currentColor。 */
+    .bc-cell { display: inline-flex; padding: 4px; border: 0; background: transparent; color: inherit; }
+    .bc-cell:hover, .bc-cell:disabled:hover { background: transparent; color: inherit; }
     .bc-cell .mode-switch { pointer-events: none; }
     .bc-hint { padding: 12px 10px 2px; font-size: 11px; opacity: 0.6; line-height: 1.7; }
 
@@ -1067,25 +1083,17 @@ export function renderMonitorPage(wsTargetUrl: string): string {
           <div class="pb">
             <div class="stack">
               <p class="hint">Switch the active LLM profile. Changes apply immediately and are written to config.yaml.</p>
-              <div v-if="claudeUsage" style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:hsl(var(--muted-foreground));">
+              <div v-if="providerUsage && providerUsage.windows && providerUsage.windows.length" style="display:flex;flex-direction:column;gap:4px;font-size:11px;color:hsl(var(--muted-foreground));">
                 <span>Subscription Usage</span>
-                <div style="display:flex;align-items:center;gap:6px;">
-                  <span style="width:18px;">5h</span>
+                <div v-for="quota in providerUsage.windows" :key="quota.id" style="display:flex;align-items:center;gap:6px;">
+                  <span style="min-width:24px;">{{ usageWindowLabel(quota.windowDurationMins, quota.id) }}</span>
                   <div style="width:110px;height:8px;background:hsl(var(--raised));border:1px solid hsl(var(--hairline));overflow:hidden;">
-                    <div :style="{ width: usageWidth(claudeUsage.fiveHourUtilization), height: '100%', background: usageColor(claudeUsage.fiveHourUtilization) }"></div>
+                    <div :style="{ width: usageWidth(quota.utilization), height: '100%', background: usageColor(quota.utilization) }"></div>
                   </div>
-                  <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.fiveHourUtilization) }}</span>
-                  <span style="opacity:.8;">&middot; resets {{ fmtReset(claudeUsage.fiveHourResetAt) }} &middot; {{ claudeUsage.fiveHourStatus || '-' }}</span>
+                  <span style="font-variant-numeric:tabular-nums;">{{ usagePct(quota.utilization) }}</span>
+                  <span style="opacity:.8;">&middot; resets {{ fmtReset(quota.resetAt) }} &middot; {{ quota.status || '-' }}</span>
                 </div>
-                <div style="display:flex;align-items:center;gap:6px;">
-                  <span style="width:18px;">7d</span>
-                  <div style="width:110px;height:8px;background:hsl(var(--raised));border:1px solid hsl(var(--hairline));overflow:hidden;">
-                    <div :style="{ width: usageWidth(claudeUsage.sevenDayUtilization), height: '100%', background: usageColor(claudeUsage.sevenDayUtilization) }"></div>
-                  </div>
-                  <span style="font-variant-numeric:tabular-nums;">{{ usagePct(claudeUsage.sevenDayUtilization) }}</span>
-                  <span style="opacity:.8;">&middot; resets {{ fmtReset(claudeUsage.sevenDayResetAt) }} &middot; {{ claudeUsage.sevenDayStatus || '-' }}</span>
-                </div>
-                <span style="opacity:.7;">Updated {{ fmtTime(new Date(claudeUsage.capturedAt).toISOString()) }}</span>
+                <span style="opacity:.7;">Updated {{ fmtTime(new Date(providerUsage.capturedAt).toISOString()) }}</span>
               </div>
               <div v-if="tokenStats && tokenStats.models && tokenStats.models.length" style="display:flex;flex-direction:column;gap:3px;font-size:11px;color:hsl(var(--muted-foreground));margin-top:4px;">
                 <span>Token Usage &middot; {{ tokenStats.date }}</span>
@@ -1219,8 +1227,8 @@ export function renderMonitorPage(wsTargetUrl: string): string {
         <div class="ph2"><span class="ph2-title">Filters</span></div>
         <div class="pb">
           <form class="fgrid" @submit.prevent="loadMemories">
-            <label>Group ID <input v-model="mf.groupId" placeholder="20000002" /></label>
-            <label>User ID <input v-model="mf.userId" placeholder="10000003" /></label>
+            <label>Group ID <input v-model="mf.groupId" placeholder="群号" /></label>
+            <label>User ID <input v-model="mf.userId" placeholder="QQ 号" /></label>
             <label>Type
               <select v-model="mf.messageType">
                 <option value="group">group</option>
@@ -1494,9 +1502,10 @@ export function renderMonitorPage(wsTargetUrl: string): string {
       <div class="panel" style="margin-bottom:16px;">
         <div class="ph2">
           <span class="ph2-title">Hit Rate &middot; 最近 {{ cacheHours.length }} 小时</span>
-          <button class="sec sm" @click="loadPromptCache">Refresh</button>
+          <button class="sec sm" @click="loadPromptCache(); refreshUsage()" :disabled="usageRefreshing">{{ usageRefreshing ? 'Refreshing...' : 'Refresh' }}</button>
         </div>
         <div class="pb">
+          <p v-if="usageRefreshError" class="hint" role="alert">{{ usageRefreshError }}</p>
           <div v-if="!cacheHours.length" class="empty">No prompt cache samples yet.</div>
           <template v-else>
             <div class="cache-heads">
@@ -1632,7 +1641,9 @@ createApp({
     var entries = ref([]);
     var renderedIds = new Set();
     var convPreview = ref(null);
-    var claudeUsage = ref(null);
+    var providerUsage = ref(null);
+    var usageRefreshing = ref(false);
+    var usageRefreshError = ref('');
     var tokenStats = ref(null);
     var usageHistory = ref([]);
     var usageGrandTotal = ref(0);
@@ -1822,6 +1833,8 @@ createApp({
       try { return JSON.stringify(JSON.parse(body), null, 2); } catch(e) { return body; }
     }
 
+    var usageWindowLabel = ${formatProviderUsageWindow.toString()};
+
     function usagePct(u) {
       if (typeof u !== 'number') return 'n/a';
       return (u * 100).toFixed(1) + '%';
@@ -1882,7 +1895,7 @@ createApp({
       autonomySidebar.value = payload.autonomySidebar || null;
       readOnly.value = !!payload.readOnly;
       replaceThoughts(payload.thoughts || []);
-      if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; }
+      if (payload.providerUsage) { providerUsage.value = payload.providerUsage; }
       if (payload.tokenStats) { tokenStats.value = payload.tokenStats; }
       entries.value = [];
       var visible = payload.history || [];
@@ -1893,7 +1906,7 @@ createApp({
       if (payload.type === 'snapshot') { renderSnapshot(payload); return; }
       if (payload.type === 'status') { wsStatus.value = payload.status; return; }
       if (payload.type === 'conversation') { convPreview.value = payload.conversationPreview; return; }
-      if (payload.type === 'usage') { if (payload.claudeUsage) { claudeUsage.value = payload.claudeUsage; } return; }
+      if (payload.type === 'usage') { if (payload.providerUsage) { providerUsage.value = payload.providerUsage; } return; }
       if (payload.type === 'tokens') { tokenStats.value = payload.tokenStats; if (tab.value === 'usage') { loadUsageHistory(); loadPromptCache(); } return; }
       if (payload.type === 'autonomy') { autonomySidebar.value = payload.autonomySidebar || null; return; }
       if (payload.type === 'archive') { applyArchiveWork(payload.work); return; }
@@ -2133,10 +2146,20 @@ createApp({
     }
 
     function refreshUsage() {
-      fetch('/api/usage/refresh', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
-        if (d.claudeUsage) { claudeUsage.value = d.claudeUsage; }
+      if (usageRefreshing.value) return;
+      usageRefreshing.value = true;
+      usageRefreshError.value = '';
+      fetch('/api/usage/refresh', { method: 'POST' }).then(function(r) {
+        return r.json().then(function(d) {
+          if (!r.ok || d.error) throw new Error('usage refresh failed');
+          return d;
+        });
+      }).then(function(d) {
+        if (d.providerUsage) { providerUsage.value = d.providerUsage; }
         if (d.tokenStats) { tokenStats.value = d.tokenStats; }
-      }).catch(function() {});
+      }).catch(function() {
+        usageRefreshError.value = '额度刷新失败，请稍后重试。';
+      }).finally(function() { usageRefreshing.value = false; });
     }
 
     // The window figure is re-derived from the window's own totals, never
@@ -2196,7 +2219,8 @@ createApp({
 
     return {
       tab, wsTargetUrl, wsStatus, wsStatusLabel,
-      entries, groupEntries, convPreview, convMetaText, claudeUsage, tokenStats,
+      entries, groupEntries, convPreview, convMetaText, providerUsage, tokenStats,
+      usageRefreshing, usageRefreshError, refreshUsage,
       thoughts, thoughtKindFilter, filteredThoughts,
       usageHistory, usageGrandTotal,
       cacheHours, cachePurposes, cacheDate,
@@ -2212,7 +2236,7 @@ createApp({
       theme, toggleTheme,
       groups, selGroupId, groupTurns, reversedGroupTurns,
       gpLiveHeight, gpDragging, onResizerMousedown,
-      fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, outcomeClass, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
+      fmtTime, fmtDateTime, fmtDuration, fmtBody, thoughtKindLabel, thoughtOutcomeLabel, outcomeClass, usageWindowLabel, usagePct, usageWidth, usageColor, fmtReset, fmtNum,
       clearEntries, reconnect, switchProfile, loadMemories, loadGroups, loadGroupTurns, selectGroup, onPickShortTermGroup,
       loadThoughts, loadUsageHistory, loadArchive
     };
